@@ -1,10 +1,14 @@
 use anyhow::Result;
 use codex_features::Feature;
+use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -312,7 +316,7 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
             fs::create_dir_all(&workflow_dir)?;
             fs::write(
                 workflow_dir.join("resume.js"),
-                "const agentId = await flowdex.spawnAgent({ name: 'worker', instructions: 'initial instructions', model: 'gpt-5.4' });\nconst initial = await flowdex.waitAgent(agentId);\nconst keep = await flowdex.resumeAgent(agentId, 'keep instructions');\nconst compact = await flowdex.resumeAgent(agentId, 'compact instructions', { contextMode: 'compact' });\nconst handoff = await flowdex.resumeAgent(agentId, 'new instructions', { contextMode: 'handoff' });\ntext(JSON.stringify({ initial, keep, compact, handoff }));",
+                "const agentId = await flowdex.spawnAgent({ name: 'worker', instructions: 'initial instructions', model: 'gpt-5.4', reasoningEffort: 'high' });\nconst initial = await flowdex.waitAgent(agentId);\nconst keep = await flowdex.resumeAgent(agentId, 'keep instructions');\nconst compact = await flowdex.resumeAgent(agentId, 'compact instructions', { contextMode: 'compact' });\nconst handoff = await flowdex.resumeAgent(agentId, 'new instructions', { contextMode: 'handoff' });\nconst failureId = await flowdex.spawnAgent({ name: 'failure_worker', instructions: 'failure initial', model: 'gpt-5.4' });\nawait flowdex.waitAgent(failureId);\nconst failedCompact = await flowdex.resumeAgent(failureId, 'must not dispatch', { contextMode: 'compact' });\nlet primitiveOptionsRejected = false;\ntry { await flowdex.resumeAgent(agentId, 'invalid primitive options', 'compact'); } catch { primitiveOptionsRejected = true; }\nlet unknownOptionsRejected = false;\ntry { await flowdex.resumeAgent(agentId, 'invalid unknown options', { timeoutMs: 1 }); } catch { unknownOptionsRejected = true; }\ntext(JSON.stringify({ initial, keep, compact, handoff, failedCompact, primitiveOptionsRejected, unknownOptionsRejected }));",
             )?;
             Ok::<(), anyhow::Error>(())
         });
@@ -352,7 +356,7 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            body_contains(request, "compact") && body_contains(request, "compaction")
+            body_contains(request, "initial instructions") && body_contains(request, "compaction")
         },
         sse(vec![
             ev_response_created("resp-resume-compact"),
@@ -367,13 +371,35 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let replacement = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| body_contains(request, "compact instructions"),
         sse(vec![
             ev_response_created("resp-resume-child-3"),
             ev_assistant_message("msg-resume-child-3", "compact output"),
             ev_completed("resp-resume-child-3"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "failure initial"),
+        sse(vec![
+            ev_response_created("resp-resume-failure-initial"),
+            ev_assistant_message("msg-resume-failure-initial", "failure ready"),
+            ev_completed("resp-resume-failure-initial"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, "failure initial") && body_contains(request, "compaction")
+        },
+        sse(vec![
+            ev_response_created("resp-resume-failed-compact"),
+            ev_assistant_message("msg-resume-failed-compact", "invalid compact output"),
+            ev_completed("resp-resume-failed-compact"),
         ]),
     )
     .await;
@@ -420,15 +446,69 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
     let output: Value = serde_json::from_str(&output)?;
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["initial"]["status"], "completed");
-    assert_eq!(workflow_output["keep"]["status"], "completed");
+    assert_eq!(workflow_output["keep"]["message"], "keep output");
     assert_eq!(workflow_output["compact"]["message"], "compact output");
     assert_eq!(workflow_output["handoff"]["message"], "replacement output");
     assert_ne!(
         workflow_output["handoff"]["agentId"],
         workflow_output["initial"]["agentId"]
     );
+    assert_eq!(workflow_output["failedCompact"]["status"], "errored");
+    assert_eq!(workflow_output["primitiveOptionsRejected"], true);
+    assert_eq!(workflow_output["unknownOptionsRejected"], true);
+    let initial_id =
+        ThreadId::from_string(workflow_output["initial"]["agentId"].as_str().unwrap())?;
+    let replacement_id =
+        ThreadId::from_string(workflow_output["handoff"]["agentId"].as_str().unwrap())?;
+    let initial_snapshot = test
+        .thread_manager
+        .get_thread(initial_id)
+        .await?
+        .config_snapshot()
+        .await;
+    let replacement_snapshot = test
+        .thread_manager
+        .get_thread(replacement_id)
+        .await?
+        .config_snapshot()
+        .await;
+    assert_eq!(
+        replacement_snapshot.parent_thread_id,
+        initial_snapshot.parent_thread_id
+    );
+    assert_eq!(replacement_snapshot.model, "gpt-5.4");
+    assert_eq!(
+        replacement_snapshot.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+    let initial_path = initial_snapshot.session_source.get_agent_path().unwrap();
+    let replacement_path = replacement_snapshot
+        .session_source
+        .get_agent_path()
+        .unwrap();
+    assert_eq!(initial_path.as_str(), "/root/worker");
+    assert!(replacement_path.as_str().starts_with("/root/handoff_"));
+    assert!(!replacement_path.as_str().contains("/root/worker/handoff_"));
+    let depth = |source: &SessionSource| match source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => Some(*depth),
+        _ => None,
+    };
+    assert_eq!(
+        depth(&replacement_snapshot.session_source),
+        depth(&initial_snapshot.session_source)
+    );
+    let replacement_request = replacement.single_request();
+    assert_eq!(replacement_request.body_json()["model"], "gpt-5.4");
     let follow_up_request = follow_up.single_request();
     assert!(!follow_up_request.body_contains_text("completed work: initial"));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|request| !body_contains(request, "must not dispatch"))
+    );
     Ok(())
 }
 

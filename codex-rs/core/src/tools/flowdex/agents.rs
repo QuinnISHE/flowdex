@@ -14,7 +14,6 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
-use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::collab_agent_error;
 use crate::tools::handlers::multi_agents_common::collab_spawn_error;
@@ -328,23 +327,20 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     }
     let id = ThreadId::from_string(&args.agent_id)
         .map_err(|_| FunctionCallError::RespondToModel("agentId must be a thread id".into()))?;
-    let status_rx = match session.services.agent_control.subscribe_status(id).await {
-        Ok(rx) => rx,
-        Err(codex_protocol::error::CodexErr::ThreadNotFound(_)) => {
-            return Ok(JsonOutput::new(
-                serde_json::json!({"agentId": id.to_string(), "status": "notFound"}),
-            ));
-        }
-        Err(err) => return Err(collab_agent_error(id, err)),
-    };
-    if !is_final(&status_rx.borrow()) {
+    let prior_status = session.services.agent_control.get_status(id).await;
+    if matches!(prior_status, AgentStatus::NotFound) {
+        return Ok(JsonOutput::new(
+            serde_json::json!({"agentId": id.to_string(), "status": "notFound"}),
+        ));
+    }
+    if !is_final(&prior_status) {
         return Err(FunctionCallError::RespondToModel(
             "agent must have a completed prior turn".into(),
         ));
     }
 
     if mode == "compact" {
-        session
+        let operation = session
             .services
             .agent_control
             .submit_compaction(id)
@@ -353,62 +349,49 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         let compact_status = session
             .services
             .agent_control
-            .wait_for_submitted_operation(id, status_rx)
+            .wait_for_submitted_operation(operation)
             .await;
         if !matches!(compact_status, AgentStatus::Completed(_)) {
             return Ok(JsonOutput::new(status_value(id, compact_status)));
         }
-        let status_rx = session
-            .services
-            .agent_control
-            .subscribe_status(id)
-            .await
-            .map_err(|err| collab_agent_error(id, err))?;
-        let status = submit_trigger_turn(&session, &turn, id, instructions, status_rx).await?;
+        let status = submit_trigger_turn(&session, &turn, id, instructions).await?;
         return Ok(JsonOutput::new(status_value(id, status)));
     }
 
     if mode == "handoff" {
-        let handoff_status =
-            submit_trigger_turn(&session, &turn, id, HANDOFF_PROMPT, status_rx).await?;
+        let handoff_status = submit_trigger_turn(&session, &turn, id, HANDOFF_PROMPT).await?;
         let handoff_text = match handoff_status {
             AgentStatus::Completed(Some(text)) if !text.trim().is_empty() => text,
             status => return Ok(JsonOutput::new(status_value(id, status))),
         };
-        let snapshot = session
+        let config = session
+            .services
+            .agent_control
+            .get_agent_config(id)
+            .await
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel("agent configuration unavailable".into())
+            })?
+            .as_ref()
+            .clone();
+        let environments = session
             .services
             .agent_control
             .get_agent_config_snapshot(id)
             .await
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel("agent configuration unavailable".into())
-            })?;
-        let mut config = build_agent_resume_config(turn.as_ref())?;
-        config.model = Some(snapshot.model.clone());
-        config.model_provider_id = snapshot.model_provider_id.clone();
-        config.service_tier = snapshot.service_tier.clone();
-        config.personality = snapshot.personality;
-        config.cwd = snapshot.cwd().clone();
-        config
-            .permissions
-            .set_workspace_roots(snapshot.workspace_roots.clone());
-        config
-            .permissions
-            .set_permission_profile(snapshot.permission_profile.clone())
-            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-        let parent_id = snapshot.parent_thread_id.unwrap_or(session.thread_id);
-        let depth = match &snapshot.session_source {
-            codex_protocol::protocol::SessionSource::SubAgent(
-                codex_protocol::protocol::SubAgentSource::ThreadSpawn { depth, .. },
-            ) => *depth,
-            _ => next_thread_spawn_depth(&turn.session_source),
-        };
+            })?
+            .environment_selections()
+            .to_vec();
+        let parent_id = session.thread_id;
+        let depth = next_thread_spawn_depth(&turn.session_source);
         let replacement_name = format!("handoff_{}", ThreadId::new().to_string().replace('-', ""));
         let source = thread_spawn_source(
             parent_id,
-            &snapshot.session_source,
+            &turn.session_source,
             depth,
-            snapshot.session_source.get_agent_role().as_deref(),
+            None,
             Some(replacement_name),
         )?;
         let prompt = format!(
@@ -428,7 +411,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 Some(source),
                 SpawnAgentOptions {
                     parent_thread_id: Some(parent_id),
-                    environments: Some(snapshot.environment_selections().to_vec()),
+                    environments: Some(environments),
                     completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
                     ..Default::default()
                 },
@@ -443,13 +426,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         )));
     }
 
-    let status_rx = session
-        .services
-        .agent_control
-        .subscribe_status(id)
-        .await
-        .map_err(|err| collab_agent_error(id, err))?;
-    let status = submit_trigger_turn(&session, &turn, id, instructions, status_rx).await?;
+    let status = submit_trigger_turn(&session, &turn, id, instructions).await?;
     Ok(JsonOutput::new(status_value(id, status)))
 }
 
@@ -458,7 +435,6 @@ async fn submit_trigger_turn(
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
     id: ThreadId,
     message: &str,
-    status_rx: tokio::sync::watch::Receiver<AgentStatus>,
 ) -> Result<AgentStatus, FunctionCallError> {
     let metadata = session
         .services
@@ -481,16 +457,16 @@ async fn submit_trigger_turn(
     );
     let context =
         AgentCommunicationContext::new(AgentCommunicationKind::Followup, session.thread_id);
-    session
+    let operation = session
         .services
         .agent_control
-        .send_inter_agent_communication(id, communication, context)
+        .submit_inter_agent_communication_operation(id, communication, context)
         .await
         .map_err(|err| collab_agent_error(id, err))?;
     Ok(session
         .services
         .agent_control
-        .wait_for_submitted_operation(id, status_rx)
+        .wait_for_submitted_operation(operation)
         .await)
 }
 

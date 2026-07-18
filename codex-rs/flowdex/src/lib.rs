@@ -15,6 +15,17 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 const WORKFLOW_DIRECTORY: [&str; 2] = [".flowdex", "workflows"];
+const RESUME_AGENT_BOOTSTRAP: &str = r#"  resumeAgent: async (agentId, instructions, options = {}) => {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw new TypeError("resumeAgent options must be an object");
+    }
+    const unknownOptions = Object.keys(options).filter((key) => key !== "contextMode");
+    if (unknownOptions.length > 0) {
+      throw new TypeError(`resumeAgent unknown option: ${unknownOptions[0]}`);
+    }
+    return tools.flowdex_resume_agent({ agent_id: agentId, instructions, options: { context_mode: options.contextMode } });
+  },
+"#;
 
 /// Loads a repository workflow and prepares it for execution in code mode.
 #[derive(Debug, Clone)]
@@ -78,7 +89,7 @@ impl WorkflowLoader {
                 "const flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n  progress: async (summary) => {{\n    await tools.flowdex_progress({{ summary }});\n  }},\n  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
             ).replace(
                 "  progress:",
-                "  resumeAgent: async (agentId, instructions, options = {}) => tools.flowdex_resume_agent({ agent_id: agentId, instructions, options: { context_mode: options.contextMode } }),\n  progress:",
+                &format!("{RESUME_AGENT_BOOTSTRAP}  progress:"),
             ),
         })
     }
@@ -257,6 +268,8 @@ mod tests {
         assert!(loaded.source.contains("sendMessage: async"));
         assert!(loaded.source.contains("waitAgent: async"));
         assert!(loaded.source.contains("resumeAgent: async"));
+        assert!(loaded.source.contains("options must be an object"));
+        assert!(loaded.source.contains("key !== \"contextMode\""));
         assert!(loaded.source.contains("progress: async"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
         assert!(
