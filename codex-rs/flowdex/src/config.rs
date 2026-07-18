@@ -24,18 +24,20 @@ pub fn load_config(
     let mut threshold = DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 
     if let Some(config) = read_partial(&global_path)?
-        && let Some(value) = config.compaction_reminder_threshold_tokens {
-            validate_threshold(value, &global_path)?;
-            threshold = value;
-        }
+        && let Some(value) = config.compaction_reminder_threshold_tokens
+    {
+        validate_threshold(value, &global_path)?;
+        threshold = value;
+    }
 
     if let Some(repository_root) = trusted_repository_root {
         let repository_path = repository_root.join(".flowdex").join("config.toml");
         if let Some(config) = read_partial(&repository_path)?
-            && let Some(value) = config.compaction_reminder_threshold_tokens {
-                validate_threshold(value, &repository_path)?;
-                threshold = value;
-            }
+            && let Some(value) = config.compaction_reminder_threshold_tokens
+        {
+            validate_threshold(value, &repository_path)?;
+            threshold = value;
+        }
     }
 
     Ok(FlowdexConfig {
