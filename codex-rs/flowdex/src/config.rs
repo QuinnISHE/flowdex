@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use thiserror::Error;
 
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 150_000;
@@ -22,21 +23,19 @@ pub fn load_config(
     let global_path = codex_home.join("flowdex.toml");
     let mut threshold = DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 
-    if let Some(config) = read_partial(&global_path)? {
-        if let Some(value) = config.compaction_reminder_threshold_tokens {
+    if let Some(config) = read_partial(&global_path)?
+        && let Some(value) = config.compaction_reminder_threshold_tokens {
             validate_threshold(value, &global_path)?;
             threshold = value;
         }
-    }
 
     if let Some(repository_root) = trusted_repository_root {
         let repository_path = repository_root.join(".flowdex").join("config.toml");
-        if let Some(config) = read_partial(&repository_path)? {
-            if let Some(value) = config.compaction_reminder_threshold_tokens {
+        if let Some(config) = read_partial(&repository_path)?
+            && let Some(value) = config.compaction_reminder_threshold_tokens {
                 validate_threshold(value, &repository_path)?;
                 threshold = value;
             }
-        }
     }
 
     Ok(FlowdexConfig {

@@ -1,8 +1,9 @@
 pub mod config;
 
-pub use config::{
-    DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS, FlowdexConfig, FlowdexConfigError, load_config,
-};
+pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+pub use config::FlowdexConfig;
+pub use config::FlowdexConfigError;
+pub use config::load_config;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
