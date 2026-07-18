@@ -5,10 +5,14 @@ pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
 pub use config::load_config;
-pub use task_store::{
-    IntegrationResult, RunInfo, TaskCommit, TaskDeclaration, TaskOperation, TaskRecord, TaskStore,
-    TaskStoreError,
-};
+pub use task_store::IntegrationResult;
+pub use task_store::RunInfo;
+pub use task_store::TaskCommit;
+pub use task_store::TaskDeclaration;
+pub use task_store::TaskOperation;
+pub use task_store::TaskRecord;
+pub use task_store::TaskStore;
+pub use task_store::TaskStoreError;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;

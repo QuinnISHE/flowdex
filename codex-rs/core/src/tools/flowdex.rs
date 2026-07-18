@@ -29,10 +29,10 @@ pub(crate) use agents::FlowdexResumeAgentHandler;
 pub(crate) use agents::FlowdexSendMessageHandler;
 pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
-pub(crate) use task::{
-    FlowdexCreateTaskHandler, FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler,
-    FlowdexTaskVerifyHandler,
-};
+pub(crate) use task::FlowdexCreateTaskHandler;
+pub(crate) use task::FlowdexTaskIntegrateHandler;
+pub(crate) use task::FlowdexTaskRunAgentHandler;
+pub(crate) use task::FlowdexTaskVerifyHandler;
 pub(crate) use verification::FlowdexVerifyHandler;
 
 const TOOL_NAME: &str = "start_flowdex_workflow";

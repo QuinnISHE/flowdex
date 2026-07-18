@@ -1,30 +1,49 @@
-use super::agents::{status_value, truncate_message};
+use super::agents::status_value;
+use super::agents::truncate_message;
 use super::verification::FlowdexVerifyHandler;
-use crate::agent::control::{SpawnAgentCompletionDelivery, SpawnAgentOptions};
-use crate::agent::{exceeds_thread_spawn_depth_limit, next_thread_spawn_depth};
-use crate::agent_communication::{AgentCommunicationContext, AgentCommunicationKind};
+use crate::agent::control::SpawnAgentCompletionDelivery;
+use crate::agent::control::SpawnAgentOptions;
+use crate::agent::exceeds_thread_spawn_depth_limit;
+use crate::agent::next_thread_spawn_depth;
+use crate::agent_communication::AgentCommunicationContext;
+use crate::agent_communication::AgentCommunicationKind;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output};
-use crate::tools::handlers::multi_agents_common::{
-    apply_requested_spawn_agent_model_overrides, apply_spawn_agent_role, build_agent_spawn_config,
-    collab_spawn_error, thread_spawn_source,
-};
-use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
-use codex_flowdex::{RunInfo, TaskDeclaration, TaskStore, TaskStoreError};
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
+use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
+use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
+use crate::tools::handlers::multi_agents_common::collab_spawn_error;
+use crate::tools::handlers::multi_agents_common::thread_spawn_source;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutor;
+use codex_flowdex::RunInfo;
+use codex_flowdex::TaskDeclaration;
+use codex_flowdex::TaskStore;
+use codex_flowdex::TaskStoreError;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InterAgentCommunication;
-use codex_tools::{JsonSchema, ResponsesApiTool, ShellCommandBackendConfig, ToolName, ToolSpec};
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ShellCommandBackendConfig;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tokio::sync::OwnedMutexGuard;
 
 const CREATE: &str = "flowdex_create_task";
@@ -230,7 +249,7 @@ async fn task_store(
 }
 
 async fn open_store(
-    session: &std::sync::Arc<crate::session::session::Session>,
+    _session: &std::sync::Arc<crate::session::session::Session>,
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
 ) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
     if !turn.config.active_project.is_trusted() {
@@ -424,7 +443,9 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     config.cwd = task_cwd.clone();
     config.workspace_roots = vec![task_cwd.clone()];
-    config.permissions.set_workspace_roots(vec![task_cwd.clone()]);
+    config
+        .permissions
+        .set_workspace_roots(vec![task_cwd.clone()]);
     let mut environments = invocation.turn.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
@@ -545,7 +566,7 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             "task has no verification commands".into(),
         ));
     }
-    let mut value = serde_json::json!({"commands": task.verification});
+    let value = serde_json::json!({"commands": task.verification});
     let payload = ToolPayload::Function {
         arguments: value.to_string(),
     };
@@ -557,10 +578,16 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     let config = std::sync::Arc::make_mut(&mut turn.config);
     config.cwd = task_cwd.clone();
     config.workspace_roots = vec![task_cwd.clone()];
-    config.permissions.set_workspace_roots(vec![task_cwd.clone()]);
+    config
+        .permissions
+        .set_workspace_roots(vec![task_cwd.clone()]);
     let verifier = FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic);
     let output = verifier
-        .handle_for_workdir(task_invocation.clone(), &task.worktree_path, Some(&task_cwd))
+        .handle_for_workdir(
+            task_invocation.clone(),
+            &task.worktree_path,
+            Some(&task_cwd),
+        )
         .await?;
     let result = output.code_mode_result(&task_invocation.payload);
     if result.get("passed").and_then(Value::as_bool) == Some(true) {

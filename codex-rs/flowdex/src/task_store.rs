@@ -1,13 +1,17 @@
-use sha2::{Digest, Sha256};
-use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sha2::Digest;
+use sha2::Sha256;
+use sqlx::Row;
+use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
 const MAX_GIT_OUTPUT: usize = 16 * 1024;
@@ -259,11 +263,10 @@ impl TaskStore {
         let commits = if head == start_commit {
             Vec::new()
         } else {
-            if !git_status(
+            if git_status(
                 &task.worktree_path,
                 ["merge-base", "--is-ancestor", &start_commit, &head],
-            )
-            .is_ok()
+            ).is_err()
             {
                 return Err(TaskStoreError::Operation(
                     "task history was rewritten".to_string(),

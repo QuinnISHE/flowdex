@@ -173,7 +173,7 @@ impl Clone for TurnContext {
             session_telemetry: self.session_telemetry.clone(),
             provider: self.provider.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
-            reasoning_summary: self.reasoning_summary.clone(),
+            reasoning_summary: self.reasoning_summary,
             session_source: self.session_source.clone(),
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
@@ -189,7 +189,7 @@ impl Clone for TurnContext {
                 .collaboration_mode_developer_instructions
                 .clone(),
             multi_agent_version: self.multi_agent_version,
-            personality: self.personality.clone(),
+            personality: self.personality,
             approval_policy: self.approval_policy.clone(),
             permission_profile: self.permission_profile.clone(),
             network: self.network.clone(),
