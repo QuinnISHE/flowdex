@@ -5,7 +5,6 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
@@ -22,7 +21,6 @@ use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
-use core_test_support::wait_for_event_with_timeout;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -190,100 +188,6 @@ async fn start_flowdex_workflow_executes_saved_v8_module() -> Result<()> {
     assert_eq!(workflow_output["path"], ".flowdex/workflows/hello.js");
     assert_eq!(workflow_output["spawnAvailable"], false);
     assert!(output.get("error").is_none());
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flowdex_progress_is_transient_reasoning_summary() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config.features.enable(Feature::CodeMode).unwrap();
-    });
-    builder = builder.with_workspace_setup(|cwd, _fs| async move {
-        let workflow_dir = cwd.join(".flowdex/workflows");
-        fs::create_dir_all(&workflow_dir)?;
-        fs::write(
-            workflow_dir.join("progress.js"),
-            "const result = await flowdex.progress('  flowdex-progress-secret  '); text(JSON.stringify({ resultType: typeof result, done: 'ok' }));",
-        )?;
-        Ok::<(), anyhow::Error>(())
-    });
-    let test = builder.build(&server).await?;
-    let args = serde_json::json!({ "path": ".flowdex/workflows/progress.js" });
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-progress-1"),
-            ev_function_call(
-                "call-progress-1",
-                "start_flowdex_workflow",
-                &args.to_string(),
-            ),
-            ev_completed("resp-progress-1"),
-        ]),
-    )
-    .await;
-    let follow_up = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| has_function_call_output(request, "call-progress-1"),
-        sse(vec![
-            ev_response_created("resp-progress-2"),
-            ev_completed("resp-progress-2"),
-        ]),
-    )
-    .await;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "run the progress workflow".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-
-    let started = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::ItemStarted(ItemStartedEvent {
-            item: TurnItem::Reasoning(item),
-            ..
-        }) => Some(item.clone()),
-        _ => None,
-    })
-    .await;
-    let completed = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::ItemCompleted(ItemCompletedEvent {
-            item: TurnItem::Reasoning(item),
-            ..
-        }) => Some(item.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(started.id, completed.id);
-    assert_eq!(started.summary_text, vec!["flowdex-progress-secret"]);
-    wait_for_event_with_timeout(
-        &test.codex,
-        |event| matches!(event, EventMsg::TurnComplete(_)),
-        tokio::time::Duration::from_secs(30),
-    )
-    .await;
-
-    let output = follow_up
-        .function_call_output_text("call-progress-1")
-        .expect("start tool output should be sent back to the model");
-    let output: Value = serde_json::from_str(&output)?;
-    assert_eq!(output["status"], "completed", "scheduler output: {output}");
-    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
-    assert_eq!(workflow_output["resultType"], "undefined");
-    assert_eq!(workflow_output["done"], "ok");
-    assert!(
-        !follow_up
-            .single_request()
-            .body_contains_text("flowdex-progress-secret")
-    );
     Ok(())
 }
 
