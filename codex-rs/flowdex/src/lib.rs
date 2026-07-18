@@ -1,5 +1,7 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -45,8 +47,19 @@ impl WorkflowLoader {
             return Err(WorkflowLoadError::OutsideWorkflowRoot);
         }
 
-        let source =
-            std::fs::read_to_string(&canonical_target).map_err(WorkflowLoadError::read_workflow)?;
+        let mut workflow_file =
+            open_workflow_file(&canonical_target).map_err(WorkflowLoadError::workflow_file)?;
+        if !workflow_file
+            .metadata()
+            .map_err(WorkflowLoadError::read_workflow)?
+            .is_file()
+        {
+            return Err(WorkflowLoadError::NotRegularFile);
+        }
+        let mut source = String::new();
+        workflow_file
+            .read_to_string(&mut source)
+            .map_err(WorkflowLoadError::read_workflow)?;
         let input = serde_json::to_string(input.unwrap_or(&Value::Null))
             .map_err(WorkflowLoadError::serialize_bootstrap)?;
         let workflow_path = workflow_display_path(&relative_path)?;
@@ -84,6 +97,8 @@ pub enum WorkflowLoadError {
     WorkflowRootUnavailable,
     #[error("workflow file was not found")]
     WorkflowNotFound,
+    #[error("workflow is not a regular file")]
+    NotRegularFile,
     #[error("unable to read workflow")]
     ReadFailed,
     #[error("workflow is not valid UTF-8")]
@@ -172,6 +187,23 @@ fn relative_path_tail(path: &Path) -> PathBuf {
     path.components().skip(WORKFLOW_DIRECTORY.len()).collect()
 }
 
+fn open_workflow_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
 fn workflow_display_path(path: &Path) -> Result<String, WorkflowLoadError> {
     path.components()
         .map(|component| match component {
@@ -235,6 +267,14 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains(expected), "{path}: {message}");
         }
+
+        fs::create_dir(_temp_dir.path().join(".flowdex/workflows/directory.js"))
+            .expect("directory workflow");
+        assert!(
+            loader
+                .load(Path::new(".flowdex/workflows/directory.js"), None)
+                .is_err()
+        );
 
         #[cfg(unix)]
         {

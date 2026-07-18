@@ -3106,6 +3106,7 @@ name = "codex-flowdex"
 version = "0.0.0"
 dependencies = [
  "codex-utils-absolute-path",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
