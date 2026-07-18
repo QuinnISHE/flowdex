@@ -159,6 +159,10 @@ impl InProcessCodeModeSession {
         self.begin_wait(request).await.await
     }
 
+    pub async fn wait_until_yield(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        self.begin_wait_until_yield(cell_id).await.await
+    }
+
     async fn begin_wait(
         &self,
         request: WaitRequest,
@@ -174,6 +178,32 @@ impl InProcessCodeModeSession {
                 &runtime_cell_id,
                 runtime::ObserveMode::YieldAfter(yield_timeout(yield_time_ms)),
             )
+            .await
+        {
+            Ok(pending_event) => Box::pin(async move {
+                match pending_event.event().await {
+                    Ok(event) => Ok(WaitOutcome::LiveCell(runtime_response(&cell_id, event)?)),
+                    Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => {
+                        Ok(WaitOutcome::MissingCell(missing_cell_response(cell_id)))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }),
+            Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => {
+                missing_wait(cell_id)
+            }
+            Err(error) => Box::pin(async move { Err(error.to_string()) }),
+        }
+    }
+
+    async fn begin_wait_until_yield(
+        &self,
+        cell_id: CellId,
+    ) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
+        let runtime_cell_id = runtime_cell_id(&cell_id);
+        match self
+            .runtime
+            .begin_observe(&runtime_cell_id, runtime::ObserveMode::UntilYield)
             .await
         {
             Ok(pending_event) => Box::pin(async move {
@@ -249,6 +279,13 @@ impl CodeModeSession for InProcessCodeModeSession {
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(InProcessCodeModeSession::wait(self, request))
+    }
+
+    fn wait_until_yield<'a>(
+        &'a self,
+        cell_id: CellId,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(InProcessCodeModeSession::wait_until_yield(self, cell_id))
     }
 
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {

@@ -100,6 +100,13 @@ impl CodeModeService {
         self.session().await?.wait(request).await
     }
 
+    pub(crate) async fn wait_until_yield(
+        &self,
+        cell_id: CellId,
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.session().await?.wait_until_yield(cell_id).await
+    }
+
     pub(crate) async fn terminate(
         &self,
         cell_id: CellId,

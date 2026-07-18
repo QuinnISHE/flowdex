@@ -364,6 +364,25 @@ impl Connection {
         result
     }
 
+    pub(super) async fn wait_until_yield(
+        &self,
+        session: RemoteSession,
+        cell_id: CellId,
+    ) -> Result<WaitOutcome, String> {
+        let cancellation = CallerCancellation::new();
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(DriverCommand::WaitUntilYield {
+            session,
+            cell_id,
+            caller_cancellation: cancellation.token(),
+            response_tx,
+        })
+        .await?;
+        let result = self.receive(response_rx).await;
+        cancellation.disarm();
+        result
+    }
+
     pub(super) async fn terminate(
         &self,
         session: RemoteSession,

@@ -212,6 +212,31 @@ impl ConnectionDriver {
                 };
                 let _ = response_tx.send(result);
             }
+            PendingRequest::WaitUntilYield {
+                session,
+                cell_id,
+                cancellation: _,
+                response_tx,
+            } => {
+                let result = match result {
+                    Ok(HostResponse::WaitCompleted { outcome }) => {
+                        if wait_outcome_cell_id(&outcome) != &cell_id {
+                            let reason = format!(
+                                "code-mode host returned cell {} for request targeting {}",
+                                wait_outcome_cell_id(&outcome).as_str(),
+                                cell_id.as_str()
+                            );
+                            let _ = response_tx.send(Err(reason.clone()));
+                            self.fail(reason);
+                            return false;
+                        }
+                        Ok(public_wait_outcome(session.generation, outcome.into()))
+                    }
+                    Ok(_) => Err("code-mode host returned an invalid cell response".to_string()),
+                    Err(err) => Err(err),
+                };
+                let _ = response_tx.send(result);
+            }
             PendingRequest::Terminate {
                 session,
                 cell_id,

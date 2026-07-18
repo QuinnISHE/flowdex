@@ -7,6 +7,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::flowdex::FlowdexProgressHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
+use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
@@ -246,6 +247,7 @@ fn build_tool_specs_and_registry(
         StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
         ToolExposure::DirectModelOnly,
     );
+    planned_tools.add_with_exposure(WaitFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
 }

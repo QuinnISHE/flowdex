@@ -230,6 +230,14 @@ impl ProcessOwnedCodeModeSession {
         binding.connection.wait(binding.remote, request).await
     }
 
+    pub async fn wait_until_yield(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        let binding = self.connection().await?;
+        binding
+            .connection
+            .wait_until_yield(binding.remote, cell_id)
+            .await
+    }
+
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
         binding.connection.terminate(binding.remote, cell_id).await
@@ -483,6 +491,13 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
         Box::pin(ProcessOwnedCodeModeSession::wait(self, request))
+    }
+
+    fn wait_until_yield<'a>(
+        &'a self,
+        cell_id: CellId,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(ProcessOwnedCodeModeSession::wait_until_yield(self, cell_id))
     }
 
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {

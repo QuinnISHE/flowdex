@@ -44,6 +44,12 @@ impl ConnectionDriver {
                 caller_cancellation,
                 response_tx,
             } => self.wait(session, request, caller_cancellation, response_tx),
+            DriverCommand::WaitUntilYield {
+                session,
+                cell_id,
+                caller_cancellation,
+                response_tx,
+            } => self.wait_until_yield(session, cell_id, caller_cancellation, response_tx),
             DriverCommand::Terminate {
                 session,
                 cell_id,
@@ -195,6 +201,38 @@ impl ConnectionDriver {
             return true;
         }
         self.start_wait(session, request, caller_cancellation, response_tx)
+    }
+
+    fn wait_until_yield(
+        &mut self,
+        session: RemoteSession,
+        cell_id: CellId,
+        caller_cancellation: CancellationToken,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    ) -> bool {
+        if let Err(err) = self.sessions.require_ready(&session) {
+            let _ = response_tx.send(Err(err));
+            return true;
+        }
+        let cell_id = match remote_cell_id(&session, &cell_id) {
+            Ok(cell_id) => cell_id,
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+                return true;
+            }
+        };
+        self.send_request(
+            HostRequest::WaitUntilYield {
+                session_id: session.id.clone(),
+                cell_id: cell_id.clone(),
+            },
+            PendingRequest::WaitUntilYield {
+                session,
+                cell_id,
+                cancellation: CancellableRequest::new(caller_cancellation),
+                response_tx,
+            },
+        )
     }
 
     pub(super) fn start_wait(

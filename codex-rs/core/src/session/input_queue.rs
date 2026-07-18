@@ -369,6 +369,7 @@ mod tests {
             input_queue.subscribe_activity(Some(&turn_state)).await;
 
         assert_eq!(pending_activity, Some(InputQueueActivity::Steer));
+        assert!(turn_state.lock().await.pending_input.has_user_input());
     }
 
     #[tokio::test]
