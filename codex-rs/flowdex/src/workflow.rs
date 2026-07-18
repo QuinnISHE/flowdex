@@ -357,4 +357,15 @@ mod tests {
                 .is_ok()
         );
     }
+    #[test]
+    fn scope_conflict_uses_normalized_roots() {
+        assert!(write_scope_conflicts(
+            &["./src/**".into()],
+            &["src/parser/**".into()]
+        ));
+        assert!(!write_scope_conflicts(
+            &["docs/**".into()],
+            &["src/**".into()]
+        ));
+    }
 }
