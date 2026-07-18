@@ -196,9 +196,12 @@ fn build_tool_specs_and_registry(
     add_tool_sources(&context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
-    planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
-    planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
-    planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
+    let flowdex_agent_tools_enabled = collab_tools_enabled(turn_context);
+    if flowdex_agent_tools_enabled {
+        planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
+    }
     let mut flowdex_nested_tool_specs = planned_tools
         .runtimes()
         .iter()
@@ -208,11 +211,13 @@ fn build_tool_specs_and_registry(
         })
         .map(|runtime| runtime.spec())
         .collect::<Vec<_>>();
-    flowdex_nested_tool_specs.extend([
-        FlowdexSpawnAgentHandler.spec(),
-        FlowdexSendMessageHandler.spec(),
-        FlowdexWaitAgentHandler.spec(),
-    ]);
+    if flowdex_agent_tools_enabled {
+        flowdex_nested_tool_specs.extend([
+            FlowdexSpawnAgentHandler.spec(),
+            FlowdexSendMessageHandler.spec(),
+            FlowdexWaitAgentHandler.spec(),
+        ]);
+    }
     planned_tools.add_with_exposure(
         StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
         ToolExposure::DirectModelOnly,

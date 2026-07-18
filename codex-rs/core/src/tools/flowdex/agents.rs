@@ -2,6 +2,7 @@ use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
 use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
@@ -125,6 +126,11 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
     }
 
     let child_depth = next_thread_spawn_depth(&turn.session_source);
+    if exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) {
+        return Err(FunctionCallError::RespondToModel(
+            "Agent depth limit reached. Solve the task yourself.".to_string(),
+        ));
+    }
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     apply_requested_spawn_agent_model_overrides(
@@ -292,8 +298,13 @@ async fn handle_wait(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
 
 fn status_value(id: ThreadId, status: AgentStatus) -> Value {
     match status {
-        ProtocolAgentStatus::Completed(message) => {
-            serde_json::json!({"agentId": id.to_string(), "status": "completed", "message": message.map(|m| truncate_message(&m))})
+        ProtocolAgentStatus::Completed(Some(message)) => serde_json::json!({
+            "agentId": id.to_string(),
+            "status": "completed",
+            "message": truncate_message(&message),
+        }),
+        ProtocolAgentStatus::Completed(None) => {
+            serde_json::json!({"agentId": id.to_string(), "status": "completed"})
         }
         ProtocolAgentStatus::Errored(error) => {
             serde_json::json!({"agentId": id.to_string(), "status": "errored", "message": truncate_message(&error)})
@@ -391,4 +402,17 @@ fn wait_spec() -> ToolSpec {
         parameters: required(properties, vec!["agent_id".into()]),
         output_schema: Some(serde_json::json!({"type":"object"})),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_without_output_omits_message() {
+        let result = status_value(ThreadId::new(), ProtocolAgentStatus::Completed(None));
+
+        assert_eq!(result["status"], "completed");
+        assert!(result.get("message").is_none());
+    }
 }

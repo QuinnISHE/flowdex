@@ -35,13 +35,14 @@ async fn start_flowdex_workflow_executes_saved_v8_module() -> Result<()> {
     let mut builder = test_codex()
         .with_config(|config| {
             config.features.enable(Feature::CodeMode).unwrap();
+            config.features.disable(Feature::Collab).unwrap();
         })
         .with_workspace_setup(|cwd, _fs| async move {
             let workflow_dir = cwd.join(".flowdex/workflows");
             fs::create_dir_all(&workflow_dir)?;
             fs::write(
                 workflow_dir.join("hello.js"),
-                "await Promise.resolve(); text(JSON.stringify({ input: flowdex.input, path: flowdex.workflowPath }));",
+                "await Promise.resolve(); text(JSON.stringify({ input: flowdex.input, path: flowdex.workflowPath, spawnAvailable: typeof tools.flowdex_spawn_agent === 'function' }));",
             )?;
             Ok::<(), anyhow::Error>(())
         });
@@ -76,6 +77,7 @@ async fn start_flowdex_workflow_executes_saved_v8_module() -> Result<()> {
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["input"]["answer"], 42);
     assert_eq!(workflow_output["path"], ".flowdex/workflows/hello.js");
+    assert_eq!(workflow_output["spawnAvailable"], false);
     assert!(output.get("error").is_none());
     Ok(())
 }
