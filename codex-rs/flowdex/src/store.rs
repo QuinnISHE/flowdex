@@ -479,6 +479,9 @@ impl FlowdexStore {
     pub fn mark_task_running(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
         self.set_scheduler_task_state(task_id, SchedulerTaskState::Running)
     }
+    pub fn mark_task_ready(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_scheduler_task_state(task_id, SchedulerTaskState::Ready)
+    }
     pub fn mark_task_attributing(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
         self.set_scheduler_task_state(task_id, SchedulerTaskState::Attributing)
     }
@@ -524,13 +527,23 @@ impl FlowdexStore {
             let rows = sqlx::query("SELECT task_id,phase,declaration_order,agent,dependencies,state,name,write_scope FROM workflow_tasks WHERE run_id=? AND phase=? ORDER BY declaration_order")
                 .bind(run_id).bind(phase_name).fetch_all(&mut *tx).await?;
             let states: std::collections::HashMap<String, String> = rows.iter().map(|row| (row.get(6), row.get(5))).collect();
+            let scopes: std::collections::HashMap<String, Vec<String>> = rows
+                .iter()
+                .map(|row| (row.get(0), decode(row.get(7))))
+                .collect();
             let running_scopes: Vec<(i64, Vec<String>)> = rows.iter().filter(|row| row.get::<String, _>(5) == "running").map(|row| (row.get(2), decode(row.get(7)))).collect();
             let mut ready = Vec::with_capacity(rows.len());
             for row in rows {
                 let candidate = ScheduledTask { task_id: row.get(0), phase: row.get(1), declaration_order: row.get(2), agent: row.get(3), dependencies: decode(row.get(4)), state: row.get(5) };
                 let candidate_scope: Vec<String> = decode(row.get(7));
                 let blocked_by_scope = running_scopes.iter().any(|(order, scope)| *order != candidate.declaration_order && *order < candidate.declaration_order && write_scope_conflicts(&candidate_scope, scope));
-                if matches!(candidate.state.as_str(), "queued" | "ready") && candidate.dependencies.iter().all(|dependency| states.get(dependency).is_some_and(|state| state == "integrated")) && !blocked_by_scope { ready.push(candidate); }
+                let blocked_by_ready_scope = ready.iter().any(|earlier: &ScheduledTask| {
+                    earlier.declaration_order < candidate.declaration_order
+                        && scopes
+                            .get(&earlier.task_id)
+                            .is_some_and(|scope| write_scope_conflicts(&candidate_scope, scope))
+                });
+                if matches!(candidate.state.as_str(), "queued" | "ready") && candidate.dependencies.iter().all(|dependency| states.get(dependency).is_some_and(|state| state == "integrated")) && !blocked_by_scope && !blocked_by_ready_scope { ready.push(candidate); }
             }
             for task in &ready { sqlx::query("UPDATE workflow_tasks SET state='ready' WHERE task_id=? AND state='queued'").bind(&task.task_id).execute(&mut *tx).await?; }
             tx.commit().await?;
