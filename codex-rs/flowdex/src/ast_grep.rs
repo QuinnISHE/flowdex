@@ -38,8 +38,6 @@ pub enum AstGrepError {
     RepositoryRoot(#[source] std::io::Error),
     #[error("unable to resolve AST-grep execution root: {0}")]
     ExecutionRoot(#[source] std::io::Error),
-    #[error("AST-grep execution root is outside the trusted repository")]
-    ExecutionOutsideRepository,
     #[error("AST-grep rules directory is unavailable: {path}")]
     RulesDirectory { path: PathBuf },
     #[error("AST-grep rule path is outside the trusted rules directory: {path}")]
@@ -66,6 +64,10 @@ pub enum AstGrepError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("unable to walk AST-grep execution root: {message}")]
+    Walk { message: String },
+    #[error("AST-grep scan cancelled")]
+    Cancelled,
 }
 
 struct LoadedRule {
@@ -78,14 +80,32 @@ pub fn run_ast_grep_rules(
     execution_root: &Path,
     exact_rule_ids: &[String],
 ) -> Result<AstGrepResult, AstGrepError> {
+    run_ast_grep_rules_with_cancellation(
+        trusted_repository_root,
+        execution_root,
+        exact_rule_ids,
+        || false,
+    )
+}
+
+/// Executes rules while allowing the caller to stop traversal and matching.
+pub fn run_ast_grep_rules_with_cancellation<F>(
+    trusted_repository_root: &Path,
+    execution_root: &Path,
+    exact_rule_ids: &[String],
+    is_cancelled: F,
+) -> Result<AstGrepResult, AstGrepError>
+where
+    F: Fn() -> bool,
+{
     let repository_root = trusted_repository_root
         .canonicalize()
         .map_err(AstGrepError::RepositoryRoot)?;
     let execution_root = execution_root
         .canonicalize()
         .map_err(AstGrepError::ExecutionRoot)?;
-    if !execution_root.starts_with(&repository_root) {
-        return Err(AstGrepError::ExecutionOutsideRepository);
+    if is_cancelled() {
+        return Err(AstGrepError::Cancelled);
     }
 
     let requested = requested_ids(exact_rule_ids)?;
@@ -132,7 +152,7 @@ pub fn run_ast_grep_rules(
         let parsed = from_yaml_string::<SupportLang>(&source, &registration).map_err(|error| {
             AstGrepError::RuleParse {
                 path: canonical.clone(),
-                message: error.to_string(),
+                message: bounded_error_text(&error.to_string()),
             }
         })?;
         for rule in parsed {
@@ -179,12 +199,19 @@ pub fn run_ast_grep_rules(
 
     let mut findings = Vec::new();
     let mut truncated = false;
-    let walker = WalkBuilder::new(&execution_root).hidden(false).build();
+    let walker = WalkBuilder::new(&execution_root).build();
     for entry in walker {
+        if is_cancelled() {
+            return Err(AstGrepError::Cancelled);
+        }
         let entry = match entry {
             Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => entry,
             Ok(_) => continue,
-            Err(_) => continue,
+            Err(error) => {
+                return Err(AstGrepError::Walk {
+                    message: bounded_error_text(&error.to_string()),
+                });
+            }
         };
         let path = entry.path();
         let Some(language) = SupportLang::from_path(path) else {
@@ -214,8 +241,11 @@ pub fn run_ast_grep_rules(
                     truncated = true;
                     break;
                 }
+                if is_cancelled() {
+                    return Err(AstGrepError::Cancelled);
+                }
                 let relative = path
-                    .strip_prefix(&repository_root)
+                    .strip_prefix(&execution_root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
@@ -266,11 +296,27 @@ fn bounded_message(mut message: String, truncated: &mut bool) -> String {
         return message;
     }
     *truncated = true;
-    message.truncate(MAX_MESSAGE_BYTES);
-    while !message.is_char_boundary(message.len()) {
-        message.pop();
-    }
+    let end = utf8_boundary(&message, MAX_MESSAGE_BYTES);
+    message.truncate(end);
     message
+}
+
+fn bounded_error_text(message: &str) -> String {
+    const SUFFIX: &str = " … (truncated)";
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let limit = MAX_MESSAGE_BYTES.saturating_sub(SUFFIX.len());
+    let end = utf8_boundary(message, limit);
+    format!("{}{}", &message[..end], SUFFIX)
+}
+
+fn utf8_boundary(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn severity_name(severity: &Severity) -> &'static str {
@@ -292,17 +338,23 @@ mod tests {
     #[test]
     fn loads_selects_and_reports_native_rule() {
         let temp = tempdir().expect("temp dir");
-        let root = temp.path();
+        let root = temp.path().join("trusted");
+        let execution = temp.path().join("linked-worktree");
         fs::create_dir_all(root.join(".flowdex/ast-grep/rules")).expect("rules dir");
-        fs::create_dir_all(root.join("src")).expect("source dir");
+        fs::create_dir_all(execution.join("src")).expect("source dir");
         fs::write(
             root.join(".flowdex/ast-grep/rules/no-console.yml"),
             "id: no-console\nlanguage: JavaScript\nrule:\n  pattern: console.log($$$ARGS)\nmessage: Avoid console output\nseverity: warning\n",
         )
         .expect("rule");
-        fs::write(root.join("src/main.js"), "const x = 1;\nconsole.log(x);\n").expect("source");
+        fs::write(
+            execution.join("src/main.js"),
+            "const x = 1;\nconsole.log(x);\n",
+        )
+        .expect("source");
 
-        let result = run_ast_grep_rules(root, root, &["no-console".to_string()]).expect("run");
+        let result =
+            run_ast_grep_rules(&root, &execution, &["no-console".to_string()]).expect("run");
         assert!(!result.passed);
         assert!(!result.truncated);
         assert_eq!(result.findings.len(), 1);
@@ -312,8 +364,23 @@ mod tests {
         assert_eq!(result.findings[0].column, 1);
         assert_eq!(result.findings[0].severity, "warning");
 
-        let passing = run_ast_grep_rules(root, root, &["no-console".to_string()]);
+        let passing = run_ast_grep_rules(&root, &execution, &["no-console".to_string()]);
         assert!(passing.is_ok());
+    }
+
+    #[test]
+    fn cancellation_and_utf8_bounds_are_explicit() {
+        let temp = tempdir().expect("temp dir");
+        fs::create_dir_all(temp.path().join(".flowdex/ast-grep/rules")).expect("rules dir");
+        let ids = ["rule".to_string()];
+        assert!(matches!(
+            run_ast_grep_rules_with_cancellation(temp.path(), temp.path(), &ids, || true),
+            Err(AstGrepError::Cancelled)
+        ));
+
+        let bounded = bounded_error_text(&"é".repeat(MAX_MESSAGE_BYTES));
+        assert!(bounded.len() <= MAX_MESSAGE_BYTES);
+        assert!(bounded.ends_with(" … (truncated)"));
     }
 
     #[test]
