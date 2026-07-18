@@ -544,6 +544,55 @@ async fn subscribe_status_updates_on_shutdown() {
 }
 
 #[tokio::test]
+async fn subscribe_status_marks_existing_terminal_value_seen() {
+    let harness = AgentControlHarness::new().await;
+    let (thread_id, thread) = harness.start_thread().await;
+    let turn = thread.session.new_default_turn().await;
+    thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("previous turn".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if thread.agent_status().await
+                == AgentStatus::Completed(Some("previous turn".to_string()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("thread should reach the prior terminal status");
+
+    let mut status_rx = harness
+        .control
+        .subscribe_status(thread_id)
+        .await
+        .expect("status subscription should succeed");
+    assert_eq!(
+        status_rx.borrow().clone(),
+        AgentStatus::Completed(Some("previous turn".to_string()))
+    );
+    assert!(
+        timeout(Duration::from_millis(20), status_rx.changed())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn wait_for_submitted_operation_ignores_stale_terminal_status() {
     let control = AgentControl::default();
     let agent_id = ThreadId::new();

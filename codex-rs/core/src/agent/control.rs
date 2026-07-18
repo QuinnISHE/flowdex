@@ -358,7 +358,12 @@ impl AgentControl {
     ) -> CodexResult<watch::Receiver<AgentStatus>> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
-        Ok(thread.subscribe_status())
+        let mut status_rx = thread.subscribe_status();
+        // The thread's long-lived receiver may not observe prior updates. Mark
+        // the current value seen so a newly cloned receiver cannot replay an old
+        // terminal status as the first change for a submitted operation.
+        status_rx.borrow_and_update();
+        Ok(status_rx)
     }
 
     /// Wait for a terminal status emitted after a new operation was submitted.
