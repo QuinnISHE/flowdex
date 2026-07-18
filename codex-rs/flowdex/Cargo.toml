@@ -13,8 +13,10 @@ workspace = true
 [dependencies]
 codex-utils-absolute-path = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
