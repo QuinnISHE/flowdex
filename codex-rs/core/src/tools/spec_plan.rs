@@ -6,11 +6,13 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::flowdex::FlowdexQueueTaskHandler;
+use crate::tools::flowdex::FlowdexRunWorkflowHandler;
 use crate::tools::flowdex::FlowdexSealPhaseHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::flowdex::FlowdexWaitRunHandler;
 use crate::tools::flowdex::QueueFlowdexTaskHandler;
+use crate::tools::flowdex::SaveFlowdexWorkflowHandler;
 use crate::tools::flowdex::SealFlowdexPhaseHandler;
 use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
 use crate::tools::handlers::ApplyPatchHandler;
@@ -270,10 +272,18 @@ fn build_tool_specs_and_registry(
             .spec(),
         );
     }
+    // Nested saved workflows are hidden from model and ordinary code-mode tools,
+    // but are exposed through the Flowdex bootstrap as an internal primitive.
+    flowdex_nested_tool_specs.push(FlowdexRunWorkflowHandler::new(Vec::new()).spec());
+    planned_tools.add_with_exposure(
+        FlowdexRunWorkflowHandler::new(flowdex_nested_tool_specs.clone()),
+        ToolExposure::Hidden,
+    );
     planned_tools.add_with_exposure(
         StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
         ToolExposure::DirectModelOnly,
     );
+    planned_tools.add_with_exposure(SaveFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(WaitFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(QueueFlowdexTaskHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(SealFlowdexPhaseHandler, ToolExposure::DirectModelOnly);
