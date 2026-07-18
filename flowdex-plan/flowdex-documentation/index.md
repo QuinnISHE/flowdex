@@ -9,3 +9,4 @@
 - [Event-driven waits](waiting.md)
 - [Context compaction](compaction.md)
 - [Task worktrees and commit attribution](task-worktrees.md)
+- [AST-grep rules](ast-grep-rules.md)
