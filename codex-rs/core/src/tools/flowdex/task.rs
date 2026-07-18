@@ -399,6 +399,8 @@ async fn handle_create(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         run_id,
         parent_thread_id: invocation.session.thread_id.to_string(),
         workflow_path: args.workflow_path,
+        parent_run_id: None,
+        workflow_identity: None,
         repository_identity: root,
         integration_worktree: cwd,
     };

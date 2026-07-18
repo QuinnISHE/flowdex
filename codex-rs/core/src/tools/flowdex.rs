@@ -53,10 +53,31 @@ const WAIT_TOOL_NAME: &str = "wait_flowdex_workflow";
 const RUN_TOOL_NAME: &str = "flowdex_run_workflow";
 const SAVE_TOOL_NAME: &str = "save_flowdex_workflow";
 
-static WORKFLOW_CHAINS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+#[derive(Clone, Debug, Default)]
+struct WorkflowInvocation {
+    chain: Vec<String>,
+    parent_run_id: Option<String>,
+    workflow_identity: Option<String>,
+}
 
-fn workflow_chains() -> &'static Mutex<HashMap<String, Vec<String>>> {
+static WORKFLOW_CHAINS: OnceLock<Mutex<HashMap<String, WorkflowInvocation>>> = OnceLock::new();
+
+fn workflow_chains() -> &'static Mutex<HashMap<String, WorkflowInvocation>> {
     WORKFLOW_CHAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn workflow_run_identity(cell_id: &str) -> (Option<String>, Option<String>) {
+    workflow_chains()
+        .lock()
+        .expect("workflow chain mutex poisoned")
+        .get(cell_id)
+        .map(|invocation| {
+            (
+                invocation.parent_run_id.clone(),
+                invocation.workflow_identity.clone(),
+            )
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,9 +345,12 @@ impl FlowdexRunWorkflowHandler {
             let chains = workflow_chains()
                 .lock()
                 .expect("workflow chain mutex poisoned");
-            chains.get(&parent_cell).cloned().unwrap_or_default()
+            chains
+                .get(&parent_cell)
+                .map(|invocation| invocation.chain.clone())
+                .unwrap_or_default()
         };
-        let identity = reference.normalized_display().to_string();
+        let identity = reference.normalized_display();
         if chain.iter().any(|item| item == &identity) {
             return Err(FunctionCallError::RespondToModel(
                 "Flowdex workflow reference cycle detected".to_string(),
@@ -367,11 +391,18 @@ impl FlowdexRunWorkflowHandler {
         .await
         .map_err(FunctionCallError::RespondToModel)?;
         let mut child_chain = chain;
-        child_chain.push(identity);
+        child_chain.push(identity.clone());
         workflow_chains()
             .lock()
             .expect("workflow chain mutex poisoned")
-            .insert(child_cell.to_string(), child_chain);
+            .insert(
+                child_cell.to_string(),
+                WorkflowInvocation {
+                    chain: child_chain,
+                    parent_run_id: Some(parent_cell),
+                    workflow_identity: Some(identity),
+                },
+            );
         let result =
             wait_nested_workflow(&exec, child_cell.clone(), response, cancellation_token).await;
         workflow_chains()
@@ -636,7 +667,11 @@ impl StartFlowdexWorkflowHandler {
                 .expect("workflow chain mutex poisoned")
                 .insert(
                     cell_id.to_string(),
-                    vec![reference.normalized_display().to_string()],
+                    WorkflowInvocation {
+                        chain: vec![reference.normalized_display()],
+                        parent_run_id: None,
+                        workflow_identity: Some(reference.normalized_display()),
+                    },
                 );
         }
         if matches!(

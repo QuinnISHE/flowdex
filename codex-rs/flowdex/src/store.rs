@@ -44,6 +44,8 @@ pub struct RunInfo {
     pub run_id: String,
     pub parent_thread_id: String,
     pub workflow_path: String,
+    pub parent_run_id: Option<String>,
+    pub workflow_identity: Option<String>,
     pub repository_identity: String,
     pub integration_worktree: PathBuf,
 }
@@ -278,8 +280,8 @@ impl FlowdexStore {
                 "run repository identity does not match task store".to_string(),
             ));
         }
-        self.runtime.block_on(sqlx::query("INSERT INTO runs(run_id,parent_thread_id,workflow_path,repository_identity,integration_worktree,created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET parent_thread_id=excluded.parent_thread_id,workflow_path=excluded.workflow_path,integration_worktree=excluded.integration_worktree")
-            .bind(&info.run_id).bind(&info.parent_thread_id).bind(&info.workflow_path).bind(&info.repository_identity).bind(info.integration_worktree.to_string_lossy().as_ref()).bind(now_unix()).execute(&self.pool))?;
+        self.runtime.block_on(sqlx::query("INSERT INTO runs(run_id,parent_thread_id,workflow_path,parent_run_id,workflow_identity,repository_identity,integration_worktree,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET parent_thread_id=excluded.parent_thread_id,workflow_path=excluded.workflow_path,parent_run_id=excluded.parent_run_id,workflow_identity=excluded.workflow_identity,integration_worktree=excluded.integration_worktree")
+            .bind(&info.run_id).bind(&info.parent_thread_id).bind(&info.workflow_path).bind(&info.parent_run_id).bind(&info.workflow_identity).bind(&info.repository_identity).bind(info.integration_worktree.to_string_lossy().as_ref()).bind(now_unix()).execute(&self.pool))?;
         Ok(())
     }
 
@@ -926,7 +928,7 @@ async fn insert_schedule_row(
 async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let statements = "PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS repository(identity TEXT NOT NULL PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued');
+      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued');
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
       CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,PRIMARY KEY(run_id,name));
@@ -946,6 +948,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE runs ADD COLUMN name TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE runs ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'",
         "ALTER TABLE runs ADD COLUMN verification TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE runs ADD COLUMN parent_run_id TEXT",
+        "ALTER TABLE runs ADD COLUMN workflow_identity TEXT",
         "ALTER TABLE workflow_tasks ADD COLUMN instructions TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
@@ -1165,6 +1169,8 @@ mod tests {
             run_id: "run".into(),
             parent_thread_id: "thread".into(),
             workflow_path: ".flowdex/workflows/a.js".into(),
+            parent_run_id: None,
+            workflow_identity: None,
             repository_identity: root.to_string_lossy().to_string(),
             integration_worktree: repo.path().into(),
         };

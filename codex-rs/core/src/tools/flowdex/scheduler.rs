@@ -313,11 +313,14 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         .validate()
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let run_id = task::runtime_id(&invocation)?;
+    let (parent_run_id, workflow_identity) = super::workflow_run_identity(&run_id);
     let (store, cwd, identity) = task::task_store(&invocation).await?;
     let info = RunInfo {
         run_id: run_id.clone(),
         parent_thread_id: session.thread_id.to_string(),
         workflow_path: args.workflow_path,
+        parent_run_id,
+        workflow_identity,
         repository_identity: identity,
         integration_worktree: cwd,
     };
