@@ -156,6 +156,27 @@ pub struct TurnContext {
     pub(crate) model_verification_emitted: AtomicBool,
 }
 
+impl Clone for TurnContext {
+    fn clone(&self) -> Self {
+        Self {
+            sub_id: self.sub_id.clone(), trace_id: self.trace_id.clone(), realtime_active: self.realtime_active,
+            config: self.config.clone(), auth_manager: self.auth_manager.clone(), model_info: self.model_info.clone(),
+            session_telemetry: self.session_telemetry.clone(), provider: self.provider.clone(), reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_summary: self.reasoning_summary.clone(), session_source: self.session_source.clone(), history_mode: self.history_mode,
+            parent_thread_id: self.parent_thread_id, originator: self.originator.clone(), environments: self.environments.clone(), cwd: self.cwd.clone(),
+            current_date: self.current_date.clone(), timezone: self.timezone.clone(), app_server_client_name: self.app_server_client_name.clone(),
+            developer_instructions: self.developer_instructions.clone(), mode: self.mode, collaboration_mode_developer_instructions: self.collaboration_mode_developer_instructions.clone(),
+            multi_agent_version: self.multi_agent_version, personality: self.personality.clone(), approval_policy: self.approval_policy.clone(),
+            permission_profile: self.permission_profile.clone(), network: self.network.clone(), windows_sandbox_level: self.windows_sandbox_level,
+            available_models: self.available_models.clone(), unified_exec_shell_mode: self.unified_exec_shell_mode.clone(), final_output_json_schema: self.final_output_json_schema.clone(),
+            dynamic_tools: self.dynamic_tools.clone(), turn_metadata_state: self.turn_metadata_state.clone(), extension_data: self.extension_data.clone(),
+            turn_skills: self.turn_skills.clone(), turn_timing_state: self.turn_timing_state.clone(), terminal_error: self.terminal_error.clone(),
+            server_model_warning_emitted: AtomicBool::new(self.server_model_warning_emitted.load(Ordering::Relaxed)),
+            model_verification_emitted: AtomicBool::new(self.model_verification_emitted.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 enum TurnMultiAgentRuntime {
     ResolveAndStore,
     Preview,

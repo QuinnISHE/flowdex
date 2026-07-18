@@ -551,6 +551,13 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     };
     let mut task_invocation = invocation.clone();
     task_invocation.payload = payload;
+    let task_cwd = AbsolutePathBuf::from_absolute_path(&task.worktree_path)
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let turn = std::sync::Arc::make_mut(&mut task_invocation.turn);
+    let config = std::sync::Arc::make_mut(&mut turn.config);
+    config.cwd = task_cwd.clone();
+    config.workspace_roots = vec![task_cwd.clone()];
+    config.permissions.set_workspace_roots(vec![task_cwd]);
     let verifier = FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic);
     let output = verifier
         .handle_for_workdir(task_invocation.clone(), &task.worktree_path)
