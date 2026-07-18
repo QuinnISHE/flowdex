@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 codex-utils-absolute-path = { workspace = true }
 libc = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

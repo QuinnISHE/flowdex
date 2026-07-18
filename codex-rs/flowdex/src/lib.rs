@@ -1,9 +1,14 @@
 pub mod config;
+pub mod task_store;
 
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
 pub use config::load_config;
+pub use task_store::{
+    IntegrationResult, RunInfo, TaskCommit, TaskDeclaration, TaskOperation, TaskRecord, TaskStore,
+    TaskStoreError,
+};
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
