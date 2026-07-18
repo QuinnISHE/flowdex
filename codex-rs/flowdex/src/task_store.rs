@@ -10,6 +10,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
@@ -115,7 +116,8 @@ impl TaskStore {
         let database_path = flowdex_root.join(format!("{key}.sqlite"));
         let options = SqliteConnectOptions::new()
             .filename(database_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(30));
         let pool = runtime.block_on(
             SqlitePoolOptions::new()
                 .max_connections(1)
@@ -193,8 +195,15 @@ impl TaskStore {
             state: "active".to_string(),
             last_verified_commit: None,
         };
-        self.runtime.block_on(sqlx::query("INSERT INTO tasks(task_id,run_id,name,instructions,read_scope,write_scope,verification,base_commit,worktree_path,state,last_verified_commit) VALUES (?,?,?,?,?,?,?,?,?,?,NULL)")
-            .bind(&record.id).bind(&record.run_id).bind(&record.name).bind(&record.instructions).bind(encode(&record.read_scope)).bind(encode(&record.write_scope)).bind(encode(&record.verification)).bind(&record.base_commit).bind(record.worktree_path.to_string_lossy().as_ref()).bind(&record.state).execute(&self.pool))?;
+        if let Err(error) = self.runtime.block_on(sqlx::query("INSERT INTO tasks(task_id,run_id,name,instructions,read_scope,write_scope,verification,base_commit,worktree_path,state,last_verified_commit) VALUES (?,?,?,?,?,?,?,?,?,?,NULL)")
+            .bind(&record.id).bind(&record.run_id).bind(&record.name).bind(&record.instructions).bind(encode(&record.read_scope)).bind(encode(&record.write_scope)).bind(encode(&record.verification)).bind(&record.base_commit).bind(record.worktree_path.to_string_lossy().as_ref()).bind(&record.state).execute(&self.pool)) {
+            remove_task_worktree(
+                &self.integration_worktree,
+                &self.worktree_root,
+                &record.worktree_path,
+            )?;
+            return Err(error.into());
+        }
         Ok(record)
     }
 
@@ -337,32 +346,46 @@ impl TaskStore {
                 ));
             }
         }
+        self.runtime.block_on(self.integrate_locked(task_id, task))
+    }
+
+    async fn integrate_locked(
+        &self,
+        task_id: &str,
+        task: TaskRecord,
+    ) -> Result<IntegrationResult, TaskStoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE integration_lock SET generation=generation+1 WHERE id=1")
+            .execute(&mut *tx)
+            .await?;
         if !worktree_clean(&self.integration_worktree)? {
             return Err(TaskStoreError::Integration(
                 "integration worktree has uncommitted changes".to_string(),
             ));
         }
-        if ["CHERRY_PICK_HEAD", "MERGE_HEAD", "REBASE_HEAD"]
-            .iter()
-            .any(|name| {
-                git_stdout(
-                    &self.integration_worktree,
-                    ["rev-parse", "-q", "--verify", name],
-                )
-                .is_ok()
-            })
-        {
+        if git_operation_in_progress(&self.integration_worktree)? {
             return Err(TaskStoreError::Integration(
                 "integration worktree has a Git operation in progress".to_string(),
             ));
         }
-        let incomplete: i64 = self.runtime.block_on(sqlx::query_scalar("SELECT COUNT(*) FROM task_commits c JOIN task_operations o ON o.operation_id=c.operation_id WHERE c.task_id=? AND o.terminal_state != 'completed'").bind(task_id).fetch_one(&self.pool))?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_operations WHERE task_id=? AND terminal_state IS NULL",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active != 0 {
+            return Err(TaskStoreError::Integration(
+                "task has an active operation".to_string(),
+            ));
+        }
+        let incomplete: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_commits c JOIN task_operations o ON o.operation_id=c.operation_id WHERE c.task_id=? AND o.terminal_state != 'completed'").bind(task_id).fetch_one(&mut *tx).await?;
         if incomplete != 0 {
             return Err(TaskStoreError::Integration(
                 "task has commits from an incomplete operation".to_string(),
             ));
         }
-        let rows = self.runtime.block_on(sqlx::query("SELECT source_commit,agent_id,model,summary FROM task_commits WHERE task_id=? ORDER BY sequence").bind(task_id).fetch_all(&self.pool))?;
+        let rows = sqlx::query("SELECT source_commit,agent_id,model,summary FROM task_commits WHERE task_id=? ORDER BY sequence").bind(task_id).fetch_all(&mut *tx).await?;
         let source: Vec<TaskCommit> = rows
             .into_iter()
             .map(|row| TaskCommit {
@@ -373,7 +396,20 @@ impl TaskStore {
                 summary: row.get(3),
             })
             .collect();
+        let task_head = git_stdout(&task.worktree_path, ["rev-parse", "HEAD"])?;
+        let history = enumerate_commits(&task.worktree_path, &task.base_commit, &task_head)?;
+        if history.len() != source.len()
+            || history
+                .iter()
+                .zip(&source)
+                .any(|((commit, _), attributed)| commit != &attributed.source_commit)
+        {
+            return Err(TaskStoreError::Integration(
+                "task history does not exactly match attributed commits".to_string(),
+            ));
+        }
         let pre_head = git_stdout(&self.integration_worktree, ["rev-parse", "HEAD"])?;
+        let mut result_commits = Vec::with_capacity(source.len());
         for commit in &source {
             if let Err(error) = git_status(
                 &self.integration_worktree,
@@ -383,37 +419,38 @@ impl TaskStore {
                     &commit.source_commit,
                 ],
             ) {
-                let _ = git_status(&self.integration_worktree, ["cherry-pick", "--abort"]);
-                let current = git_stdout(&self.integration_worktree, ["rev-parse", "HEAD"])
-                    .unwrap_or_default();
-                if current != pre_head {
-                    return Err(TaskStoreError::Integration(
-                        "cherry-pick conflict changed integration HEAD; preserved for recovery"
-                            .to_string(),
-                    ));
-                }
+                rollback_integration(&self.integration_worktree, &pre_head)?;
                 return Err(TaskStoreError::Integration(error.to_string()));
             }
-        }
-        let mut result_commits = Vec::with_capacity(source.len());
-        for commit in &source {
             let integrated = git_stdout(&self.integration_worktree, ["rev-parse", "HEAD"])?;
             result_commits.push(TaskCommit {
-                integrated_commit: Some(integrated.clone()),
+                integrated_commit: Some(integrated),
                 ..commit.clone()
             });
         }
-        self.runtime.block_on(async {
-            let mut tx = self.pool.begin().await?;
-            for commit in &result_commits { sqlx::query("UPDATE task_commits SET integrated_commit=? WHERE task_id=? AND source_commit=?").bind(commit.integrated_commit.as_deref()).bind(task_id).bind(&commit.source_commit).execute(&mut *tx).await?; }
-            sqlx::query("UPDATE tasks SET state='integrated' WHERE task_id=?").bind(task_id).execute(&mut *tx).await?;
-            tx.commit().await
-        })?;
-        remove_task_worktree(
+        for commit in &result_commits {
+            sqlx::query(
+                "UPDATE task_commits SET integrated_commit=? WHERE task_id=? AND source_commit=?",
+            )
+            .bind(commit.integrated_commit.as_deref())
+            .bind(task_id)
+            .bind(&commit.source_commit)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE tasks SET state='integrated' WHERE task_id=?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Err(error) = remove_task_worktree(
             &self.integration_worktree,
             &self.worktree_root,
             &task.worktree_path,
-        )?;
+        ) {
+            rollback_integration(&self.integration_worktree, &pre_head)?;
+            return Err(error);
+        }
+        tx.commit().await?;
         Ok(IntegrationResult {
             task_id: task_id.to_string(),
             commits: result_commits,
@@ -427,7 +464,9 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
       CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));";
+      CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
+      CREATE TABLE IF NOT EXISTS integration_lock(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL);
+      INSERT OR IGNORE INTO integration_lock(id,generation) VALUES(1,0);";
     for statement in statements
         .split(';')
         .filter(|statement| !statement.trim().is_empty())
@@ -496,15 +535,23 @@ where
 }
 fn format_git_error(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mut text = stderr.trim().to_string();
-    if text.len() > MAX_GIT_OUTPUT {
-        text.truncate(MAX_GIT_OUTPUT);
-    }
+    let text = bound_git_output(stderr.trim().to_string());
     if text.is_empty() {
         format!("exit status {}", output.status)
     } else {
         text
     }
+}
+
+fn bound_git_output(mut text: String) -> String {
+    if text.len() > MAX_GIT_OUTPUT {
+        let mut end = MAX_GIT_OUTPUT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 fn enumerate_commits(
     worktree: &Path,
@@ -547,11 +594,57 @@ fn remove_task_worktree(
             "refusing to remove worktree outside Flowdex root".to_string(),
         ));
     }
+    let registered = git_stdout(integration, ["worktree", "list", "--porcelain"])?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|listed| fs::canonicalize(listed).ok())
+        .any(|listed| listed == canonical_path);
+    if !registered {
+        return Err(TaskStoreError::Integration(
+            "refusing to remove an unregistered task worktree".to_string(),
+        ));
+    }
     let mut args = vec!["worktree".into(), "remove".into(), "--force".into()];
     args.push(path.as_os_str().to_os_string());
-    let _ = git_status(integration, args);
-    if path.exists() {
-        fs::remove_dir_all(path)?;
+    git_status(integration, args)
+}
+
+fn git_operation_in_progress(worktree: &Path) -> Result<bool, TaskStoreError> {
+    for state in [
+        "CHERRY_PICK_HEAD",
+        "MERGE_HEAD",
+        "REBASE_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-apply",
+        "rebase-merge",
+        "sequencer",
+    ] {
+        let path = git_stdout(worktree, ["rev-parse", "--git-path", state])?;
+        let path = PathBuf::from(path);
+        if (if path.is_absolute() {
+            path
+        } else {
+            worktree.join(path)
+        })
+        .exists()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rollback_integration(worktree: &Path, pre_head: &str) -> Result<(), TaskStoreError> {
+    if git_operation_in_progress(worktree)? {
+        let _ = git_status(worktree, ["cherry-pick", "--abort"]);
+    }
+    git_status(worktree, ["reset", "--hard", pre_head])?;
+    let head = git_stdout(worktree, ["rev-parse", "HEAD"])?;
+    if head != pre_head || !worktree_clean(worktree)? || git_operation_in_progress(worktree)? {
+        return Err(TaskStoreError::Integration(
+            "integration rollback did not restore the original Git state".to_string(),
+        ));
     }
     Ok(())
 }
@@ -619,13 +712,21 @@ mod tests {
             .unwrap();
         fs::write(task.worktree_path.join("x"), "change").unwrap();
         git(&task.worktree_path, &["add", "x"]);
-        git(&task.worktree_path, &["commit", "-qm", "change"]);
+        git(&task.worktree_path, &["commit", "-qm", "first"]);
+        fs::write(task.worktree_path.join("y"), "change").unwrap();
+        git(&task.worktree_path, &["add", "y"]);
+        git(&task.worktree_path, &["commit", "-qm", "second"]);
         let commits = store.finish_operation("task", "op", "completed").unwrap();
-        assert_eq!(commits.len(), 1);
+        assert_eq!(commits.len(), 2);
         let result = store.integrate("task").unwrap();
-        assert_eq!(result.commits.len(), 1);
+        assert_eq!(result.commits.len(), 2);
+        assert_ne!(
+            result.commits[0].integrated_commit,
+            result.commits[1].integrated_commit
+        );
         assert!(!task.worktree_path.exists());
         assert!(repo.path().join("x").exists());
+        assert!(repo.path().join("y").exists());
     }
     #[test]
     fn conflict_preserves_task_and_rolls_back() {
@@ -660,5 +761,58 @@ mod tests {
             git_stdout(repo.path(), ["rev-parse", "HEAD"]).unwrap()
         );
         assert!(task.worktree_path.exists());
+    }
+
+    #[test]
+    fn integration_rejects_active_and_unattributed_history() {
+        let (_repo, _home, store, run) = store();
+        let task = store
+            .create_task(
+                &run,
+                &TaskDeclaration {
+                    id: "task".into(),
+                    name: "n".into(),
+                    instructions: "i".into(),
+                    read_scope: vec![],
+                    write_scope: vec![],
+                    verification: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .start_operation("task", "op", "agent", "model")
+            .unwrap();
+        assert!(store.integrate("task").is_err());
+        store.finish_operation("task", "op", "completed").unwrap();
+        fs::write(task.worktree_path.join("unattributed"), "change").unwrap();
+        git(&task.worktree_path, &["add", "unattributed"]);
+        git(&task.worktree_path, &["commit", "-qm", "unattributed"]);
+        assert!(store.integrate("task").is_err());
+    }
+
+    #[test]
+    fn metadata_failure_removes_created_worktree() {
+        let (_repo, _home, store, run) = store();
+        let declaration = TaskDeclaration {
+            id: "task".into(),
+            name: "n".into(),
+            instructions: "i".into(),
+            read_scope: vec![],
+            write_scope: vec![],
+            verification: vec![],
+        };
+        store.create_task(&run, &declaration).unwrap();
+        let mut second_run = run.clone();
+        second_run.run_id = "second".into();
+        assert!(store.create_task(&second_run, &declaration).is_err());
+        assert!(!store.worktree_root.join("second").join("task").exists());
+    }
+
+    #[test]
+    fn git_output_bound_preserves_utf8() {
+        let text = "a".repeat(MAX_GIT_OUTPUT - 1) + "é";
+        let bounded = bound_git_output(text);
+        assert_eq!(bounded.len(), MAX_GIT_OUTPUT - 1);
+        assert!(bounded.is_char_boundary(bounded.len()));
     }
 }
