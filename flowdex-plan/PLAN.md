@@ -4,7 +4,7 @@
 
 Flowdex adds model-authored JavaScript workflows to the Codex backend. The planner saves a workflow under `.flowdex/workflows/` and starts it through a model tool. The runtime then manages agents, task queues, verification, reviews, context, and event-driven suspension without repeatedly waking the orchestrator.
 
-Plain JavaScript workflows run in Codex's existing native V8 code-mode runtime. Rust owns durable orchestration, Git worktrees, events, attribution, and SQLite state.
+Plain JavaScript runs through Codex's existing native V8 code-mode runtime. Rust owns durable orchestration, Git worktrees, events, attribution, and SQLite state.
 
 ## Workflow and Agent Interfaces
 
