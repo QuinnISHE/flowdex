@@ -266,7 +266,8 @@ impl TaskStore {
             if git_status(
                 &task.worktree_path,
                 ["merge-base", "--is-ancestor", &start_commit, &head],
-            ).is_err()
+            )
+            .is_err()
             {
                 return Err(TaskStoreError::Operation(
                     "task history was rewritten".to_string(),

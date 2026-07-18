@@ -232,16 +232,6 @@ fn runtime_id(invocation: &ToolInvocation) -> Result<String, FunctionCallError> 
         )),
     }
 }
-fn local_cwd(invocation: &ToolInvocation) -> Result<PathBuf, FunctionCallError> {
-    invocation
-        .turn
-        .environments
-        .single_local_environment_cwd()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel("Flowdex tasks require one local environment".into())
-        })
-}
 async fn task_store(
     invocation: &ToolInvocation,
 ) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
