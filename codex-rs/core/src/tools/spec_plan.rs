@@ -12,6 +12,9 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::FlowdexSendMessageHandler;
+use crate::tools::handlers::FlowdexSpawnAgentHandler;
+use crate::tools::handlers::FlowdexWaitAgentHandler;
 use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
@@ -193,7 +196,10 @@ fn build_tool_specs_and_registry(
     add_tool_sources(&context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
-    let flowdex_nested_tool_specs = planned_tools
+    planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
+    planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
+    planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
+    let mut flowdex_nested_tool_specs = planned_tools
         .runtimes()
         .iter()
         .filter(|runtime| {
@@ -201,7 +207,12 @@ fn build_tool_specs_and_registry(
                 && runtime.exposure() != ToolExposure::Hidden
         })
         .map(|runtime| runtime.spec())
-        .collect();
+        .collect::<Vec<_>>();
+    flowdex_nested_tool_specs.extend([
+        FlowdexSpawnAgentHandler.spec(),
+        FlowdexSendMessageHandler.spec(),
+        FlowdexWaitAgentHandler.spec(),
+    ]);
     planned_tools.add_with_exposure(
         StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
         ToolExposure::DirectModelOnly,
