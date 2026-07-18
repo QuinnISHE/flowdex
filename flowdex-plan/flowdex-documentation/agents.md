@@ -47,4 +47,4 @@ emit(JSON.stringify(result));
 
 ## Current limits
 
-Batch 002 provides no task or phase layer, automatic review loop, worktree assignment, tool profiles, context chunks or context-reuse modes, model-facing suspension/steering, SQLite state, or scheduler. It also does not provide Flowdex-managed persistence, commits, or dynamic queue APIs. See [verification.md](verification.md) for the Batch 003 verification primitive and [progress.md](progress.md) for transient progress summaries.
+Batch 002 provides no task or phase layer, automatic review loop, worktree assignment, tool profiles, context chunks or context-reuse modes, SQLite state, or scheduler. Batch 005 adds model-facing event-driven suspension and steering through [waiting.md](waiting.md); it does not provide Flowdex-managed persistence, commits, or dynamic queue APIs. See [verification.md](verification.md) for the Batch 003 verification primitive and [progress.md](progress.md) for transient progress summaries.

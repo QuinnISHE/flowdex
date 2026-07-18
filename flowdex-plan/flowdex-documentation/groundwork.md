@@ -1,6 +1,6 @@
 # Flowdex Batch 001: Groundwork
 
-This document is the source of truth for the first Flowdex vertical slice: a saved JavaScript workflow is loaded and executed by Codex's existing native V8 code-mode runtime.
+This document is the source of truth for the first Flowdex vertical slice: a saved JavaScript workflow is loaded and executed by Codex's existing native V8 code-mode runtime. Event-driven orchestration waits are documented in [waiting.md](waiting.md).
 
 ## Starting a workflow
 
@@ -39,4 +39,4 @@ Execution reuses `CodeModeService`, the current turn's nested-tool definitions, 
 
 ## Explicit non-goals
 
-Batch 001 does not implement task or phase scheduling, dependencies or dynamic queues, agent spawning or messaging, waits or steering, verification/review loops, worktrees or commit attribution, persistence/configuration, context chunks or context gathering, progress events, installers, CLI workflow execution, or a `compact_context` Flowdex tool.
+Batch 001 does not implement task or phase scheduling, dependencies or dynamic queues, agent spawning or messaging, verification/review loops, worktrees or commit attribution, persistence/configuration, context chunks or context gathering, progress events, installers, CLI workflow execution, or a `compact_context` Flowdex tool. See [waiting.md](waiting.md) for the later event-driven wait contract.
