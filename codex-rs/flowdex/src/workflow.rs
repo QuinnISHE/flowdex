@@ -231,6 +231,10 @@ fn validate_task_shape(task: &TaskDefinition) -> Result<(), WorkflowValidationEr
     validate_commands(&task.verification)
 }
 
+pub fn validate_task_definition(task: &TaskDefinition) -> Result<(), WorkflowValidationError> {
+    validate_task_shape(task)
+}
+
 fn validate_commands(values: &[String]) -> Result<(), WorkflowValidationError> {
     for value in values {
         non_empty("command or scope", value)?;

@@ -1,5 +1,6 @@
 use crate::workflow::{
-    TaskDefinition, WorkflowDefinition, WorkflowValidationError, write_scope_conflicts,
+    validate_task_definition, write_scope_conflicts, TaskDefinition, WorkflowDefinition,
+    WorkflowValidationError,
 };
 use sha2::Digest;
 use sha2::Sha256;
@@ -280,6 +281,7 @@ impl FlowdexStore {
         task_id: &str,
         task: &TaskDefinition,
     ) -> Result<(), FlowdexStoreError> {
+        validate_task_definition(task)?;
         self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
             let phase = sqlx::query("SELECT open,sealed FROM workflow_phases WHERE run_id=? AND name=?")
