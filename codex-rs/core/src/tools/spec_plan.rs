@@ -5,7 +5,11 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::flowdex::FlowdexQueueTaskHandler;
+use crate::tools::flowdex::FlowdexSealPhaseHandler;
+use crate::tools::flowdex::FlowdexStartRunHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
+use crate::tools::flowdex::FlowdexWaitRunHandler;
 use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
@@ -214,6 +218,10 @@ fn build_tool_specs_and_registry(
         planned_tools.add_with_exposure(FlowdexTaskRunAgentHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexTaskVerifyHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexTaskIntegrateHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexStartRunHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexQueueTaskHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexSealPhaseHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexWaitRunHandler, ToolExposure::Hidden);
     }
     let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
         let name = runtime.tool_name();
@@ -246,6 +254,10 @@ fn build_tool_specs_and_registry(
             FlowdexTaskRunAgentHandler.spec(),
             FlowdexTaskVerifyHandler.spec(),
             FlowdexTaskIntegrateHandler.spec(),
+            FlowdexStartRunHandler.spec(),
+            FlowdexQueueTaskHandler.spec(),
+            FlowdexSealPhaseHandler.spec(),
+            FlowdexWaitRunHandler.spec(),
         ]);
     }
     if flowdex_verification_enabled {

@@ -19,10 +19,10 @@ use crate::tools::handlers::multi_agents_common::collab_spawn_error;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_flowdex::FlowdexStore;
+use codex_flowdex::FlowdexStoreError;
 use codex_flowdex::RunInfo;
 use codex_flowdex::TaskDeclaration;
-use codex_flowdex::TaskStore;
-use codex_flowdex::TaskStoreError;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseInputItem;
@@ -97,12 +97,12 @@ struct CreateArgs {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentSpec {
-    name: String,
-    instructions: String,
-    profile: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<ReasoningEffort>,
+pub(crate) struct AgentSpec {
+    pub(crate) name: String,
+    pub(crate) instructions: String,
+    pub(crate) profile: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -233,16 +233,16 @@ fn runtime_id(invocation: &ToolInvocation) -> Result<String, FunctionCallError> 
         )),
     }
 }
-async fn task_store(
+pub(crate) async fn task_store(
     invocation: &ToolInvocation,
-) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
+) -> Result<(FlowdexStore, PathBuf, String), FunctionCallError> {
     open_store(&invocation.session, &invocation.turn).await
 }
 
 async fn open_store(
     _session: &std::sync::Arc<crate::session::session::Session>,
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
-) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
+) -> Result<(FlowdexStore, PathBuf, String), FunctionCallError> {
     if !turn.config.active_project.is_trusted() {
         return Err(FunctionCallError::RespondToModel(
             "Flowdex tasks require a trusted Git repository".into(),
@@ -266,7 +266,7 @@ async fn open_store(
     let repository_identity = identity.clone();
     let store_cwd = cwd.clone();
     let store = tokio::task::spawn_blocking(move || {
-        TaskStore::open(&home, repository_identity, &store_cwd)
+        FlowdexStore::open(&home, repository_identity, &store_cwd)
     })
     .await
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
@@ -363,7 +363,7 @@ pub(crate) async fn finish_task_operation(
         .map_err(task_error)?;
     Ok(())
 }
-fn task_error(error: TaskStoreError) -> FunctionCallError {
+fn task_error(error: FlowdexStoreError) -> FunctionCallError {
     FunctionCallError::RespondToModel(format!("Flowdex task failed: {error}"))
 }
 
@@ -586,6 +586,29 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     Ok(JsonOutput(status_value(id, status)))
 }
 
+/// Runs a durable task through the Batch 009 agent lifecycle without going through the
+/// JavaScript/code-mode bridge. The scheduler uses this entry point for each ready task.
+pub(crate) async fn run_task_agent(
+    mut invocation: ToolInvocation,
+    task_id: String,
+    agent: AgentSpec,
+) -> Result<JsonOutput, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "task_id": task_id,
+            "agent": {
+                "name": agent.name,
+                "instructions": agent.instructions,
+                "profile": agent.profile,
+                "model": agent.model,
+                "reasoning_effort": agent.reasoning_effort,
+            }
+        })
+        .to_string(),
+    };
+    handle_run(invocation).await
+}
+
 async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {
     let args: TaskIdArgs = serde_json::from_str(&parse(
         invocation.payload.clone(),
@@ -658,6 +681,17 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     Ok(JsonOutput(result))
 }
 
+/// Verifies a durable task directly from Rust scheduler code.
+pub(crate) async fn verify_task(
+    mut invocation: ToolInvocation,
+    task_id: String,
+) -> Result<JsonOutput, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"task_id": task_id}).to_string(),
+    };
+    handle_verify(invocation).await
+}
+
 async fn handle_integrate(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {
     let args: TaskIdArgs = serde_json::from_str(&parse(
         invocation.payload.clone(),
@@ -674,6 +708,17 @@ async fn handle_integrate(invocation: ToolInvocation) -> Result<JsonOutput, Func
     Ok(JsonOutput(
         serde_json::json!({"taskId": result.task_id, "commits": commits}),
     ))
+}
+
+/// Integrates a durable task directly from Rust scheduler code.
+pub(crate) async fn integrate_task(
+    mut invocation: ToolInvocation,
+    task_id: String,
+) -> Result<JsonOutput, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"task_id": task_id}).to_string(),
+    };
+    handle_integrate(invocation).await
 }
 
 pub(crate) fn task_associated_agent(id: ThreadId) -> Option<String> {
