@@ -1147,7 +1147,9 @@ async fn compact_context_tool_skips_auto_compact_fallback() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_provider.name = "OpenAI (test)".into();
+            config.model_context_window = Some(50_000);
+            config.model_auto_compact_token_limit = Some(9_000);
             config.token_budget = Some(TokenBudgetConfig {
                 auto_compact_fallback_prompt: Some(AUTO_COMPACT_FALLBACK_PROMPT.to_string()),
                 auto_compact_fallback_buffer_tokens: Some(4_000),
