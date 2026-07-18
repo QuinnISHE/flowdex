@@ -120,10 +120,8 @@ impl WorkflowDefinition {
             {
                 return Err(WorkflowValidationError::AgentWithoutSelector(name.clone()));
             }
-            for value in [&agent.profile, &agent.model, &agent.reasoning_effort] {
-                if let Some(value) = value {
-                    non_empty("agent selector", value)?;
-                }
+            for value in [&agent.profile, &agent.model, &agent.reasoning_effort].into_iter().flatten() {
+                non_empty("agent selector", value)?;
             }
         }
         validate_commands(&self.verification)?;
