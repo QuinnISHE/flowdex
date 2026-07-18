@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
@@ -119,6 +120,7 @@ async fn handle_spawn_agent(
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
                     environments: Some(turn.environments.to_selections()),
+                    completion_delivery: SpawnAgentCompletionDelivery::NotifyParent,
                 },
             ),
     )
