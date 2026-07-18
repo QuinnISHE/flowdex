@@ -357,12 +357,17 @@ impl FlowdexStore {
     }
 
     pub fn set_run_state(&self, run_id: &str, state: RunState) -> Result<(), FlowdexStoreError> {
-        self.runtime.block_on(
+        let result = self.runtime.block_on(
             sqlx::query("UPDATE runs SET state=? WHERE run_id=?")
                 .bind(state.as_str())
                 .bind(run_id)
                 .execute(&self.pool),
         )?;
+        if result.rows_affected() == 0 {
+            return Err(FlowdexStoreError::Integration(format!(
+                "run not found: {run_id}"
+            )));
+        }
         Ok(())
     }
 
@@ -372,13 +377,18 @@ impl FlowdexStore {
         phase_name: &str,
         state: PhaseState,
     ) -> Result<(), FlowdexStoreError> {
-        self.runtime.block_on(
+        let result = self.runtime.block_on(
             sqlx::query("UPDATE workflow_phases SET state=? WHERE run_id=? AND name=?")
                 .bind(state.as_str())
                 .bind(run_id)
                 .bind(phase_name)
                 .execute(&self.pool),
         )?;
+        if result.rows_affected() == 0 {
+            return Err(FlowdexStoreError::Integration(format!(
+                "phase not found: {phase_name}"
+            )));
+        }
         Ok(())
     }
 
@@ -387,12 +397,15 @@ impl FlowdexStore {
         task_id: &str,
         state: SchedulerTaskState,
     ) -> Result<(), FlowdexStoreError> {
-        self.runtime.block_on(
+        let result = self.runtime.block_on(
             sqlx::query("UPDATE workflow_tasks SET state=? WHERE task_id=?")
                 .bind(state.as_str())
                 .bind(task_id)
                 .execute(&self.pool),
         )?;
+        if result.rows_affected() == 0 {
+            return Err(FlowdexStoreError::TaskNotFound(task_id.to_string()));
+        }
         Ok(())
     }
 
