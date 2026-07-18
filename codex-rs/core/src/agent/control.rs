@@ -64,12 +64,20 @@ pub(crate) enum SpawnAgentForkMode {
     LastNTurns(usize),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SpawnAgentCompletionDelivery {
+    #[default]
+    NotifyParent,
+    StatusOnly,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) completion_delivery: SpawnAgentCompletionDelivery,
 }
 
 #[derive(Clone, Debug)]
@@ -438,6 +446,7 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         child_reference: String,
         child_agent_path: Option<AgentPath>,
+        completion_delivery: SpawnAgentCompletionDelivery,
     ) {
         let Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
@@ -462,6 +471,10 @@ impl AgentControl {
                 Err(_) => control.get_status(child_thread_id).await,
             };
             if !is_final(&status) {
+                return;
+            }
+
+            if completion_delivery == SpawnAgentCompletionDelivery::StatusOnly {
                 return;
             }
 

@@ -551,6 +551,7 @@ impl AgentControl {
                 notification_source,
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                options.completion_delivery.clone(),
             );
         }
 
@@ -906,6 +907,7 @@ impl AgentControl {
                 Some(notification_source.clone()),
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                SpawnAgentCompletionDelivery::default(),
             );
         }
         self.persist_thread_spawn_edge_for_source(
