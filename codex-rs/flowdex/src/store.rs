@@ -1,6 +1,6 @@
 use crate::workflow::{
-    validate_task_definition, write_scope_conflicts, TaskDefinition, WorkflowDefinition,
-    WorkflowValidationError,
+    TaskDefinition, WorkflowDefinition, WorkflowValidationError, validate_task_definition,
+    write_scope_conflicts,
 };
 use sha2::Digest;
 use sha2::Sha256;
@@ -101,6 +101,7 @@ pub struct IntegrationResult {
 pub enum RunState {
     Queued,
     Running,
+    Verifying,
     Completed,
     Failed,
 }
@@ -109,6 +110,7 @@ impl RunState {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Verifying => "verifying",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
@@ -119,6 +121,7 @@ impl RunState {
 pub enum PhaseState {
     Pending,
     Running,
+    Verifying,
     Waiting,
     Sealed,
     Completed,
@@ -129,6 +132,7 @@ impl PhaseState {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::Verifying => "verifying",
             Self::Waiting => "waiting",
             Self::Sealed => "sealed",
             Self::Completed => "completed",
@@ -142,6 +146,7 @@ pub enum SchedulerTaskState {
     Queued,
     Ready,
     Running,
+    Attributing,
     Verified,
     Integrated,
     Failed,
@@ -152,6 +157,7 @@ impl SchedulerTaskState {
             Self::Queued => "queued",
             Self::Ready => "ready",
             Self::Running => "running",
+            Self::Attributing => "attributing",
             Self::Verified => "verified",
             Self::Integrated => "integrated",
             Self::Failed => "failed",
@@ -166,6 +172,43 @@ pub struct ScheduledTask {
     pub declaration_order: i64,
     pub agent: String,
     pub dependencies: Vec<String>,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledTaskDetails {
+    pub task_id: String,
+    pub run_id: String,
+    pub phase: String,
+    pub name: String,
+    pub agent: String,
+    pub instructions: String,
+    pub dependencies: Vec<String>,
+    pub read_scope: Vec<String>,
+    pub write_scope: Vec<String>,
+    pub verification: Vec<String>,
+    pub declaration_order: i64,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunMetadata {
+    pub run_id: String,
+    pub name: String,
+    pub verification: Vec<String>,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhaseMetadata {
+    pub run_id: String,
+    pub name: String,
+    pub index: i64,
+    pub total: i64,
+    pub instructions: String,
+    pub open: bool,
+    pub sealed: bool,
+    pub verification: Vec<String>,
     pub state: String,
 }
 
@@ -250,8 +293,8 @@ impl FlowdexStore {
         self.ensure_run(info)?;
         self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
-            sqlx::query("UPDATE runs SET name=?, state=? WHERE run_id=?")
-                .bind(&definition.name).bind(RunState::Queued.as_str()).bind(&info.run_id)
+            sqlx::query("UPDATE runs SET name=?, verification=?, state=? WHERE run_id=?")
+                .bind(&definition.name).bind(encode(&definition.verification)).bind(RunState::Queued.as_str()).bind(&info.run_id)
                 .execute(&mut *tx).await?;
             for (agent_name, agent) in &definition.agents {
                 sqlx::query("INSERT INTO workflow_agents(run_id,name,profile,model,reasoning_effort) VALUES (?,?,?,?,?)")
@@ -264,7 +307,7 @@ impl FlowdexStore {
                     .execute(&mut *tx).await?;
                 for (task_index, task) in phase.tasks.iter().enumerate() {
                     let task_id = format!("{}:{}:{}", info.run_id, phase.name, task.name);
-                    insert_schedule_row(&mut tx, &task_id, &info.run_id, &phase.name, task_index as i64, task, SchedulerTaskState::Queued).await?;
+                    insert_schedule_row(&mut tx, &task_id, &info.run_id, &phase.name, &phase.instructions, task_index as i64, task, SchedulerTaskState::Queued).await?;
                 }
             }
             tx.commit().await?;
@@ -284,7 +327,7 @@ impl FlowdexStore {
         validate_task_definition(task)?;
         self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let phase = sqlx::query("SELECT open,sealed FROM workflow_phases WHERE run_id=? AND name=?")
+            let phase = sqlx::query("SELECT open,sealed,instructions FROM workflow_phases WHERE run_id=? AND name=?")
                 .bind(run_id).bind(phase_name).fetch_optional(&mut *tx).await?
                 .ok_or_else(|| FlowdexStoreError::Integration(format!("phase not found: {phase_name}")))?;
             if phase.get::<i64, _>(0) == 0 || phase.get::<i64, _>(1) != 0 { return Err(FlowdexStoreError::Workflow(WorkflowValidationError::PhaseNotOpen(phase_name.to_string()))); }
@@ -297,7 +340,7 @@ impl FlowdexStore {
                 if exists == 0 { return Err(FlowdexStoreError::Workflow(WorkflowValidationError::UnknownDependency { phase: phase_name.to_string(), task: task.name.clone(), dependency: dependency.clone() })); }
             }
             let order: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(declaration_order),-1)+1 FROM workflow_tasks WHERE run_id=? AND phase=?").bind(run_id).bind(phase_name).fetch_one(&mut *tx).await?;
-            insert_schedule_row(&mut tx, task_id, run_id, phase_name, order, task, SchedulerTaskState::Queued).await?;
+            insert_schedule_row(&mut tx, task_id, run_id, phase_name, phase.get(2), order, task, SchedulerTaskState::Queued).await?;
             tx.commit().await?;
             Ok(())
         })
@@ -351,6 +394,110 @@ impl FlowdexStore {
                 .execute(&self.pool),
         )?;
         Ok(())
+    }
+
+    pub fn scheduler_task(&self, task_id: &str) -> Result<ScheduledTaskDetails, FlowdexStoreError> {
+        let row = self.runtime.block_on(sqlx::query("SELECT t.task_id,t.run_id,t.phase,t.name,t.agent,t.instructions,t.dependencies,t.read_scope,t.write_scope,t.verification,t.declaration_order,t.state FROM workflow_tasks t WHERE t.task_id=?").bind(task_id).fetch_optional(&self.pool))?.ok_or_else(|| FlowdexStoreError::TaskNotFound(task_id.to_string()))?;
+        Ok(ScheduledTaskDetails {
+            task_id: row.get(0),
+            run_id: row.get(1),
+            phase: row.get(2),
+            name: row.get(3),
+            agent: row.get(4),
+            instructions: row.get(5),
+            dependencies: decode(row.get(6)),
+            read_scope: decode(row.get(7)),
+            write_scope: decode(row.get(8)),
+            verification: decode(row.get(9)),
+            declaration_order: row.get(10),
+            state: row.get(11),
+        })
+    }
+
+    pub fn workflow_agent(
+        &self,
+        run_id: &str,
+        name: &str,
+    ) -> Result<crate::workflow::AgentDefinition, FlowdexStoreError> {
+        let row = self.runtime.block_on(sqlx::query("SELECT profile,model,reasoning_effort FROM workflow_agents WHERE run_id=? AND name=?").bind(run_id).bind(name).fetch_optional(&self.pool))?.ok_or_else(|| FlowdexStoreError::Integration(format!("agent not found: {name}")))?;
+        Ok(crate::workflow::AgentDefinition {
+            profile: row.get(0),
+            model: row.get(1),
+            reasoning_effort: row.get(2),
+        })
+    }
+
+    pub fn run_metadata(&self, run_id: &str) -> Result<RunMetadata, FlowdexStoreError> {
+        let row = self
+            .runtime
+            .block_on(
+                sqlx::query("SELECT run_id,name,verification,state FROM runs WHERE run_id=?")
+                    .bind(run_id)
+                    .fetch_optional(&self.pool),
+            )?
+            .ok_or_else(|| FlowdexStoreError::Integration(format!("run not found: {run_id}")))?;
+        Ok(RunMetadata {
+            run_id: row.get(0),
+            name: row.get(1),
+            verification: decode(row.get(2)),
+            state: row.get(3),
+        })
+    }
+
+    pub fn phase_metadata(
+        &self,
+        run_id: &str,
+        phase_name: &str,
+    ) -> Result<PhaseMetadata, FlowdexStoreError> {
+        let row = self.runtime.block_on(sqlx::query("SELECT run_id,name,declaration_order,instructions,open,sealed,verification,state,(SELECT COUNT(*) FROM workflow_phases p2 WHERE p2.run_id=workflow_phases.run_id) FROM workflow_phases WHERE run_id=? AND name=?").bind(run_id).bind(phase_name).fetch_optional(&self.pool))?.ok_or_else(|| FlowdexStoreError::Integration(format!("phase not found: {phase_name}")))?;
+        Ok(PhaseMetadata {
+            run_id: row.get(0),
+            name: row.get(1),
+            index: row.get(2),
+            total: row.get(8),
+            instructions: row.get(3),
+            open: row.get::<i64, _>(4) != 0,
+            sealed: row.get::<i64, _>(5) != 0,
+            verification: decode(row.get(6)),
+            state: row.get(7),
+        })
+    }
+
+    pub fn mark_task_running(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_scheduler_task_state(task_id, SchedulerTaskState::Running)
+    }
+    pub fn mark_task_attributing(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_scheduler_task_state(task_id, SchedulerTaskState::Attributing)
+    }
+    pub fn mark_task_integrated(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_scheduler_task_state(task_id, SchedulerTaskState::Integrated)
+    }
+    pub fn mark_task_failed(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_scheduler_task_state(task_id, SchedulerTaskState::Failed)
+    }
+    pub fn mark_phase_running(&self, run_id: &str, phase: &str) -> Result<(), FlowdexStoreError> {
+        self.set_phase_state(run_id, phase, PhaseState::Running)
+    }
+    pub fn mark_phase_verifying(&self, run_id: &str, phase: &str) -> Result<(), FlowdexStoreError> {
+        self.set_phase_state(run_id, phase, PhaseState::Verifying)
+    }
+    pub fn mark_phase_completed(&self, run_id: &str, phase: &str) -> Result<(), FlowdexStoreError> {
+        self.set_phase_state(run_id, phase, PhaseState::Completed)
+    }
+    pub fn mark_phase_failed(&self, run_id: &str, phase: &str) -> Result<(), FlowdexStoreError> {
+        self.set_phase_state(run_id, phase, PhaseState::Failed)
+    }
+    pub fn mark_run_running(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_run_state(run_id, RunState::Running)
+    }
+    pub fn mark_run_verifying(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_run_state(run_id, RunState::Verifying)
+    }
+    pub fn mark_run_completed(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_run_state(run_id, RunState::Completed)
+    }
+    pub fn mark_run_failed(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
+        self.set_run_state(run_id, RunState::Failed)
     }
 
     /// Marks queued tasks ready only after all dependency tasks integrated.
@@ -737,12 +884,14 @@ async fn insert_schedule_row(
     task_id: &str,
     run_id: &str,
     phase: &str,
+    phase_instructions: &str,
     declaration_order: i64,
     task: &TaskDefinition,
     state: SchedulerTaskState,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO workflow_tasks(task_id,run_id,phase,name,declaration_order,agent,dependencies,read_scope,write_scope,verification,state) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(task_id).bind(run_id).bind(phase).bind(&task.name).bind(declaration_order).bind(&task.agent)
+    let instructions = format!("{phase_instructions}\n\n{}", task.instructions);
+    sqlx::query("INSERT INTO workflow_tasks(task_id,run_id,phase,name,instructions,declaration_order,agent,dependencies,read_scope,write_scope,verification,state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(task_id).bind(run_id).bind(phase).bind(&task.name).bind(instructions).bind(declaration_order).bind(&task.agent)
         .bind(encode(&task.dependencies)).bind(encode(&task.read_scope)).bind(encode(&task.write_scope)).bind(encode(&task.verification)).bind(state.as_str())
         .execute(&mut **tx).await?;
     Ok(())
@@ -751,11 +900,11 @@ async fn insert_schedule_row(
 async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let statements = "PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS repository(identity TEXT NOT NULL PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'queued');
+      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued');
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
       CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,PRIMARY KEY(run_id,name));
-      CREATE TABLE IF NOT EXISTS workflow_tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,phase TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,agent TEXT NOT NULL,dependencies TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,UNIQUE(run_id,phase,name));
+      CREATE TABLE IF NOT EXISTS workflow_tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,phase TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL DEFAULT '',declaration_order INTEGER NOT NULL,agent TEXT NOT NULL,dependencies TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,UNIQUE(run_id,phase,name));
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
       CREATE TABLE IF NOT EXISTS integration_lock(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL);
@@ -770,6 +919,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for statement in [
         "ALTER TABLE runs ADD COLUMN name TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE runs ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'",
+        "ALTER TABLE runs ADD COLUMN verification TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE workflow_tasks ADD COLUMN instructions TEXT NOT NULL DEFAULT ''",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
@@ -952,6 +1103,7 @@ fn rollback_integration(worktree: &Path, pre_head: &str) -> Result<(), FlowdexSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::{AgentDefinition, PhaseDefinition, TaskDefinition, WorkflowDefinition};
     use codex_utils_absolute_path::AbsolutePathBuf;
     use std::fs;
     use tempfile::tempdir;
@@ -1147,5 +1299,68 @@ mod tests {
         let bounded = bound_git_output(text);
         assert_eq!(bounded.len(), MAX_GIT_OUTPUT - 1);
         assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    #[test]
+    fn scheduler_getters_and_transitions_are_durable() {
+        let (_repo, _home, store, run) = store();
+        let definition = WorkflowDefinition {
+            name: "workflow".into(),
+            agents: [(
+                "worker".into(),
+                AgentDefinition {
+                    profile: Some("implementation_worker".into()),
+                    model: None,
+                    reasoning_effort: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            verification: vec!["git diff --check".into()],
+            phases: vec![PhaseDefinition {
+                name: "phase".into(),
+                instructions: "phase instructions".into(),
+                open: false,
+                verification: vec!["cargo test".into()],
+                tasks: vec![TaskDefinition {
+                    name: "task".into(),
+                    agent: "worker".into(),
+                    instructions: "task instructions".into(),
+                    dependencies: vec![],
+                    read_scope: vec!["src/**".into()],
+                    write_scope: vec!["src/**".into()],
+                    verification: vec![],
+                }],
+            }],
+        };
+        store.initialize_workflow(&run, &definition).unwrap();
+        let task = store.scheduler_task("run:phase:task").unwrap();
+        assert_eq!(task.instructions, "phase instructions\n\ntask instructions");
+        assert_eq!(task.agent, "worker");
+        assert_eq!(
+            store
+                .workflow_agent("run", "worker")
+                .unwrap()
+                .profile
+                .as_deref(),
+            Some("implementation_worker")
+        );
+        assert_eq!(
+            store.run_metadata("run").unwrap().verification,
+            vec!["git diff --check"]
+        );
+        assert_eq!(store.phase_metadata("run", "phase").unwrap().total, 1);
+        store.mark_run_running("run").unwrap();
+        store.mark_phase_running("run", "phase").unwrap();
+        store.mark_task_running("run:phase:task").unwrap();
+        store.mark_task_attributing("run:phase:task").unwrap();
+        store.mark_task_integrated("run:phase:task").unwrap();
+        store.mark_phase_completed("run", "phase").unwrap();
+        store.mark_run_completed("run").unwrap();
+        assert_eq!(
+            store.scheduler_task("run:phase:task").unwrap().state,
+            "integrated"
+        );
+        assert_eq!(store.run_metadata("run").unwrap().state, "completed");
     }
 }
