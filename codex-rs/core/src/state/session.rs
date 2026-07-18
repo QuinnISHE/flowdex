@@ -200,6 +200,10 @@ impl SessionState {
         self.auto_compact_window.take_pending_context_action()
     }
 
+    pub(crate) fn clear_pending_compact_request(&mut self) {
+        self.auto_compact_window.clear_pending_compact_request();
+    }
+
     pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
         let window = self.auto_compact_window.advance();
         self.auto_compact_window.clear_prefill();

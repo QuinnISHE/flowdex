@@ -3571,6 +3571,11 @@ impl Session {
         state.take_pending_context_action()
     }
 
+    pub(crate) async fn clear_pending_compact_request(&self) {
+        let mut state = self.state.lock().await;
+        state.clear_pending_compact_request();
+    }
+
     pub(crate) async fn start_new_context_window(
         &self,
         turn_context: &TurnContext,

@@ -1124,3 +1124,58 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_context_tool_skips_auto_compact_fallback() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call("compact-call", "compact_context", "{}"),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 9_500),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_context_window = Some(10_000);
+            config.token_budget = Some(TokenBudgetConfig {
+                auto_compact_fallback_prompt: Some(AUTO_COMPACT_FALLBACK_PROMPT.to_string()),
+                auto_compact_fallback_buffer_tokens: Some(4_000),
+                ..TokenBudgetConfig::default()
+            });
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("test config should allow token budget");
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("request compact context").await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[1].body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(
+        tool_names(&requests[0])
+            .iter()
+            .any(|name| name == "compact_context"),
+        "compact_context should be exposed when token budget is enabled"
+    );
+    assert!(
+        !requests[1].body_contains_text("request compact context"),
+        "compact_context should drop prior window history before continuing"
+    );
+
+    Ok(())
+}

@@ -350,7 +350,11 @@ pub(crate) async fn run_turn(
                         pending_context_action,
                         Some(crate::state::PendingContextAction::NewContextWindow)
                     ) || token_limit_reached);
-                let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
+                let allow_auto_compact_fallback = !matches!(
+                    pending_context_action,
+                    Some(crate::state::PendingContextAction::Compact)
+                ) && !should_roll_over
+                    && !token_limit_reached;
                 super::token_budget::maybe_record(
                     sess.as_ref(),
                     turn_context.as_ref(),
@@ -377,11 +381,13 @@ pub(crate) async fn run_turn(
                     .await
                     {
                         if matches!(err, CodexErr::TurnAborted) {
+                            sess.clear_pending_compact_request().await;
                             return Err(err);
                         }
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
+                        sess.clear_pending_compact_request().await;
                         return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;
@@ -402,11 +408,13 @@ pub(crate) async fn run_turn(
                     .await
                     {
                         if matches!(err, CodexErr::TurnAborted) {
+                            sess.clear_pending_compact_request().await;
                             return Err(err);
                         }
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
+                        sess.clear_pending_compact_request().await;
                         return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;
@@ -467,6 +475,7 @@ pub(crate) async fn run_turn(
                 continue;
             }
             Err(err @ CodexErr::TurnAborted) => {
+                sess.clear_pending_compact_request().await;
                 return Err(err);
             }
             Err(codex_error @ CodexErr::InvalidImageRequest()) => {
@@ -506,6 +515,7 @@ pub(crate) async fn run_turn(
         }
     }
 
+    sess.clear_pending_compact_request().await;
     Ok(last_agent_message)
 }
 

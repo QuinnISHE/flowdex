@@ -112,6 +112,12 @@ impl AutoCompactWindow {
         self.pending_context_action.take()
     }
 
+    pub(super) fn clear_pending_compact_request(&mut self) {
+        if self.pending_context_action == Some(PendingContextAction::Compact) {
+            self.pending_context_action = None;
+        }
+    }
+
     /// Records the request-input side of the first server usage sample. The
     /// sampled output from that response is body growth and should remain
     /// counted against the scoped auto-compact budget.
@@ -201,6 +207,14 @@ mod tests {
             Some(PendingContextAction::Compact)
         );
         window.request_compact();
+        window.clear_pending_compact_request();
+        assert_eq!(window.take_pending_context_action(), None);
+        window.request_new_context_window();
+        window.clear_pending_compact_request();
+        assert_eq!(
+            window.take_pending_context_action(),
+            Some(PendingContextAction::NewContextWindow)
+        );
         let (window_number, ids) = window.advance();
         assert_eq!(window_number, 4);
         assert_eq!(window.window_number(), 4);
