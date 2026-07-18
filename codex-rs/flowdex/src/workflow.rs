@@ -1,38 +1,50 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentDefinition {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowDefinition {
     pub name: String,
     pub agents: BTreeMap<String, AgentDefinition>,
+    #[serde(default)]
     pub verification: Vec<String>,
     pub phases: Vec<PhaseDefinition>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PhaseDefinition {
     pub name: String,
     pub instructions: String,
     pub tasks: Vec<TaskDefinition>,
+    #[serde(default)]
     pub open: bool,
+    #[serde(default)]
     pub verification: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskDefinition {
     pub name: String,
     pub agent: String,
     pub instructions: String,
+    #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default)]
     pub read_scope: Vec<String>,
+    #[serde(default)]
     pub write_scope: Vec<String>,
+    #[serde(default)]
     pub verification: Vec<String>,
 }
 
