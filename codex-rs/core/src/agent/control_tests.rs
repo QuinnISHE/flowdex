@@ -3,6 +3,7 @@ use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
+use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
@@ -2356,6 +2357,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         })),
         tester_path.to_string(),
         Some(tester_path.clone()),
+        SpawnAgentCompletionDelivery::NotifyParent,
     );
     let tester_turn = tester_thread.session.new_default_turn().await;
     tester_thread
@@ -2444,6 +2446,7 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
         })),
         child_thread_id.to_string(),
         /*child_agent_path*/ None,
+        SpawnAgentCompletionDelivery::NotifyParent,
     );
 
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);
