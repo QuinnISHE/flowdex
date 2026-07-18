@@ -158,6 +158,15 @@ impl AgentControl {
             .await
     }
 
+    /// Submit the standalone native compaction operation to an existing agent.
+    pub(crate) async fn submit_compaction(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let state = self.upgrade()?;
+        let op = Op::Compact;
+        self.ensure_execution_capacity_for_op(agent_id, &op).await?;
+        self.handle_thread_request_result(agent_id, &state, state.send_op(agent_id, op).await)
+            .await
+    }
+
     async fn send_input_after_capacity_check(
         &self,
         agent_id: ThreadId,
@@ -350,6 +359,27 @@ impl AgentControl {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         Ok(thread.subscribe_status())
+    }
+
+    /// Wait for a terminal status emitted after a new operation was submitted.
+    ///
+    /// The first status change is always awaited so a terminal status from the
+    /// preceding operation cannot satisfy this waiter. Tokio's watch channel
+    /// coalesces fast transitions, so the changed value may already be terminal.
+    pub(crate) async fn wait_for_submitted_operation(
+        &self,
+        agent_id: ThreadId,
+        mut status_rx: watch::Receiver<AgentStatus>,
+    ) -> AgentStatus {
+        loop {
+            if status_rx.changed().await.is_err() {
+                return self.get_status(agent_id).await;
+            }
+            let status = status_rx.borrow().clone();
+            if is_final(&status) {
+                return status;
+            }
+        }
     }
 
     pub(crate) async fn format_environment_context_subagents(

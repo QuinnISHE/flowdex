@@ -544,6 +544,55 @@ async fn subscribe_status_updates_on_shutdown() {
 }
 
 #[tokio::test]
+async fn wait_for_submitted_operation_ignores_stale_terminal_status() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    let (status_tx, status_rx) =
+        tokio::sync::watch::channel(AgentStatus::Completed(Some("previous turn".to_string())));
+
+    // A terminal value from before submission must not satisfy the waiter.
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            control.wait_for_submitted_operation(agent_id, status_rx.clone()),
+        )
+        .await
+        .is_err()
+    );
+
+    // Both updates may be coalesced before the waiter runs; the latest terminal
+    // value still belongs to the newly submitted operation.
+    status_tx.send(AgentStatus::Running).unwrap();
+    status_tx
+        .send(AgentStatus::Completed(Some("new turn".to_string())))
+        .unwrap();
+    let status = control
+        .wait_for_submitted_operation(agent_id, status_rx)
+        .await;
+    assert_eq!(status, AgentStatus::Completed(Some("new turn".to_string())));
+}
+
+#[tokio::test]
+async fn submit_compaction_submits_standalone_compact_operation() {
+    let harness = AgentControlHarness::new().await;
+    let (thread_id, _thread) = harness.start_thread().await;
+
+    harness
+        .control
+        .submit_compaction(thread_id)
+        .await
+        .expect("compaction should submit");
+
+    assert!(
+        harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|entry| entry == (thread_id, Op::Compact))
+    );
+}
+
+#[tokio::test]
 async fn send_input_submits_user_message() {
     let harness = AgentControlHarness::new().await;
     let (thread_id, _thread) = harness.start_thread().await;
