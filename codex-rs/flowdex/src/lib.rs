@@ -1,6 +1,8 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
-use std::path::{Component, Path, PathBuf};
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use thiserror::Error;
 
 const WORKFLOW_DIRECTORY: [&str; 2] = [".flowdex", "workflows"];
@@ -43,8 +45,8 @@ impl WorkflowLoader {
             return Err(WorkflowLoadError::OutsideWorkflowRoot);
         }
 
-        let source = std::fs::read_to_string(&canonical_target)
-            .map_err(WorkflowLoadError::read_workflow)?;
+        let source =
+            std::fs::read_to_string(&canonical_target).map_err(WorkflowLoadError::read_workflow)?;
         let input = serde_json::to_string(input.unwrap_or(&Value::Null))
             .map_err(WorkflowLoadError::serialize_bootstrap)?;
         let workflow_path = workflow_display_path(&relative_path)?;
@@ -210,9 +212,11 @@ mod tests {
             .expect("workflow should load");
         assert!(loaded.source.starts_with("const flowdex = Object.freeze({"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
-        assert!(loaded
-            .source
-            .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#));
+        assert!(
+            loaded
+                .source
+                .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#)
+        );
         assert!(loaded.source.ends_with("emit('hello');"));
     }
 
