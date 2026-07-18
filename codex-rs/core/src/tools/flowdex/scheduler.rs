@@ -1,14 +1,19 @@
 use super::task::{self, AgentSpec};
+use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::{
     FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output,
 };
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::{
+    FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
+};
 use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
 use codex_flowdex::store::{FlowdexStore, RunInfo, RunState, SchedulerTaskState, TaskDeclaration};
 use codex_flowdex::{PhaseDefinition, TaskDefinition, WorkflowDefinition};
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_tools::shell_command_backend_for_features;
 use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -20,6 +25,8 @@ const START: &str = "flowdex_start_run";
 const QUEUE: &str = "flowdex_queue_task";
 const SEAL: &str = "flowdex_seal_phase";
 const WAIT: &str = "flowdex_wait_run";
+const DIRECT_QUEUE: &str = "queue_flowdex_task";
+const DIRECT_SEAL: &str = "seal_flowdex_phase";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,8 +65,11 @@ struct RawWorkflow {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAgent {
+    #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
     reasoning_effort: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -68,6 +78,7 @@ struct RawPhase {
     name: String,
     instructions: String,
     tasks: Vec<RawTask>,
+    #[serde(default)]
     open: bool,
     #[serde(default)]
     verification: Vec<String>,
@@ -162,6 +173,8 @@ pub(crate) struct FlowdexStartRunHandler;
 pub(crate) struct FlowdexQueueTaskHandler;
 pub(crate) struct FlowdexSealPhaseHandler;
 pub(crate) struct FlowdexWaitRunHandler;
+pub(crate) struct QueueFlowdexTaskHandler;
+pub(crate) struct SealFlowdexPhaseHandler;
 
 macro_rules! handler {
     ($ty:ty, $name:expr, $spec:ident, $call:ident) => {
@@ -183,6 +196,32 @@ handler!(FlowdexStartRunHandler, START, start_spec, start_call);
 handler!(FlowdexQueueTaskHandler, QUEUE, queue_spec, queue_call);
 handler!(FlowdexSealPhaseHandler, SEAL, seal_spec, seal_call);
 handler!(FlowdexWaitRunHandler, WAIT, wait_spec, wait_call);
+
+impl ToolExecutor<ToolInvocation> for QueueFlowdexTaskHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(DIRECT_QUEUE)
+    }
+    fn spec(&self) -> ToolSpec {
+        queue_spec_named(DIRECT_QUEUE)
+    }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move { queue_call(invocation).await.map(boxed_tool_output) })
+    }
+}
+impl CoreToolRuntime for QueueFlowdexTaskHandler {}
+
+impl ToolExecutor<ToolInvocation> for SealFlowdexPhaseHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(DIRECT_SEAL)
+    }
+    fn spec(&self) -> ToolSpec {
+        seal_spec_named(DIRECT_SEAL)
+    }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move { seal_call(invocation).await.map(boxed_tool_output) })
+    }
+}
+impl CoreToolRuntime for SealFlowdexPhaseHandler {}
 
 fn spec(
     name: &str,
@@ -218,8 +257,11 @@ fn start_spec() -> ToolSpec {
     )
 }
 fn queue_spec() -> ToolSpec {
+    queue_spec_named(QUEUE)
+}
+fn queue_spec_named(name: &str) -> ToolSpec {
     spec(
-        QUEUE,
+        name,
         "Queue a task in an open Flowdex phase.",
         vec![
             ("run_id", JsonSchema::string(None)),
@@ -230,8 +272,11 @@ fn queue_spec() -> ToolSpec {
     )
 }
 fn seal_spec() -> ToolSpec {
+    seal_spec_named(SEAL)
+}
+fn seal_spec_named(name: &str) -> ToolSpec {
     spec(
-        SEAL,
+        name,
         "Seal an open Flowdex phase.",
         vec![
             ("run_id", JsonSchema::string(None)),
@@ -252,7 +297,7 @@ fn wait_spec() -> ToolSpec {
 async fn start_call(invocation: ToolInvocation) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let ToolInvocation {
         session,
-        turn,
+        turn: _,
         payload: ToolPayload::Function { arguments },
         ..
     } = invocation.clone()
@@ -302,10 +347,8 @@ async fn start_call(invocation: ToolInvocation) -> Result<Box<dyn ToolOutput>, F
         .lock()
         .await
         .insert(run_id.clone(), Arc::clone(&controller));
-    // The existing task bridge carries request-scoped state that is intentionally !Send. The
-    // scheduler service will move this execution onto the session-owned local task seam once
-    // that seam is exposed; keep initialization deterministic until then.
-    run_scheduler(controller).await;
+    // The scheduler owns the live run independently of the tool invocation turn.
+    tokio::spawn(run_scheduler(controller));
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
         serde_json::json!({"runId":run_id}).to_string(),
         Some(true),
@@ -338,15 +381,31 @@ async fn queue_call(invocation: ToolInvocation) -> Result<Box<dyn ToolOutput>, F
     .await
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
-    controller
-        .definition
-        .lock()
+    let phase_instructions = {
+        let mut definition = controller.definition.lock().await;
+        let phase = definition
+            .phases
+            .iter_mut()
+            .find(|p| p.name == args.phase)
+            .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex phase not found".into()))?;
+        let instructions = phase.instructions.clone();
+        phase.tasks.push(task.clone());
+        instructions
+    };
+    let declaration = TaskDeclaration {
+        id: task_id.clone(),
+        name: task.name.clone(),
+        instructions: format!("{}\n\n{}", phase_instructions, task.instructions),
+        read_scope: task.read_scope.clone(),
+        write_scope: task.write_scope.clone(),
+        verification: task.verification.clone(),
+    };
+    let store = Arc::clone(&controller.store);
+    let info = controller.info.clone();
+    tokio::task::spawn_blocking(move || store.create_task(&info, &declaration))
         .await
-        .phases
-        .iter_mut()
-        .find(|p| p.name == args.phase)
-        .map(|p| p.tasks.push(task))
-        .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex phase not found".into()))?;
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let _ = controller
         .activity
         .send(controller.activity_rx.borrow().wrapping_add(1));
@@ -421,6 +480,9 @@ async fn wait_call(invocation: ToolInvocation) -> Result<Box<dyn ToolOutput>, Fu
 async fn run_scheduler(controller: Arc<RunController>) {
     let result = run_scheduler_inner(&controller).await;
     if let Err(error) = result {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let _ = tokio::task::spawn_blocking(move || store.mark_run_failed(&run_id)).await;
         let _ = controller.status.send(RunStatus::Failed(error));
     } else {
         let _ = controller.status.send(RunStatus::Completed);
@@ -449,7 +511,21 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), Stri
             format!("Running phase {}/{}: {}", index + 1, total, phase.name),
         )
         .await;
-        run_phase(controller, phase, index, total).await?;
+        run_phase(controller, index, total).await?;
+    }
+    if !definition.verification.is_empty() {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        tokio::task::spawn_blocking(move || store.mark_run_verifying(&run_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        progress(
+            &controller.invocation,
+            format!("Verifying workflow: {}", definition.name),
+        )
+        .await;
+        verify_commands(controller, &definition.verification).await?;
     }
     let set_run = (
         Arc::clone(&controller.store),
@@ -469,10 +545,17 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), Stri
 
 async fn run_phase(
     controller: &Arc<RunController>,
-    phase: &PhaseDefinition,
-    _index: usize,
-    _total: usize,
+    index: usize,
+    total: usize,
 ) -> Result<(), String> {
+    let phase = controller
+        .definition
+        .lock()
+        .await
+        .phases
+        .get(index)
+        .cloned()
+        .ok_or_else(|| "scheduled phase missing definition".to_string())?;
     let phase_instructions = phase.instructions.clone();
     for task_def in &phase.tasks {
         let declaration = TaskDeclaration {
@@ -507,7 +590,60 @@ async fn run_phase(
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?
         };
+        let metadata = {
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let name = phase.name.clone();
+            tokio::task::spawn_blocking(move || store.phase_metadata(&run_id, &name))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+        };
         if all.iter().all(|task| task.state == "integrated") {
+            if !metadata.sealed {
+                let mut activity = controller.activity_rx.clone();
+                activity
+                    .changed()
+                    .await
+                    .map_err(|_| "scheduler activity stopped".to_string())?;
+                continue;
+            }
+            if !phase.verification.is_empty() {
+                let store = Arc::clone(&controller.store);
+                let run_id = controller.id.clone();
+                let name = phase.name.clone();
+                tokio::task::spawn_blocking(move || store.mark_phase_verifying(&run_id, &name))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                progress(
+                    &controller.invocation,
+                    format!("Verifying phase {}/{}: {}", index + 1, total, phase.name),
+                )
+                .await;
+                if let Err(error) = verify_commands(controller, &phase.verification).await {
+                    let store = Arc::clone(&controller.store);
+                    let run_id = controller.id.clone();
+                    let name = phase.name.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        store.mark_phase_failed(&run_id, &name)
+                    })
+                    .await;
+                    return Err(error);
+                }
+            }
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let name = phase.name.clone();
+            tokio::task::spawn_blocking(move || store.mark_phase_completed(&run_id, &name))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            progress(
+                &controller.invocation,
+                format!("Completed phase {}/{}: {}", index + 1, total, phase.name),
+            )
+            .await;
             break;
         }
         if ready.is_empty() {
@@ -520,12 +656,19 @@ async fn run_phase(
         }
         let mut operations = Vec::new();
         for scheduled in ready {
-            let task_def = phase
-                .tasks
-                .iter()
-                .find(|task| {
-                    format!("{}:{}:{}", controller.id, phase.name, task.name) == scheduled.task_id
+            let task_def = controller
+                .definition
+                .lock()
+                .await
+                .phases
+                .get(index)
+                .and_then(|phase| {
+                    phase.tasks.iter().find(|task| {
+                        format!("{}:{}:{}", controller.id, phase.name, task.name)
+                            == scheduled.task_id
+                    })
                 })
+                .cloned()
                 .ok_or_else(|| "scheduled task missing definition".to_string())?;
             progress(
                 &controller.invocation,
@@ -542,7 +685,7 @@ async fn run_phase(
                 .ok_or_else(|| "agent missing".to_string())?;
             let agent = AgentSpec {
                 name: task_def.name.clone(),
-                instructions: "Execute the durable task declaration.".to_string(),
+                instructions: task_def.instructions.clone(),
                 profile: agent_def.profile,
                 model: agent_def.model,
                 reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
@@ -557,7 +700,7 @@ async fn run_phase(
             operations.push((
                 scheduled,
                 task_def.clone(),
-                tokio::spawn(task::run_task_agent(
+                tokio::spawn(run_task_handler(
                     controller.invocation.clone(),
                     task_id,
                     agent,
@@ -565,19 +708,60 @@ async fn run_phase(
             ));
         }
         for (scheduled, task_def, operation) in operations {
-            let result = operation
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
+            let result = match operation.await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = scheduled.task_id.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
+                    return Err(error.to_string());
+                }
+                Err(error) => {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = scheduled.task_id.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
+                    return Err(error.to_string());
+                }
+            };
             if !task_def.verification.is_empty() {
                 progress(
                     &controller.invocation,
                     format!("Verifying task: {}", task_def.name),
                 )
                 .await;
-                task::verify_task(controller.invocation.clone(), scheduled.task_id.clone())
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let verification_output = match run_verify_handler(
+                    controller.invocation.clone(),
+                    scheduled.task_id.clone(),
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let store = Arc::clone(&controller.store);
+                        let task_id = scheduled.task_id.clone();
+                        let _ =
+                            tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id))
+                                .await;
+                        return Err(error.to_string());
+                    }
+                };
+                if verification_output
+                    .code_mode_result(&ToolPayload::Function {
+                        arguments: serde_json::json!({"task_id": scheduled.task_id.clone()})
+                            .to_string(),
+                    })
+                    .get("passed")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = scheduled.task_id.clone();
+                    let _ =
+                        tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
+                    return Err(format!("Task {} failed during verification", task_def.name));
+                }
                 let store = Arc::clone(&controller.store);
                 let id = scheduled.task_id.clone();
                 tokio::task::spawn_blocking(move || {
@@ -592,7 +776,7 @@ async fn run_phase(
                 format!("Integrating task: {}", task_def.name),
             )
             .await;
-            task::integrate_task(controller.invocation.clone(), scheduled.task_id.clone())
+            run_integrate_handler(controller.invocation.clone(), scheduled.task_id.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             let store = Arc::clone(&controller.store);
@@ -620,6 +804,82 @@ fn parse_effort(value: String) -> Option<ReasoningEffort> {
         _ => ReasoningEffort::Custom(value),
     })
 }
+
+async fn run_task_handler(
+    mut invocation: ToolInvocation,
+    task_id: String,
+    agent: AgentSpec,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "task_id": task_id,
+            "agent": {
+                "name": agent.name,
+                "instructions": agent.instructions,
+                "profile": agent.profile,
+                "model": agent.model,
+                "reasoning_effort": agent.reasoning_effort,
+            }
+        })
+        .to_string(),
+    };
+    FlowdexTaskRunAgentHandler.handle(invocation).await
+}
+
+async fn run_verify_handler(
+    mut invocation: ToolInvocation,
+    task_id: String,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"task_id": task_id}).to_string(),
+    };
+    FlowdexTaskVerifyHandler.handle(invocation).await
+}
+
+async fn run_integrate_handler(
+    mut invocation: ToolInvocation,
+    task_id: String,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"task_id": task_id}).to_string(),
+    };
+    FlowdexTaskIntegrateHandler.handle(invocation).await
+}
+
+async fn verify_commands(
+    controller: &Arc<RunController>,
+    commands: &[String],
+) -> Result<(), String> {
+    let invocation = {
+        let mut invocation = controller.invocation.clone();
+        invocation.payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "commands": commands,
+                "workdir": controller.info.integration_worktree.to_string_lossy(),
+            })
+            .to_string(),
+        };
+        invocation
+    };
+    let verifier = FlowdexVerifyHandler::new(shell_command_backend_for_features(
+        controller.invocation.turn.config.features.get(),
+    ));
+    let output = verifier
+        .handle(invocation.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    if output
+        .code_mode_result(&invocation.payload)
+        .get("passed")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        Ok(())
+    } else {
+        Err("verification failed".to_string())
+    }
+}
+
 async fn progress(invocation: &ToolInvocation, text: String) {
     let item = TurnItem::Reasoning(ReasoningItem {
         id: Uuid::new_v4().to_string(),

@@ -10,6 +10,8 @@ use crate::tools::flowdex::FlowdexSealPhaseHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::flowdex::FlowdexWaitRunHandler;
+use crate::tools::flowdex::QueueFlowdexTaskHandler;
+use crate::tools::flowdex::SealFlowdexPhaseHandler;
 use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
@@ -273,6 +275,8 @@ fn build_tool_specs_and_registry(
         ToolExposure::DirectModelOnly,
     );
     planned_tools.add_with_exposure(WaitFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(QueueFlowdexTaskHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(SealFlowdexPhaseHandler, ToolExposure::DirectModelOnly);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
 }

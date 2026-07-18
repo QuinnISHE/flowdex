@@ -31,7 +31,8 @@ pub(crate) use agents::FlowdexSendMessageHandler;
 pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
 pub(crate) use scheduler::{
-    FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler, FlowdexWaitRunHandler,
+    FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
+    FlowdexWaitRunHandler, QueueFlowdexTaskHandler, SealFlowdexPhaseHandler,
 };
 pub(crate) use task::FlowdexCreateTaskHandler;
 pub(crate) use task::FlowdexTaskIntegrateHandler;
