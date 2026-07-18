@@ -1,18 +1,29 @@
 pub mod config;
-pub mod task_store;
+pub mod store;
+pub mod workflow;
 
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
 pub use config::load_config;
-pub use task_store::IntegrationResult;
-pub use task_store::RunInfo;
-pub use task_store::TaskCommit;
-pub use task_store::TaskDeclaration;
-pub use task_store::TaskOperation;
-pub use task_store::TaskRecord;
-pub use task_store::TaskStore;
-pub use task_store::TaskStoreError;
+pub use store::FlowdexStore;
+pub use store::FlowdexStoreError;
+pub use store::IntegrationResult;
+pub use store::PhaseState;
+pub use store::RunInfo;
+pub use store::RunState;
+pub use store::ScheduledTask;
+pub use store::SchedulerTaskState;
+pub use store::TaskCommit;
+pub use store::TaskDeclaration;
+pub use store::TaskOperation;
+pub use store::TaskRecord;
+pub use workflow::AgentDefinition;
+pub use workflow::PhaseDefinition;
+pub use workflow::TaskDefinition;
+pub use workflow::WorkflowDefinition;
+pub use workflow::WorkflowValidationError;
+pub use workflow::write_scope_conflicts;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
@@ -80,6 +91,155 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
     return Object.freeze(task);
   },
 "#;
+const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
+    const isPlainObject = (value) =>
+      value !== null && typeof value === "object" && !Array.isArray(value) &&
+      Object.getPrototypeOf(value) === Object.prototype;
+    const requireObject = (value, label) => {
+      if (!isPlainObject(value)) throw new TypeError(`${label} must be a plain object`);
+      return value;
+    };
+    const requireString = (value, label) => {
+      if (typeof value !== "string" || value.trim().length === 0) {
+        throw new TypeError(`${label} must be a non-empty string`);
+      }
+      return value;
+    };
+    const requireKeys = (value, allowed, label) => {
+      const unknown = Object.keys(value).find((key) => !allowed.has(key));
+      if (unknown !== undefined) throw new TypeError(`${label} unknown field: ${unknown}`);
+    };
+    const commandArray = (value, label) => {
+      if (value === undefined) return [];
+      if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+      return value.map((command, index) => requireString(command, `${label}[${index}]`));
+    };
+    const selector = (value, label) =>
+      value === undefined ? undefined : requireString(value, label);
+    const taskDefinition = (task, knownAgents, label = "task") => {
+      requireObject(task, `${label} definition`);
+      requireKeys(task, new Set(["name", "agent", "instructions", "dependencies", "readScope", "writeScope", "verification"]), label);
+      const name = requireString(task.name, `${label}.name`);
+      const agent = requireString(task.agent, `${label}.agent`);
+      if (!knownAgents.has(agent)) throw new TypeError(`${label}.agent is unknown`);
+      const dependencies = task.dependencies === undefined ? [] : task.dependencies;
+      if (!Array.isArray(dependencies)) throw new TypeError(`${label}.dependencies must be an array`);
+      return {
+        name,
+        agent,
+        instructions: requireString(task.instructions, `${label}.instructions`),
+        dependencies: dependencies.map((dependency, index) =>
+          requireString(dependency, `${label}.dependencies[${index}]`)),
+        read_scope: commandArray(task.readScope, `${label}.readScope`),
+        write_scope: commandArray(task.writeScope, `${label}.writeScope`),
+        verification: commandArray(task.verification, `${label}.verification`),
+      };
+    };
+
+    requireObject(definition, "startRun definition");
+    requireKeys(definition, new Set(["name", "agents", "phases", "verification"]), "startRun");
+    const runName = requireString(definition.name, "startRun.name");
+    const agents = requireObject(definition.agents, "startRun.agents");
+    const agentNames = new Set(Object.keys(agents));
+    if (agentNames.size === 0) throw new TypeError("startRun.agents must not be empty");
+    const normalizedAgents = {};
+    for (const agentName of agentNames) {
+      requireString(agentName, "startRun agent name");
+      const agent = requireObject(agents[agentName], `startRun.agents.${agentName}`);
+      requireKeys(agent, new Set(["profile", "model", "reasoningEffort"]), `startRun.agents.${agentName}`);
+      const profile = selector(agent.profile, `startRun.agents.${agentName}.profile`);
+      const model = selector(agent.model, `startRun.agents.${agentName}.model`);
+      const reasoningEffort = selector(agent.reasoningEffort, `startRun.agents.${agentName}.reasoningEffort`);
+      if (profile === undefined && model === undefined && reasoningEffort === undefined) {
+        throw new TypeError(`startRun.agents.${agentName} needs a profile, model, or reasoningEffort`);
+      }
+      normalizedAgents[agentName] = {};
+      if (profile !== undefined) normalizedAgents[agentName].profile = profile;
+      if (model !== undefined) normalizedAgents[agentName].model = model;
+      if (reasoningEffort !== undefined) normalizedAgents[agentName].reasoning_effort = reasoningEffort;
+    }
+
+    if (!Array.isArray(definition.phases) || definition.phases.length === 0) {
+      throw new TypeError("startRun.phases must be a non-empty array");
+    }
+    const phaseNames = new Set();
+    const phases = definition.phases.map((phase, phaseIndex) => {
+      requireObject(phase, `startRun.phases[${phaseIndex}]`);
+      requireKeys(phase, new Set(["name", "instructions", "tasks", "open", "verification"]), `startRun.phases[${phaseIndex}]`);
+      const name = requireString(phase.name, `startRun.phases[${phaseIndex}].name`);
+      if (phaseNames.has(name)) throw new TypeError(`duplicate phase name: ${name}`);
+      phaseNames.add(name);
+      const open = phase.open === undefined ? false : phase.open;
+      if (typeof open !== "boolean") throw new TypeError(`startRun.phases[${phaseIndex}].open must be boolean`);
+      if (!Array.isArray(phase.tasks)) throw new TypeError(`startRun.phases[${phaseIndex}].tasks must be an array`);
+      if (!open && phase.tasks.length === 0) throw new TypeError(`closed phase ${name} must have tasks`);
+      const names = new Set();
+      const tasks = phase.tasks.map((task, taskIndex) => {
+        const normalized = taskDefinition(task, agentNames, `startRun.phases[${phaseIndex}].tasks[${taskIndex}]`);
+        if (names.has(normalized.name)) throw new TypeError(`duplicate task name in phase ${name}: ${normalized.name}`);
+        names.add(normalized.name);
+        return normalized;
+      });
+      for (const task of tasks) {
+        for (const dependency of task.dependencies) {
+          if (!names.has(dependency)) throw new TypeError(`missing dependency in phase ${name}: ${dependency}`);
+        }
+      }
+      const visiting = new Set();
+      const visited = new Set();
+      const visit = (taskName) => {
+        if (visiting.has(taskName)) throw new TypeError(`dependency cycle in phase ${name}`);
+        if (visited.has(taskName)) return;
+        visiting.add(taskName);
+        const task = tasks.find((candidate) => candidate.name === taskName);
+        for (const dependency of task.dependencies) visit(dependency);
+        visiting.delete(taskName);
+        visited.add(taskName);
+      };
+      for (const task of tasks) visit(task.name);
+      return {
+        name,
+        instructions: requireString(phase.instructions, `startRun.phases[${phaseIndex}].instructions`),
+        tasks,
+        open,
+        verification: commandArray(phase.verification, `startRun.phases[${phaseIndex}].verification`),
+      };
+    });
+    const normalized = {
+      name: runName,
+      agents: normalizedAgents,
+      phases,
+      verification: commandArray(definition.verification, "startRun.verification"),
+    };
+    const created = await tools.flowdex_start_run({
+      definition: normalized,
+      workflow_path: flowdex.workflowPath,
+    });
+    const id = created.runId;
+    const handle = {
+      id,
+      queueTask: async (phaseName, task) => {
+        requireString(phaseName, "queueTask.phase");
+        const normalizedTask = taskDefinition(task, agentNames, "queueTask.task");
+        const queued = await tools.flowdex_queue_task({
+          run_id: id,
+          phase: phaseName,
+          task: normalizedTask,
+        });
+        return { taskId: queued.taskId };
+      },
+      sealPhase: async (phaseName) => {
+        requireString(phaseName, "sealPhase.phase");
+        await tools.flowdex_seal_phase({ run_id: id, phase: phaseName });
+      },
+      wait: async () => {
+        const result = await tools.flowdex_wait_run({ run_id: id });
+        return { runId: result.runId, status: result.status };
+      },
+    };
+    return Object.freeze(handle);
+  },
+"#;
 
 /// Loads a repository workflow and prepares it for execution in code mode.
 #[derive(Debug, Clone)]
@@ -143,7 +303,7 @@ impl WorkflowLoader {
                 "const flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n  progress: async (summary) => {{\n    await tools.flowdex_progress({{ summary }});\n  }},\n  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
             ).replace(
                 "  progress:",
-                &format!("{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}  progress:"),
+                &format!("{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}  progress:"),
             ).replace("  progress: async (summary) => {{\\n    await tools.flowdex_progress({{ summary }});\\n  }},\\n", ""),
         })
     }
@@ -322,6 +482,14 @@ mod tests {
         assert!(loaded.source.contains("sendMessage: async"));
         assert!(loaded.source.contains("waitAgent: async"));
         assert!(loaded.source.contains("resumeAgent: async"));
+        assert!(loaded.source.contains("startRun: async"));
+        assert!(loaded.source.contains("Object.freeze(handle)"));
+        assert!(loaded.source.contains("tools.flowdex_start_run"));
+        assert!(loaded.source.contains("tools.flowdex_queue_task"));
+        assert!(loaded.source.contains("tools.flowdex_seal_phase"));
+        assert!(loaded.source.contains("tools.flowdex_wait_run"));
+        assert!(loaded.source.contains("reasoning_effort"));
+        assert!(loaded.source.contains("write_scope"));
         assert!(loaded.source.contains("options must be an object"));
         assert!(loaded.source.contains("key !== \"contextMode\""));
         assert!(loaded.source.contains("createTask unknown field"));
