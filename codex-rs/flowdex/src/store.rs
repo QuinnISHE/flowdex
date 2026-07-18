@@ -1376,4 +1376,99 @@ mod tests {
         );
         assert_eq!(store.run_metadata("run").unwrap().state, "completed");
     }
+
+    #[test]
+    fn scheduler_readiness_sealing_and_dynamic_additions_are_ordered() {
+        let (_repo, _home, store, run) = store();
+        let task = |name: &str, dependencies: &[&str], write_scope: &[&str]| TaskDefinition {
+            name: name.into(),
+            agent: "worker".into(),
+            instructions: format!("instructions for {name}"),
+            dependencies: dependencies.iter().map(|value| (*value).into()).collect(),
+            read_scope: vec![],
+            write_scope: write_scope.iter().map(|value| (*value).into()).collect(),
+            verification: vec![],
+        };
+        let definition = WorkflowDefinition {
+            name: "ordered".into(),
+            agents: [(
+                "worker".into(),
+                AgentDefinition {
+                    profile: Some("implementation_worker".into()),
+                    model: None,
+                    reasoning_effort: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            verification: vec![],
+            phases: vec![PhaseDefinition {
+                name: "phase".into(),
+                instructions: "phase instructions".into(),
+                open: true,
+                verification: vec![],
+                tasks: vec![
+                    task("first", &[], &["src/**"]),
+                    task("second", &[], &["docs/**"]),
+                    task("join", &["first", "second"], &["out/**"]),
+                ],
+            }],
+        };
+        store.initialize_workflow(&run, &definition).unwrap();
+
+        let declaration_order = store
+            .scheduled_tasks("run", "phase")
+            .unwrap()
+            .into_iter()
+            .map(|task| task.task_id.rsplit(':').next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(declaration_order, ["first", "second", "join"]);
+
+        let ready = store.ready_tasks("run", "phase").unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|task| task.task_id.rsplit(':').next().unwrap())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        store.mark_task_running("run:phase:first").unwrap();
+        let blocked_by_scope = store.ready_tasks("run", "phase").unwrap();
+        assert_eq!(
+            blocked_by_scope
+                .iter()
+                .map(|task| task.task_id.rsplit(':').next().unwrap())
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+
+        store
+            .queue_task(
+                "run",
+                "phase",
+                "run:phase:late",
+                &task("late", &["first"], &["late/**"]),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .scheduler_task("run:phase:late")
+                .unwrap()
+                .declaration_order,
+            3
+        );
+        store.seal_phase("run", "phase").unwrap();
+        assert!(
+            store
+                .queue_task(
+                    "run",
+                    "phase",
+                    "run:phase:rejected",
+                    &task("rejected", &[], &[])
+                )
+                .is_err()
+        );
+        assert!(store.scheduler_task("run:phase:rejected").is_err());
+        assert!(store.phase_metadata("run", "phase").unwrap().sealed);
+    }
 }

@@ -380,4 +380,21 @@ mod tests {
             &["src/**".into()]
         ));
     }
+
+    #[test]
+    fn rejects_unknown_agent_and_invalid_command() {
+        let mut definition = workflow(vec![task("a", &[])]);
+        definition.phases[0].tasks[0].agent = "missing".into();
+        assert!(matches!(
+            definition.validate(),
+            Err(WorkflowValidationError::UnknownAgent { .. })
+        ));
+
+        let mut definition = workflow(vec![task("a", &[])]);
+        definition.phases[0].tasks[0].verification = vec!["  ".into()];
+        assert!(matches!(
+            definition.validate(),
+            Err(WorkflowValidationError::EmptyString("command or scope"))
+        ));
+    }
 }

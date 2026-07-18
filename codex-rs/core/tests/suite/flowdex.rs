@@ -15,9 +15,11 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_once_match;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
@@ -26,6 +28,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -190,7 +193,7 @@ async fn flowdex_progress_is_transient_reasoning_summary() -> Result<()> {
         .function_call_output_text("call-progress-1")
         .expect("start tool output should be sent back to the model");
     let output: Value = serde_json::from_str(&output)?;
-    assert_eq!(output["status"], "completed");
+    assert_eq!(output["status"], "completed", "scheduler output: {output}");
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["resultType"], "undefined");
     assert_eq!(workflow_output["done"], "ok");
@@ -817,4 +820,261 @@ text(JSON.stringify({ taskId: task.id, createUnknownRejected, runUnknownRejected
     assert!(!flowdex_contains_file(&flowdex_root, "task.txt"));
             Ok(())
         })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flowdex_scheduler_runs_parallel_dependencies_and_verification() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.features.enable(Feature::Collab).unwrap();
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let workflow_dir = cwd.join(".flowdex/workflows");
+            fs::create_dir_all(&workflow_dir)?;
+            fs::write(
+                workflow_dir.join("scheduler.js"),
+                r#"const run = await flowdex.startRun({
+  name: 'scheduler-fixture',
+  agents: { worker: { model: 'gpt-5.4' } },
+  verification: ['git status --porcelain'],
+  phases: [{
+    name: 'build',
+    instructions: 'Complete and commit the build task.',
+    verification: ['git status --porcelain'],
+    tasks: [
+      { name: 'alpha', agent: 'worker', instructions: 'alpha instructions', verification: ['git status --porcelain'], writeScope: ['alpha.txt'] },
+      { name: 'beta', agent: 'worker', instructions: 'beta instructions', verification: ['git status --porcelain'], writeScope: ['beta.txt'] },
+      { name: 'join', agent: 'worker', instructions: 'join instructions', dependencies: ['alpha', 'beta'], verification: ['git status --porcelain'], writeScope: ['joined.txt'] },
+    ],
+  }],
+});
+text(JSON.stringify(await run.wait()));"#,
+            )?;
+            fs::write(cwd.join("README.md"), "scheduler fixture\n")?;
+            let run_git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "git {args:?} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(())
+            };
+            run_git(&["init"])?;
+            run_git(&["config", "user.name", "Flowdex Test"])?;
+            run_git(&["config", "user.email", "flowdex-test@example.com"])?;
+            run_git(&["add", "."])?;
+            run_git(&["commit", "-m", "fixture baseline"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/scheduler.js" });
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "run the scheduler workflow"),
+        sse(vec![
+            ev_response_created("resp-scheduler-parent-1"),
+            ev_function_call(
+                "call-scheduler-outer",
+                "start_flowdex_workflow",
+                &args.to_string(),
+            ),
+            ev_completed("resp-scheduler-parent-1"),
+        ]),
+    )
+    .await;
+
+    let delayed = |call_id: &str, command: &str| {
+        sse_response(sse(vec![
+            ev_response_created(call_id),
+            core_test_support::responses::ev_shell_command_call(call_id, command),
+            ev_completed(call_id),
+        ]))
+        .set_delay(Duration::from_millis(750))
+    };
+    let alpha_initial = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "alpha instructions"),
+        delayed(
+            "resp-scheduler-alpha-1",
+            "echo alpha > alpha.txt && git add alpha.txt && git commit -m \"alpha\"",
+        ),
+    )
+    .await;
+    let beta_initial = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "beta instructions"),
+        delayed(
+            "resp-scheduler-beta-1",
+            "echo beta > beta.txt && git add beta.txt && git commit -m \"beta\"",
+        ),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "resp-scheduler-alpha-1"),
+        sse(vec![
+            ev_response_created("resp-scheduler-alpha-2"),
+            ev_assistant_message("msg-scheduler-alpha", "alpha complete"),
+            ev_completed("resp-scheduler-alpha-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "resp-scheduler-beta-1"),
+        sse(vec![
+            ev_response_created("resp-scheduler-beta-2"),
+            ev_assistant_message("msg-scheduler-beta", "beta complete"),
+            ev_completed("resp-scheduler-beta-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "join instructions"),
+        sse(vec![
+            ev_response_created("resp-scheduler-join-1"),
+            core_test_support::responses::ev_shell_command_call(
+                "call-scheduler-join-shell",
+                "echo joined > joined.txt && git add joined.txt && git commit -m \"join\"",
+            ),
+            ev_completed("resp-scheduler-join-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            has_function_call_output(request, "call-scheduler-join-shell")
+        },
+        sse(vec![
+            ev_response_created("resp-scheduler-join-2"),
+            ev_assistant_message("msg-scheduler-join", "join complete"),
+            ev_completed("resp-scheduler-join-2"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-scheduler-outer"),
+        sse(vec![
+            ev_response_created("resp-scheduler-parent-2"),
+            ev_completed("resp-scheduler-parent-2"),
+        ]),
+    )
+    .await;
+
+    let mut created = test.thread_manager.subscribe_thread_created();
+    let submit = test.codex.submit(Op::UserInput {
+        items: vec![UserInput::Text {
+            text: "run the scheduler workflow".into(),
+            text_elements: Vec::new(),
+        }],
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    });
+    submit.await?;
+    let mut reasoning = Vec::new();
+    let turn_id = loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        if let EventMsg::TurnStarted(event) = event.msg {
+            break event.turn_id;
+        }
+    };
+    let mut saw_parallel = false;
+    loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        saw_parallel = saw_parallel
+            || (alpha_initial.requests().len() == 1 && beta_initial.requests().len() == 1);
+        match event.msg {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::Reasoning(item),
+                ..
+            }) => reasoning.extend(item.summary_text),
+            EventMsg::TurnComplete(event) if event.turn_id == turn_id => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_parallel,
+        "both independent task agents should be running before release"
+    );
+
+    let output: Value = serde_json::from_str(
+        &follow_up
+            .function_call_output_text("call-scheduler-outer")
+            .expect("scheduler output should be returned"),
+    )?;
+    assert_eq!(output["status"], "completed", "scheduler output: {output}");
+    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
+    assert_eq!(workflow_output["status"], "completed");
+    assert!(test.workspace_path("alpha.txt").exists());
+    assert!(test.workspace_path("beta.txt").exists());
+    assert!(test.workspace_path("joined.txt").exists());
+
+    let expected = [
+        "Running workflow: scheduler-fixture",
+        "Running phase 1/1: build",
+        "Running task: alpha",
+        "Running task: beta",
+        "Verifying task: alpha",
+        "Verifying task: beta",
+        "Integrating task: alpha",
+        "Integrating task: beta",
+        "Running task: join",
+        "Verifying task: join",
+        "Integrating task: join",
+        "Verifying phase 1/1: build",
+        "Verifying workflow: scheduler-fixture",
+        "Completed workflow: scheduler-fixture",
+    ];
+    for summary in expected {
+        assert!(
+            reasoning.iter().any(|item| item == summary),
+            "missing summary: {summary}"
+        );
+    }
+    let alpha_index = reasoning
+        .iter()
+        .position(|item| item == "Integrating task: alpha")
+        .unwrap();
+    let beta_index = reasoning
+        .iter()
+        .position(|item| item == "Integrating task: beta")
+        .unwrap();
+    assert!(
+        alpha_index < beta_index,
+        "integration should follow declaration order"
+    );
+    let follow_up_request = follow_up.single_request();
+    for summary in expected {
+        assert!(!follow_up_request.body_contains_text(summary));
+    }
+    assert!(!follow_up_request.body_contains_text("alpha complete"));
+    assert!(!follow_up_request.body_contains_text("beta complete"));
+
+    for _ in 0..3 {
+        let child_id = tokio::time::timeout(Duration::from_secs(5), created.recv()).await??;
+        let snapshot = test
+            .thread_manager
+            .get_thread(child_id)
+            .await?
+            .config_snapshot()
+            .await;
+        assert!(matches!(
+            snapshot.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ));
+    }
+    Ok(())
 }
