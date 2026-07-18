@@ -237,6 +237,11 @@ async fn handle_send(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
         }
     };
     let target = resolve_agent_target(&session, &turn, &args.agent_id).await?;
+    if trigger_turn && super::task::task_associated_agent(target).is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "task-associated agents must be resumed with resumeAgent; trigger-turn delivery is not supported".into(),
+        ));
+    }
     let metadata = session
         .services
         .agent_control
@@ -339,6 +344,11 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         ));
     }
 
+    let _task_gate = match super::task::task_associated_agent(id) {
+        Some(task_id) => Some(super::task::acquire_task_gate(&task_id).await),
+        None => None,
+    };
+
     if mode == "compact" {
         let operation = session
             .services
@@ -419,6 +429,9 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             .await
             .map_err(collab_spawn_error)?;
         let replacement_id = child.thread_id;
+        if let Some(task_id) = super::task::task_associated_agent(id) {
+            super::task::associate_task_agent(replacement_id, &task_id);
+        }
         let replacement_status = wait_for_terminal(&session, replacement_id).await;
         return Ok(JsonOutput::new(status_value(
             replacement_id,
@@ -470,7 +483,7 @@ async fn submit_trigger_turn(
         .await)
 }
 
-async fn wait_for_terminal(
+pub(crate) async fn wait_for_terminal(
     session: &std::sync::Arc<crate::session::session::Session>,
     id: ThreadId,
 ) -> AgentStatus {
@@ -544,7 +557,7 @@ pub(crate) fn status_value(id: ThreadId, status: AgentStatus) -> Value {
     }
 }
 
-fn truncate_message(message: &str) -> String {
+pub(crate) fn truncate_message(message: &str) -> String {
     codex_utils_output_truncation::truncate_text(
         message,
         codex_utils_output_truncation::TruncationPolicy::Tokens(4096),

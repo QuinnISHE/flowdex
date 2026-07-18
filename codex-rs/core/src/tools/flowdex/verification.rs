@@ -35,6 +35,25 @@ impl FlowdexVerifyHandler {
     pub(crate) fn new(backend: ShellCommandBackendConfig) -> Self {
         Self { backend }
     }
+
+    pub(crate) async fn handle_for_workdir(
+        &self,
+        mut invocation: ToolInvocation,
+        workdir: &std::path::Path,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(FunctionCallError::RespondToModel(
+                "flowdex verify expects JSON arguments".to_string(),
+            ));
+        };
+        let mut value: serde_json::Value = serde_json::from_str(arguments)
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        value["workdir"] = serde_json::Value::String(workdir.to_string_lossy().into_owned());
+        invocation.payload = ToolPayload::Function {
+            arguments: value.to_string(),
+        };
+        self.handle_call(invocation).await
+    }
 }
 
 #[derive(Debug, Deserialize)]

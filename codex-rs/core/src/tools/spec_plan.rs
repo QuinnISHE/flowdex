@@ -16,9 +16,13 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::FlowdexCreateTaskHandler;
 use crate::tools::handlers::FlowdexResumeAgentHandler;
 use crate::tools::handlers::FlowdexSendMessageHandler;
 use crate::tools::handlers::FlowdexSpawnAgentHandler;
+use crate::tools::handlers::FlowdexTaskIntegrateHandler;
+use crate::tools::handlers::FlowdexTaskRunAgentHandler;
+use crate::tools::handlers::FlowdexTaskVerifyHandler;
 use crate::tools::handlers::FlowdexWaitAgentHandler;
 use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
@@ -208,6 +212,10 @@ fn build_tool_specs_and_registry(
         planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexResumeAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexCreateTaskHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskRunAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskVerifyHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskIntegrateHandler, ToolExposure::Hidden);
     }
     let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
         let name = runtime.tool_name();
@@ -237,6 +245,10 @@ fn build_tool_specs_and_registry(
             FlowdexSendMessageHandler.spec(),
             FlowdexWaitAgentHandler.spec(),
             FlowdexResumeAgentHandler.spec(),
+            FlowdexCreateTaskHandler.spec(),
+            FlowdexTaskRunAgentHandler.spec(),
+            FlowdexTaskVerifyHandler.spec(),
+            FlowdexTaskIntegrateHandler.spec(),
         ]);
     }
     if flowdex_verification_enabled {

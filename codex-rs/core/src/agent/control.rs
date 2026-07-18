@@ -82,9 +82,10 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) completion_delivery: SpawnAgentCompletionDelivery,
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct LiveAgent {
     pub(crate) thread_id: ThreadId,
+    pub(crate) initial_submission_id: String,
+    pub(crate) initial_operation: Option<SubmittedAgentOperation>,
     pub(crate) metadata: AgentMetadata,
     pub(crate) status: AgentStatus,
 }

@@ -23,11 +23,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 mod agents;
+mod task;
 mod verification;
 pub(crate) use agents::FlowdexResumeAgentHandler;
 pub(crate) use agents::FlowdexSendMessageHandler;
 pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
+pub(crate) use task::{
+    FlowdexCreateTaskHandler, FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler,
+    FlowdexTaskVerifyHandler,
+};
 pub(crate) use verification::FlowdexVerifyHandler;
 
 const TOOL_NAME: &str = "start_flowdex_workflow";

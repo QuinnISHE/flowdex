@@ -526,21 +526,23 @@ impl AgentControl {
         )
         .await;
 
-        match initial_input {
-            SpawnInitialInput::UserInput(input) => {
+        let (initial_submission_id, initial_operation) = match initial_input {
+            SpawnInitialInput::UserInput(input) => (
                 self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
-                    .await?;
-            }
+                    .await?,
+                None,
+            ),
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
-                    new_thread.thread_id,
-                    &state,
-                    communication,
-                    context,
-                )
-                .await?;
+                let operation = self
+                    .submit_inter_agent_communication_operation(
+                        new_thread.thread_id,
+                        communication,
+                        context,
+                    )
+                    .await?;
+                (operation.submission_id.clone(), Some(operation))
             }
-        }
+        };
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
@@ -558,6 +560,8 @@ impl AgentControl {
 
         Ok(LiveAgent {
             thread_id: new_thread.thread_id,
+            initial_submission_id,
+            initial_operation,
             metadata: agent_metadata,
             status: self.get_status(new_thread.thread_id).await,
         })
