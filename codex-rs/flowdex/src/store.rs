@@ -1347,7 +1347,10 @@ mod tests {
             }],
         };
         store.initialize_workflow(&run, &definition).unwrap();
-        let task = store.scheduler_task("run:phase:task").unwrap();
+        let task_id = store.scheduled_tasks("run", "phase").unwrap()[0]
+            .task_id
+            .clone();
+        let task = store.scheduler_task(&task_id).unwrap();
         assert_eq!(task.instructions, "phase instructions\n\ntask instructions");
         assert_eq!(task.agent, "worker");
         assert_eq!(
@@ -1365,15 +1368,12 @@ mod tests {
         assert_eq!(store.phase_metadata("run", "phase").unwrap().total, 1);
         store.mark_run_running("run").unwrap();
         store.mark_phase_running("run", "phase").unwrap();
-        store.mark_task_running("run:phase:task").unwrap();
-        store.mark_task_attributing("run:phase:task").unwrap();
-        store.mark_task_integrated("run:phase:task").unwrap();
+        store.mark_task_running(&task_id).unwrap();
+        store.mark_task_attributing(&task_id).unwrap();
+        store.mark_task_integrated(&task_id).unwrap();
         store.mark_phase_completed("run", "phase").unwrap();
         store.mark_run_completed("run").unwrap();
-        assert_eq!(
-            store.scheduler_task("run:phase:task").unwrap().state,
-            "integrated"
-        );
+        assert_eq!(store.scheduler_task(&task_id).unwrap().state, "integrated");
         assert_eq!(store.run_metadata("run").unwrap().state, "completed");
     }
 
@@ -1416,29 +1416,20 @@ mod tests {
         };
         store.initialize_workflow(&run, &definition).unwrap();
 
-        let declaration_order = store
-            .scheduled_tasks("run", "phase")
-            .unwrap()
-            .into_iter()
-            .map(|task| task.task_id.rsplit(':').next().unwrap().to_string())
-            .collect::<Vec<_>>();
+        let tasks = store.scheduled_tasks("run", "phase").unwrap();
+        let task_name = |task: &ScheduledTask| store.scheduler_task(&task.task_id).unwrap().name;
+        let declaration_order = tasks.iter().map(task_name).collect::<Vec<_>>();
         assert_eq!(declaration_order, ["first", "second", "join"]);
 
         let ready = store.ready_tasks("run", "phase").unwrap();
         assert_eq!(
-            ready
-                .iter()
-                .map(|task| task.task_id.rsplit(':').next().unwrap())
-                .collect::<Vec<_>>(),
+            ready.iter().map(task_name).collect::<Vec<_>>(),
             ["first", "second"]
         );
-        store.mark_task_running("run:phase:first").unwrap();
+        store.mark_task_running(&tasks[0].task_id).unwrap();
         let blocked_by_scope = store.ready_tasks("run", "phase").unwrap();
         assert_eq!(
-            blocked_by_scope
-                .iter()
-                .map(|task| task.task_id.rsplit(':').next().unwrap())
-                .collect::<Vec<_>>(),
+            blocked_by_scope.iter().map(task_name).collect::<Vec<_>>(),
             ["second"]
         );
 
