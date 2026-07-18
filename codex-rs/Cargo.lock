@@ -3101,6 +3101,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-flowdex"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-absolute-path",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "codex-git-utils"
 version = "0.0.0"
 dependencies = [
