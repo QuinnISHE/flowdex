@@ -649,6 +649,75 @@ async fn flowdex_workflow_verifies_commands_in_order() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flowdex_rules_run_during_verification_and_explicitly() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_pre_build_hook(|home| {
+            fs::write(home.join("flowdex.toml"), "ast_grep_always_run = [\"no-console\"]\n")
+                .expect("global Flowdex config");
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let rules_dir = cwd.join(".flowdex/ast-grep/rules");
+            fs::create_dir_all(&rules_dir)?;
+            fs::write(
+                rules_dir.join("no-console.yml"),
+                "id: no-console\nlanguage: JavaScript\nrule:\n  pattern: console.log($$$)\nmessage: avoid console.log\nseverity: warning\n",
+            )?;
+            fs::write(cwd.join("fixture.js"), "console.log('fixture');\n")?;
+            let workflow_dir = cwd.join(".flowdex/workflows");
+            fs::create_dir_all(&workflow_dir)?;
+            fs::write(
+                workflow_dir.join("rules.js"),
+                "const verification = await flowdex.verify(['echo verified']); const explicit = await flowdex.checkRules(['no-console']); text(JSON.stringify({ verification, explicit }));",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/rules.js" });
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-rules-1"),
+            ev_function_call("call-rules-1", "start_flowdex_workflow", &args.to_string()),
+            ev_completed("resp-rules-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-rules-2"),
+            ev_completed("resp-rules-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("run the configured rules").await?;
+
+    let output = follow_up
+        .function_call_output_text("call-rules-1")
+        .expect("workflow output should be returned");
+    let output: Value = serde_json::from_str(&output)?;
+    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
+    assert_eq!(workflow_output["verification"]["passed"], false);
+    assert_eq!(workflow_output["verification"]["rules"]["passed"], false);
+    assert_eq!(
+        workflow_output["verification"]["rules"]["findings"][0]["ruleId"],
+        "no-console"
+    );
+    assert_eq!(workflow_output["explicit"]["passed"], false);
+    assert_eq!(
+        workflow_output["explicit"]["findings"][0]["file"],
+        "fixture.js"
+    );
+    Ok(())
+}
+
 #[test]
 fn flowdex_task_lifecycle_attributes_commits_and_cleans_up() -> Result<()> {
     // V8-backed task agents exceed Windows' default Tokio worker stack.

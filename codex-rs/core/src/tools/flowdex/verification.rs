@@ -1,3 +1,4 @@
+use super::rules::run_rules;
 use crate::function_tool::FunctionCallError;
 use crate::skills::maybe_emit_implicit_skill_invocation;
 use crate::tools::context::ToolInvocation;
@@ -43,6 +44,7 @@ impl FlowdexVerifyHandler {
         mut invocation: ToolInvocation,
         workdir: &std::path::Path,
         runtime_cwd: Option<&AbsolutePathBuf>,
+        trusted_repository_root: Option<&std::path::Path>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return Err(FunctionCallError::RespondToModel(
@@ -254,8 +256,29 @@ impl FlowdexVerifyHandler {
                 feedback_messages.push(feedback);
             }
         }
+        let mut value = serde_json::json!({"passed": true, "commands": results});
+        let rule_ids = &turn.config.flowdex_config.ast_grep_always_run;
+        if !rule_ids.is_empty() {
+            if !turn.config.active_project.is_trusted() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex rules require a trusted Git repository".to_string(),
+                ));
+            }
+            let rules = run_rules(
+                trusted_repository_root.unwrap_or(turn.config.cwd.as_path()),
+                cwd.as_path(),
+                rule_ids.clone(),
+                &cancellation_token,
+            )
+            .await?;
+            value["rules"] = serde_json::to_value(&rules)
+                .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+            if !rules.passed {
+                value["passed"] = Value::Bool(false);
+            }
+        }
         Ok(boxed_tool_output(VerificationOutput {
-            value: serde_json::json!({"passed": true, "commands": results}),
+            value,
             model_output: (!feedback_messages.is_empty()).then(|| feedback_messages.join("\n")),
         }))
     }

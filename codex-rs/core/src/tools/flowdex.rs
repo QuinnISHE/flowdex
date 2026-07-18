@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
 
 mod agents;
+mod rules;
 mod scheduler;
 mod task;
 mod verification;
@@ -43,6 +44,7 @@ pub(crate) use scheduler::{
     FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
     FlowdexWaitRunHandler, QueueFlowdexTaskHandler, SealFlowdexPhaseHandler,
 };
+pub(crate) use rules::FlowdexCheckRulesHandler;
 pub(crate) use task::FlowdexCreateTaskHandler;
 pub(crate) use task::FlowdexTaskIntegrateHandler;
 pub(crate) use task::FlowdexTaskRunAgentHandler;
