@@ -403,12 +403,13 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             ) => *depth,
             _ => next_thread_spawn_depth(&turn.session_source),
         };
+        let replacement_name = format!("handoff_{}", ThreadId::new().to_string().replace('-', ""));
         let source = thread_spawn_source(
             parent_id,
             &snapshot.session_source,
             depth,
             snapshot.session_source.get_agent_role().as_deref(),
-            None,
+            Some(replacement_name),
         )?;
         let prompt = format!(
             "Handoff:\n{}\n\nInstructions:\n{}",
