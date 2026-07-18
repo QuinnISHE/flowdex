@@ -2327,15 +2327,108 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_status_only_completion_does_not_queue_parent_message() {
+    let harness = AgentControlHarness::new().await;
+    let mut config = harness.config.clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let root = harness
+        .manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    let root_thread_id = root.thread_id;
+    let child_path = AgentPath::root().join("worker_a").expect("child path");
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            config,
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(root_thread_id),
+                completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child spawn should succeed")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_turn = child_thread.session.new_default_turn().await;
+    child_thread
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if child_thread.agent_status().await == AgentStatus::Completed(Some("done".to_string()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("status-only child should become completed");
+    assert!(!harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .any(|(thread_id, op)| {
+            thread_id == root_thread_id
+                && matches!(op, Op::InterAgentCommunication { communication } if communication.author == child_path)
+        }));
+}
+
+#[tokio::test]
 async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
     let (worker_thread_id, _worker_thread) = harness.start_thread().await;
     let mut tester_config = harness.config.clone();
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
+    let worker_path = AgentPath::root().join("worker_a").expect("worker path");
+    let tester_path = worker_path.join("tester").expect("tester path");
     let tester_thread_id = harness
-        .manager
-        .start_thread(tester_config.clone())
+        .control
+        .spawn_agent_with_metadata(
+            tester_config,
+            text_input("hello tester"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: worker_thread_id,
+                depth: 2,
+                agent_path: Some(tester_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(worker_thread_id),
+                completion_delivery: SpawnAgentCompletionDelivery::NotifyParent,
+                ..Default::default()
+            },
+        )
         .await
         .expect("tester thread should start")
         .thread_id;
@@ -2344,21 +2437,6 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         .get_thread(tester_thread_id)
         .await
         .expect("tester thread should exist");
-    let worker_path = AgentPath::root().join("worker_a").expect("worker path");
-    let tester_path = worker_path.join("tester").expect("tester path");
-    harness.control.maybe_start_completion_watcher(
-        tester_thread_id,
-        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: worker_thread_id,
-            depth: 2,
-            agent_path: Some(tester_path.clone()),
-            agent_nickname: None,
-            agent_role: Some("explorer".to_string()),
-        })),
-        tester_path.to_string(),
-        Some(tester_path.clone()),
-        SpawnAgentCompletionDelivery::NotifyParent,
-    );
     let tester_turn = tester_thread.session.new_default_turn().await;
     tester_thread
         .session

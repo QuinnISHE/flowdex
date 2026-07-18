@@ -475,6 +475,7 @@ impl AgentControl {
             (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?,
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
+        agent_metadata.completion_delivery = options.completion_delivery.clone();
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);

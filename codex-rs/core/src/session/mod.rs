@@ -1815,6 +1815,15 @@ impl Session {
             return;
         }
 
+        if self
+            .services
+            .agent_control
+            .completion_delivery_for_thread(self.thread_id)
+            == crate::agent::control::SpawnAgentCompletionDelivery::StatusOnly
+        {
+            return;
+        }
+
         self.forward_child_completion_to_parent(
             turn_context,
             *parent_thread_id,

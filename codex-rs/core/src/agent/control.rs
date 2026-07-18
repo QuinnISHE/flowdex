@@ -283,6 +283,16 @@ impl AgentControl {
         self.state.agent_metadata_for_thread(agent_id)
     }
 
+    pub(crate) fn completion_delivery_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> SpawnAgentCompletionDelivery {
+        self.state
+            .agent_metadata_for_thread(thread_id)
+            .map(|metadata| metadata.completion_delivery)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
         self.state
             .agent_metadata_for_thread(agent_id)
@@ -552,6 +562,7 @@ impl AgentControl {
             agent_path,
             agent_nickname,
             agent_role,
+            completion_delivery: SpawnAgentCompletionDelivery::default(),
         })
     }
 
