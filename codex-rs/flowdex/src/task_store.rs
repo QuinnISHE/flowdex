@@ -865,7 +865,7 @@ mod tests {
             verification: vec![],
         };
         store.create_task(&run, &declaration).unwrap();
-        let mut second_run = run.clone();
+        let mut second_run = run;
         second_run.run_id = "second".into();
         assert!(store.create_task(&second_run, &declaration).is_err());
         assert!(!store.worktree_root.join("second").join("task").exists());

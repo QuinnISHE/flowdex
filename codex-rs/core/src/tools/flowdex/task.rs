@@ -72,7 +72,7 @@ fn associate(id: ThreadId, task: &str) {
 async fn task_gate(task: &str) -> OwnedMutexGuard<()> {
     let gate = gates()
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(task.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
