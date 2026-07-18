@@ -56,6 +56,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
+pub(crate) use crate::tools::flowdex::FlowdexResumeAgentHandler;
 pub(crate) use crate::tools::flowdex::FlowdexSendMessageHandler;
 pub(crate) use crate::tools::flowdex::FlowdexSpawnAgentHandler;
 pub(crate) use crate::tools::flowdex::FlowdexWaitAgentHandler;

@@ -16,6 +16,7 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::FlowdexResumeAgentHandler;
 use crate::tools::handlers::FlowdexSendMessageHandler;
 use crate::tools::handlers::FlowdexSpawnAgentHandler;
 use crate::tools::handlers::FlowdexWaitAgentHandler;
@@ -206,6 +207,7 @@ fn build_tool_specs_and_registry(
         planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexResumeAgentHandler, ToolExposure::Hidden);
     }
     let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
         let name = runtime.tool_name();
@@ -234,6 +236,7 @@ fn build_tool_specs_and_registry(
             FlowdexSpawnAgentHandler.spec(),
             FlowdexSendMessageHandler.spec(),
             FlowdexWaitAgentHandler.spec(),
+            FlowdexResumeAgentHandler.spec(),
         ]);
     }
     if flowdex_verification_enabled {

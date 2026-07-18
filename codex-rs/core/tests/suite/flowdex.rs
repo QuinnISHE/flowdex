@@ -300,6 +300,139 @@ async fn flowdex_workflow_spawns_and_waits_without_parent_completion_notificatio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let workflow_dir = cwd.join(".flowdex/workflows");
+            fs::create_dir_all(&workflow_dir)?;
+            fs::write(
+                workflow_dir.join("resume.js"),
+                "const agentId = await flowdex.spawnAgent({ name: 'worker', instructions: 'initial instructions', model: 'gpt-5.4' });\nconst initial = await flowdex.waitAgent(agentId);\nconst keep = await flowdex.resumeAgent(agentId, 'keep instructions');\nconst compact = await flowdex.resumeAgent(agentId, 'compact instructions', { contextMode: 'compact' });\nconst handoff = await flowdex.resumeAgent(agentId, 'new instructions', { contextMode: 'handoff' });\ntext(JSON.stringify({ initial, keep, compact, handoff }));",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/resume.js" });
+
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "start the resume workflow"),
+        sse(vec![
+            ev_response_created("resp-resume-parent-1"),
+            ev_function_call("call-resume-1", "start_flowdex_workflow", &args.to_string()),
+            ev_completed("resp-resume-parent-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "initial instructions"),
+        sse(vec![
+            ev_response_created("resp-resume-child-1"),
+            ev_assistant_message("msg-resume-child-1", "initial output"),
+            ev_completed("resp-resume-child-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "keep instructions"),
+        sse(vec![
+            ev_response_created("resp-resume-child-2"),
+            ev_assistant_message("msg-resume-child-2", "keep output"),
+            ev_completed("resp-resume-child-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, "compact") && body_contains(request, "compaction")
+        },
+        sse(vec![
+            ev_response_created("resp-resume-compact"),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "COMPACTED_CONTEXT",
+                }
+            }),
+            ev_completed("resp-resume-compact"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "compact instructions"),
+        sse(vec![
+            ev_response_created("resp-resume-child-3"),
+            ev_assistant_message("msg-resume-child-3", "compact output"),
+            ev_completed("resp-resume-child-3"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, "Produce only a concise structured handoff")
+        },
+        sse(vec![
+            ev_response_created("resp-resume-handoff"),
+            ev_assistant_message(
+                "msg-resume-handoff",
+                "completed work: initial; remaining work: new instructions",
+            ),
+            ev_completed("resp-resume-handoff"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "new instructions"),
+        sse(vec![
+            ev_response_created("resp-resume-replacement"),
+            ev_assistant_message("msg-resume-replacement", "replacement output"),
+            ev_completed("resp-resume-replacement"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-resume-1"),
+        sse(vec![
+            ev_response_created("resp-resume-parent-2"),
+            ev_completed("resp-resume-parent-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("start the resume workflow").await?;
+
+    let output = follow_up
+        .function_call_output_text("call-resume-1")
+        .expect("start tool output should be sent back to the model");
+    let output: Value = serde_json::from_str(&output)?;
+    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
+    assert_eq!(workflow_output["initial"]["status"], "completed");
+    assert_eq!(workflow_output["keep"]["status"], "completed");
+    assert_eq!(workflow_output["compact"]["message"], "compact output");
+    assert_eq!(workflow_output["handoff"]["message"], "replacement output");
+    assert_ne!(
+        workflow_output["handoff"]["agentId"],
+        workflow_output["initial"]["agentId"]
+    );
+    let follow_up_request = follow_up.single_request();
+    assert!(!follow_up_request.body_contains_text("completed work: initial"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flowdex_workflow_verifies_commands_in_order() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {

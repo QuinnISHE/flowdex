@@ -24,6 +24,7 @@ use std::path::Path;
 
 mod agents;
 mod verification;
+pub(crate) use agents::FlowdexResumeAgentHandler;
 pub(crate) use agents::FlowdexSendMessageHandler;
 pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
