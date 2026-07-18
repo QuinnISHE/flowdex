@@ -664,14 +664,27 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
     .await;
     mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| body_contains(request, "Make the initial change"),
+        |request: &wiremock::Request| {
+            body_contains(request, "Make the initial change")
+                && !body_contains(request, "Make a second change")
+        },
         sse(vec![
             ev_response_created("resp-task-child-1"),
             core_test_support::responses::ev_shell_command_call(
                 "call-task-child-1",
-                "echo first>task.txt && git add task.txt && git commit -m \"initial task change\"",
+                "echo first > task.txt && git add task.txt && git commit -m \"initial task change\"",
             ),
             ev_completed("resp-task-child-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-child-1"),
+        sse(vec![
+            ev_response_created("resp-task-child-1-followup"),
+            ev_assistant_message("msg-task-child-1-followup", "initial task change committed"),
+            ev_completed("resp-task-child-1-followup"),
         ]),
     )
     .await;
@@ -682,7 +695,7 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
             ev_response_created("resp-task-child-2"),
             core_test_support::responses::ev_shell_command_call(
                 "call-task-child-2",
-                "echo second>>task.txt && git add task.txt && git commit -m \"resumed task change\"",
+                "echo second >> task.txt && git add task.txt && git commit -m \"resumed task change\"",
             ),
             ev_completed("resp-task-child-2"),
         ]),
@@ -690,24 +703,20 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
     .await;
     mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| has_function_call_output(request, "call-task-1"),
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-child-2"),
         sse(vec![
-            ev_response_created("resp-task-parent-2"),
-            ev_function_call(
-                "call-task-wait",
-                "wait_flowdex_workflow",
-                &serde_json::json!({ "run_id": "1" }).to_string(),
-            ),
-            ev_completed("resp-task-parent-2"),
+            ev_response_created("resp-task-child-2-followup"),
+            ev_assistant_message("msg-task-child-2-followup", "resumed task change committed"),
+            ev_completed("resp-task-child-2-followup"),
         ]),
     )
     .await;
     let follow_up = mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| has_function_call_output(request, "call-task-wait"),
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-1"),
         sse(vec![
-            ev_response_created("resp-task-parent-3"),
-            ev_completed("resp-task-parent-3"),
+            ev_response_created("resp-task-parent-2"),
+            ev_completed("resp-task-parent-2"),
         ]),
     )
     .await;
@@ -715,7 +724,7 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
     test.submit_turn("run the task lifecycle workflow").await?;
 
     let output = follow_up
-        .function_call_output_text("call-task-wait")
+        .function_call_output_text("call-task-1")
         .expect("task workflow output should be returned");
     let output: Value = serde_json::from_str(&output)?;
     assert_eq!(output["status"], "completed");
@@ -739,11 +748,29 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
     for commit in commits {
         assert_eq!(commit["agentId"], agent_id);
         assert_eq!(commit["model"], "gpt-5.4");
-        assert!(commit["sourceCommit"].as_str().is_some_and(|hash| hash.len() == 40));
-        assert!(commit["integratedCommit"].as_str().is_some_and(|hash| hash.len() == 40));
+        assert!(
+            commit["sourceCommit"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 40)
+        );
+        assert!(
+            commit["integratedCommit"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 40)
+        );
     }
-    assert!(commits[0]["summary"].as_str().unwrap().contains("initial task change"));
-    assert!(commits[1]["summary"].as_str().unwrap().contains("resumed task change"));
+    assert!(
+        commits[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("initial task change")
+    );
+    assert!(
+        commits[1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("resumed task change")
+    );
     assert!(commits[0]["sourceCommit"] != commits[0]["integratedCommit"]);
     assert!(commits[1]["sourceCommit"] != commits[1]["integratedCommit"]);
 
