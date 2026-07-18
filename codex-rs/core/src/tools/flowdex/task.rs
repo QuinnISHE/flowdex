@@ -622,7 +622,7 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     } else {
         "errored"
     };
-    let (store, repository_root, _) = task_store(&invocation).await?;
+    let (store, _, _) = task_store(&invocation).await?;
     let task_id = task.id.clone();
     tokio::task::spawn_blocking(move || store.finish_operation(&task_id, &operation_id, terminal))
         .await
@@ -661,7 +661,7 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     )?)
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let _gate = task_gate(&args.task_id).await;
-    let (store, _, _) = task_store(&invocation).await?;
+    let (store, repository_root, _) = task_store(&invocation).await?;
     let task_id = args.task_id.clone();
     let task = tokio::task::spawn_blocking({
         let id = task_id.clone();

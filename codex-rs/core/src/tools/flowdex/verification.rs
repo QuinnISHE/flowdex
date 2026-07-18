@@ -57,7 +57,8 @@ impl FlowdexVerifyHandler {
         invocation.payload = ToolPayload::Function {
             arguments: value.to_string(),
         };
-        self.handle_call(invocation, runtime_cwd).await
+        self.handle_call(invocation, runtime_cwd, trusted_repository_root)
+            .await
     }
 }
 
@@ -98,7 +99,7 @@ impl ToolExecutor<ToolInvocation> for FlowdexVerifyHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation, None))
+        Box::pin(self.handle_call(invocation, None, None))
     }
 }
 
@@ -113,6 +114,7 @@ impl FlowdexVerifyHandler {
         &self,
         invocation: ToolInvocation,
         runtime_cwd: Option<&AbsolutePathBuf>,
+        trusted_repository_root: Option<&std::path::Path>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
