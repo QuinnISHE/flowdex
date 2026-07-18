@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
@@ -23,6 +24,8 @@ use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_event_with_timeout;
 use serde_json::Value;
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -38,6 +41,17 @@ fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool 
                         && item.get("call_id").and_then(Value::as_str) == Some(call_id)
                 })
             })
+    })
+}
+
+fn flowdex_contains_file(root: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.file_name().and_then(|file| file.to_str()) == Some(name)
+            || (path.is_dir() && flowdex_contains_file(&path, name))
     })
 }
 
@@ -268,11 +282,31 @@ async fn flowdex_workflow_spawns_and_waits_without_parent_completion_notificatio
     .await;
     mount_sse_once_match(
         &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-child-1"),
+        sse(vec![
+            ev_response_created("resp-task-child-1-followup"),
+            ev_assistant_message("msg-task-child-1", "initial task change committed"),
+            ev_completed("resp-task-child-1-followup"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
         |request: &wiremock::Request| body_contains(request, "child instructions"),
         sse(vec![
             ev_response_created("resp-child-1"),
             ev_assistant_message("msg-child-1", "child output"),
             ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-child-2"),
+        sse(vec![
+            ev_response_created("resp-task-child-2-followup"),
+            ev_assistant_message("msg-task-child-2", "resumed task change committed"),
+            ev_completed("resp-task-child-2-followup"),
         ]),
     )
     .await;
@@ -566,5 +600,157 @@ async fn flowdex_workflow_verifies_commands_in_order() -> Result<()> {
     if let Some(output) = commands[1].get("output") {
         assert!(output.as_str().is_some());
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flowdex_task_lifecycle_attributes_commits_and_cleans_up() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let run_git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "git {args:?} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(())
+            };
+            fs::create_dir_all(cwd.join(".flowdex/workflows"))?;
+            fs::write(
+                cwd.join(".flowdex/workflows/task.js"),
+                r#"const task = await flowdex.createTask({
+  name: 'task-lifecycle',
+  instructions: 'Update task.txt and commit the changes.',
+  readScope: ['task.txt'],
+  writeScope: ['task.txt'],
+  verification: ['git status --porcelain'],
+});
+const initial = await task.runAgent({ name: 'task_worker', instructions: 'Make the initial change.', model: 'gpt-5.4' });
+const firstVerification = await task.verify();
+const resumed = await flowdex.resumeAgent(initial.agentId, 'Make a second change and commit it.');
+let staleRejected = false;
+try { await task.integrate(); } catch { staleRejected = true; }
+const secondVerification = await task.verify();
+const integrated = await task.integrate();
+text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, staleRejected, secondVerification, integrated }));"#,
+            )?;
+            fs::write(cwd.join("README.md"), "flowdex task fixture\n")?;
+            run_git(&["init"])?;
+            run_git(&["config", "user.name", "Flowdex Test"])?;
+            run_git(&["config", "user.email", "flowdex-test@example.com"])?;
+            run_git(&["add", "."])?;
+            run_git(&["commit", "-m", "fixture baseline"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/task.js" });
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-task-parent-1"),
+            ev_function_call("call-task-1", "start_flowdex_workflow", &args.to_string()),
+            ev_completed("resp-task-parent-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "Make the initial change"),
+        sse(vec![
+            ev_response_created("resp-task-child-1"),
+            core_test_support::responses::ev_shell_command_call(
+                "call-task-child-1",
+                "echo first>task.txt && git add task.txt && git commit -m \"initial task change\"",
+            ),
+            ev_completed("resp-task-child-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, "Make a second change"),
+        sse(vec![
+            ev_response_created("resp-task-child-2"),
+            core_test_support::responses::ev_shell_command_call(
+                "call-task-child-2",
+                "echo second>>task.txt && git add task.txt && git commit -m \"resumed task change\"",
+            ),
+            ev_completed("resp-task-child-2"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-1"),
+        sse(vec![
+            ev_response_created("resp-task-parent-2"),
+            ev_function_call(
+                "call-task-wait",
+                "wait_flowdex_workflow",
+                &serde_json::json!({ "run_id": "1" }).to_string(),
+            ),
+            ev_completed("resp-task-parent-2"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| has_function_call_output(request, "call-task-wait"),
+        sse(vec![
+            ev_response_created("resp-task-parent-3"),
+            ev_completed("resp-task-parent-3"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("run the task lifecycle workflow").await?;
+
+    let output = follow_up
+        .function_call_output_text("call-task-wait")
+        .expect("task workflow output should be returned");
+    let output: Value = serde_json::from_str(&output)?;
+    assert_eq!(output["status"], "completed");
+    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
+    let task_id = workflow_output["taskId"].as_str().expect("task id");
+    let agent_id = workflow_output["initial"]["agentId"]
+        .as_str()
+        .expect("initial agent id");
+    assert_eq!(workflow_output["initial"]["status"], "completed");
+    assert_eq!(workflow_output["resumed"]["status"], "completed");
+    assert_eq!(workflow_output["resumed"]["agentId"], agent_id);
+    assert_eq!(workflow_output["firstVerification"]["passed"], true);
+    assert_eq!(workflow_output["secondVerification"]["passed"], true);
+    assert_eq!(workflow_output["staleRejected"], true);
+
+    let commits = workflow_output["integrated"]["commits"]
+        .as_array()
+        .expect("integrated commits");
+    assert_eq!(workflow_output["integrated"]["taskId"], task_id);
+    assert_eq!(commits.len(), 2);
+    for commit in commits {
+        assert_eq!(commit["agentId"], agent_id);
+        assert_eq!(commit["model"], "gpt-5.4");
+        assert!(commit["sourceCommit"].as_str().is_some_and(|hash| hash.len() == 40));
+        assert!(commit["integratedCommit"].as_str().is_some_and(|hash| hash.len() == 40));
+    }
+    assert!(commits[0]["summary"].as_str().unwrap().contains("initial task change"));
+    assert!(commits[1]["summary"].as_str().unwrap().contains("resumed task change"));
+    assert!(commits[0]["sourceCommit"] != commits[0]["integratedCommit"]);
+    assert!(commits[1]["sourceCommit"] != commits[1]["integratedCommit"]);
+
+    let content = fs::read_to_string(test.workspace_path("task.txt"))?;
+    assert!(content.contains("first"));
+    assert!(content.contains("second"));
+    let flowdex_root = test.codex_home_path().join("flowdex").join("worktrees");
+    assert!(!flowdex_contains_file(&flowdex_root, "task.txt"));
     Ok(())
 }

@@ -423,9 +423,12 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     let task_cwd = AbsolutePathBuf::from_absolute_path(&task.worktree_path)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     config.cwd = task_cwd.clone();
+    config.workspace_roots = vec![task_cwd.clone()];
+    config.permissions.set_workspace_roots(vec![task_cwd.clone()]);
     let mut environments = invocation.turn.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
+        environment.workspace_roots = vec![PathUri::from_abs_path(&task_cwd)];
     }
     let depth = next_thread_spawn_depth(&invocation.turn.session_source);
     if exceeds_thread_spawn_depth_limit(depth, invocation.turn.config.agent_max_depth) {

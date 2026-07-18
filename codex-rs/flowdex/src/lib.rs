@@ -35,7 +35,14 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
     if (declaration === null || typeof declaration !== "object" || Array.isArray(declaration)) {
       throw new TypeError("createTask declaration must be an object");
     }
-    const created = await tools.flowdex_create_task({ ...declaration, workflow_path: flowdex.workflowPath });
+    const created = await tools.flowdex_create_task({
+      name: declaration.name,
+      instructions: declaration.instructions,
+      read_scope: declaration.readScope,
+      write_scope: declaration.writeScope,
+      verification: declaration.verification,
+      workflow_path: flowdex.workflowPath,
+    });
     const task = {
       id: created.taskId,
       runAgent: async (agentSpec) => tools.flowdex_task_run_agent({ task_id: created.taskId, agent: agentSpec }),
