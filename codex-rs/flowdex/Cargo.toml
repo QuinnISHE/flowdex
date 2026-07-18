@@ -11,7 +11,11 @@ doctest = false
 workspace = true
 
 [dependencies]
+ast-grep-config = "0.40.0"
+ast-grep-core = { version = "0.40.0", default-features = false, features = ["tree-sitter"] }
+ast-grep-language = "0.40.0"
 codex-utils-absolute-path = { workspace = true }
+ignore = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }

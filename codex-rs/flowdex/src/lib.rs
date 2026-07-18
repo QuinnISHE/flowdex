@@ -1,7 +1,9 @@
+pub mod ast_grep;
 pub mod config;
 pub mod store;
 pub mod workflow;
 
+pub use ast_grep::{AstGrepError, AstGrepFinding, AstGrepResult, run_ast_grep_rules};
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
