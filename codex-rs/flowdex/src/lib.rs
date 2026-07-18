@@ -144,7 +144,7 @@ impl WorkflowLoader {
             ).replace(
                 "  progress:",
                 &format!("{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}  progress:"),
-            ),
+            ).replace("  progress: async (summary) => {{\\n    await tools.flowdex_progress({{ summary }});\\n  }},\\n", ""),
         })
     }
 }
@@ -331,7 +331,7 @@ mod tests {
                 .source
                 .contains("reasoning_effort: agentSpec.reasoningEffort")
         );
-        assert!(loaded.source.contains("progress: async"));
+        assert!(!loaded.source.contains("progress: async"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
         assert!(
             loaded

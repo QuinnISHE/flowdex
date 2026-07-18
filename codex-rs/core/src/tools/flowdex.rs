@@ -19,7 +19,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 mod agents;
@@ -37,7 +36,6 @@ pub(crate) use verification::FlowdexVerifyHandler;
 
 const TOOL_NAME: &str = "start_flowdex_workflow";
 const WAIT_TOOL_NAME: &str = "wait_flowdex_workflow";
-const PROGRESS_TOOL_NAME: &str = "flowdex_progress";
 
 #[derive(Debug, Deserialize)]
 struct StartArgs {
@@ -50,41 +48,7 @@ pub(crate) struct StartFlowdexWorkflowHandler {
     nested_tool_specs: Vec<ToolSpec>,
 }
 
-pub(crate) struct FlowdexProgressHandler;
 pub(crate) struct WaitFlowdexWorkflowHandler;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProgressArgs {
-    summary: String,
-}
-
-impl ToolExecutor<ToolInvocation> for FlowdexProgressHandler {
-    fn tool_name(&self) -> ToolName {
-        ToolName::plain(PROGRESS_TOOL_NAME)
-    }
-
-    fn spec(&self) -> ToolSpec {
-        ToolSpec::Function(ResponsesApiTool {
-            name: PROGRESS_TOOL_NAME.to_string(),
-            description: "Publish a transient Flowdex progress summary.".to_string(),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(
-                BTreeMap::from([("summary".to_string(), JsonSchema::string(None))]),
-                Some(vec!["summary".to_string()]),
-                Some(false.into()),
-            ),
-            output_schema: None,
-        })
-    }
-
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move { handle_progress(invocation).await.map(boxed_tool_output) })
-    }
-}
-
-impl CoreToolRuntime for FlowdexProgressHandler {}
 
 impl ToolExecutor<ToolInvocation> for WaitFlowdexWorkflowHandler {
     fn tool_name(&self) -> ToolName {
@@ -231,40 +195,6 @@ impl WaitFlowdexWorkflowHandler {
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
     run_id: String,
-}
-
-async fn handle_progress(
-    invocation: ToolInvocation,
-) -> Result<FunctionToolOutput, FunctionCallError> {
-    let ToolInvocation {
-        session,
-        turn,
-        payload,
-        ..
-    } = invocation;
-    let ToolPayload::Function { arguments } = payload else {
-        return Err(FunctionCallError::RespondToModel(
-            "flowdex progress expects JSON arguments".to_string(),
-        ));
-    };
-    let args: ProgressArgs = parse_arguments(&arguments)?;
-    let summary = args.summary.trim();
-    if summary.is_empty() {
-        return Err(FunctionCallError::RespondToModel(
-            "summary must be non-empty".to_string(),
-        ));
-    }
-    let summary = codex_utils_output_truncation::truncate_text(
-        summary,
-        codex_utils_output_truncation::TruncationPolicy::Tokens(4096),
-    );
-    let item = codex_protocol::items::TurnItem::Reasoning(codex_protocol::items::ReasoningItem {
-        id: codex_protocol::ResponseItemId::new("rs").to_string(),
-        summary_text: vec![summary],
-        raw_content: Vec::new(),
-    });
-    session.emit_flowdex_progress(turn.as_ref(), item).await;
-    Ok(FunctionToolOutput::from_text(String::new(), Some(true)))
 }
 
 impl StartFlowdexWorkflowHandler {
