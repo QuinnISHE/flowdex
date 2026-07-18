@@ -80,6 +80,21 @@ pub(super) fn workflow_run_identity(cell_id: &str) -> (Option<String>, Option<St
         .unwrap_or_default()
 }
 
+fn child_workflow_chain(parent_cell: &str, identity: &str) -> Result<Vec<String>, String> {
+    let chains = workflow_chains()
+        .lock()
+        .expect("workflow chain mutex poisoned");
+    let mut chain = chains
+        .get(parent_cell)
+        .map(|invocation| invocation.chain.clone())
+        .unwrap_or_default();
+    if chain.iter().any(|item| item == identity) {
+        return Err("Flowdex workflow reference cycle detected".to_string());
+    }
+    chain.push(identity.to_string());
+    Ok(chain)
+}
+
 #[derive(Debug, Deserialize)]
 struct StartArgs {
     path: String,
@@ -341,21 +356,9 @@ impl FlowdexRunWorkflowHandler {
                 ));
             }
         };
-        let chain = {
-            let chains = workflow_chains()
-                .lock()
-                .expect("workflow chain mutex poisoned");
-            chains
-                .get(&parent_cell)
-                .map(|invocation| invocation.chain.clone())
-                .unwrap_or_default()
-        };
         let identity = reference.normalized_display();
-        if chain.iter().any(|item| item == &identity) {
-            return Err(FunctionCallError::RespondToModel(
-                "Flowdex workflow reference cycle detected".to_string(),
-            ));
-        }
+        let child_chain = child_workflow_chain(&parent_cell, &identity)
+            .map_err(FunctionCallError::RespondToModel)?;
         let root = match reference.scope() {
             WorkflowScope::Repo => {
                 if !turn.config.active_project.is_trusted() {
@@ -390,8 +393,6 @@ impl FlowdexRunWorkflowHandler {
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
-        let mut child_chain = chain;
-        child_chain.push(identity.clone());
         workflow_chains()
             .lock()
             .expect("workflow chain mutex poisoned")
@@ -410,10 +411,35 @@ impl FlowdexRunWorkflowHandler {
             .expect("workflow chain mutex poisoned")
             .remove(child_cell.as_str());
         let value = result.map_err(FunctionCallError::RespondToModel)?;
-        Ok(boxed_tool_output(FunctionToolOutput::from_text(
-            value.to_string(),
-            Some(true),
-        )))
+        Ok(boxed_tool_output(task::JsonOutput(value)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_workflow_chain_rejects_recursive_reference() {
+        let parent = "flowdex-cycle-test-parent";
+        workflow_chains()
+            .lock()
+            .expect("workflow chain mutex poisoned")
+            .insert(
+                parent.to_string(),
+                WorkflowInvocation {
+                    chain: vec!["repo:cycle".to_string()],
+                    ..Default::default()
+                },
+            );
+        assert_eq!(
+            child_workflow_chain(parent, "repo:cycle"),
+            Err("Flowdex workflow reference cycle detected".to_string())
+        );
+        workflow_chains()
+            .lock()
+            .expect("workflow chain mutex poisoned")
+            .remove(parent);
     }
 }
 

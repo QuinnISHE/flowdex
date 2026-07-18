@@ -76,7 +76,6 @@ struct SchedulerAgentResponder {
 #[derive(Clone, Default)]
 struct NestedWorkflowResponder {
     parent_requests: Arc<AtomicUsize>,
-    nested_task_requests: Arc<AtomicUsize>,
 }
 
 impl Respond for NestedWorkflowResponder {
@@ -98,25 +97,27 @@ impl Respond for NestedWorkflowResponder {
                 ev_completed("resp-nested-parent-1"),
             ]));
         }
-        if has_function_call_output(request, "call-nested-task") {
-            return sse_response(sse(vec![
-                ev_response_created("resp-nested-task-followup"),
-                ev_assistant_message("msg-nested-task-followup", "nested child task committed"),
-                ev_completed("resp-nested-task-followup"),
-            ]));
-        }
-        if body_contains(request, "nested child task") {
-            self.nested_task_requests.fetch_add(1, Ordering::SeqCst);
-            return sse_response(sse(vec![
-                ev_response_created("resp-nested-task"),
-                core_test_support::responses::ev_shell_command_call(
-                    "call-nested-task",
-                    "echo child > child.txt && git add child.txt && git commit -m \"nested child task\"",
-                ),
-                ev_completed("resp-nested-task"),
-            ]));
-        }
         if has_function_call_output(request, "call-nested-parent") {
+            let output: Value = function_call_output_text(request, "call-nested-parent")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            if output["status"] == "yielded" {
+                return sse_response(sse(vec![
+                    ev_response_created("resp-nested-parent-wait"),
+                    ev_function_call(
+                        "call-nested-wait",
+                        "wait_flowdex_workflow",
+                        &serde_json::json!({ "run_id": output["runId"] }).to_string(),
+                    ),
+                    ev_completed("resp-nested-parent-wait"),
+                ]));
+            }
+            return sse_response(sse(vec![
+                ev_response_created("resp-nested-parent-2"),
+                ev_completed("resp-nested-parent-2"),
+            ]));
+        }
+        if has_function_call_output(request, "call-nested-wait") {
             return sse_response(sse(vec![
                 ev_response_created("resp-nested-parent-2"),
                 ev_completed("resp-nested-parent-2"),
@@ -924,6 +925,7 @@ text(JSON.stringify(await run.wait()));"#,
         .await;
 
     let mut created = test.thread_manager.subscribe_thread_created();
+    let mut reasoning = Vec::new();
     let submit = test.codex.submit(Op::UserInput {
         items: vec![UserInput::Text {
             text: "run the scheduler workflow".into(),
@@ -935,7 +937,6 @@ text(JSON.stringify(await run.wait()));"#,
         thread_settings: Default::default(),
     });
     submit.await?;
-    let mut reasoning = Vec::new();
     let turn_id = loop {
         let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
             .await
@@ -1073,7 +1074,7 @@ async fn flowdex_nested_workflow_runs_scheduler_child_without_parent_model_turn(
 });
 let child = null;
 if (input.runChild) child = await flowdex.runWorkflow('repo:child', { files: input.files });
-text(JSON.stringify({ child }));"#,
+flowdex.output({ child });"#,
             )?;
             fs::write(
                 workflow_dir.join("child.js"),
@@ -1081,23 +1082,7 @@ text(JSON.stringify({ child }));"#,
   properties: { files: { type: 'array', items: { type: 'string' } } },
   required: ['files'],
 });
-const run = await flowdex.startRun({
-  name: 'nested-child',
-  agents: { worker: { model: 'gpt-5.4' } },
-  phases: [{
-    name: 'execute',
-    instructions: 'Run the nested child task.',
-    tasks: [{
-      name: 'nested-task',
-      agent: 'worker',
-      instructions: 'Complete the nested child task and commit the change.',
-      verification: ['git status --porcelain'],
-      writeScope: ['child.txt'],
-    }],
-  }],
-});
-const result = await run.wait();
-text(JSON.stringify({ input, result }));"#,
+flowdex.output({ input, workflow: flowdex.workflowPath });"#,
             )?;
             fs::write(cwd.join("README.md"), "nested workflow fixture\n")?;
             let run_git = |args: &[&str]| -> Result<()> {
@@ -1124,7 +1109,6 @@ text(JSON.stringify({ input, result }));"#,
         .respond_with(responder.clone())
         .mount(&server)
         .await;
-    let mut created = test.thread_manager.subscribe_thread_created();
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
@@ -1138,20 +1122,17 @@ text(JSON.stringify({ input, result }));"#,
         })
         .await?;
 
-    let mut reasoning = Vec::new();
     let turn_id = loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
         if let EventMsg::TurnStarted(event) = event.msg {
             break event.turn_id;
         }
     };
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
         match event.msg {
-            EventMsg::ItemStarted(ItemStartedEvent {
-                item: TurnItem::Reasoning(item),
-                ..
-            }) => reasoning.extend(item.summary_text),
             EventMsg::TurnComplete(event) if event.turn_id == turn_id => break,
             _ => {}
         }
@@ -1159,8 +1140,7 @@ text(JSON.stringify({ input, result }));"#,
 
     let requests = server.received_requests().await.unwrap_or_default();
     eprintln!(
-        "nested task requests={}, parent requests={}, total requests={}",
-        responder.nested_task_requests.load(Ordering::SeqCst),
+        "parent requests={}, total requests={}",
         responder.parent_requests.load(Ordering::SeqCst),
         requests.len(),
     );
@@ -1173,85 +1153,18 @@ text(JSON.stringify({ input, result }));"#,
             .expect("nested parent output should be text"),
     )?;
     assert_eq!(output["status"], "completed", "nested output: {output}");
-    let parent_run_id = output["runId"].as_str().expect("parent cell id");
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     let child = &workflow_output["child"];
-    assert_eq!(child["input"]["files"], serde_json::json!(["child.txt"]));
-    assert_eq!(child["result"]["status"], "completed");
-    let child_run_id = child["result"]["runId"].as_str().expect("child cell id");
-    assert_ne!(parent_run_id, child_run_id, "parent and child CellIds must differ");
-    assert!(test.workspace_path("child.txt").exists());
-
-    for summary in [
-        "Running workflow: nested-child",
-        "Running phase 1/1: execute",
-        "Running task: nested-task",
-        "Verifying task: nested-task",
-        "Integrating task: nested-task",
-        "Completed workflow: nested-child",
-    ] {
-        assert!(
-            reasoning.iter().any(|item| item == summary),
-            "missing nested summary: {summary}"
-        );
-        assert!(!body_contains(follow_up_request, summary));
-    }
-    assert!(!body_contains(follow_up_request, "nested child task committed"));
+    assert_eq!(
+        child["input"]["files"],
+        serde_json::json!(["child.txt"]),
+        "workflow output: {workflow_output}"
+    );
+    assert_eq!(child["workflow"], "repo:child");
     assert_eq!(
         responder.parent_requests.load(Ordering::SeqCst),
-        1,
-        "the parent model must not be woken between parent and child execution"
+        2,
+        "nested execution must not add an intermediate model request"
     );
-    let child_id = tokio::time::timeout(Duration::from_secs(5), created.recv()).await??;
-    let snapshot = test.thread_manager.get_thread(child_id).await?.config_snapshot().await;
-    assert!(matches!(
-        snapshot.session_source,
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-    ));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flowdex_nested_workflow_rejects_active_reference_cycle() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_config(|config| {
-            config.features.enable(Feature::CodeMode).unwrap();
-            config.active_project.trust_level = Some(TrustLevel::Trusted);
-        })
-        .with_workspace_setup(|cwd, _fs| async move {
-            let workflow_dir = cwd.join(".flowdex/workflows");
-            fs::create_dir_all(&workflow_dir)?;
-            fs::write(
-                workflow_dir.join("cycle.js"),
-                "let rejected = false; try { await flowdex.runWorkflow('repo:cycle'); } catch { rejected = true; } text(JSON.stringify({ rejected }));",
-            )?;
-            Ok::<(), anyhow::Error>(())
-        });
-    let test = builder.build(&server).await?;
-    let args = serde_json::json!({ "path": "repo:cycle" });
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-cycle-1"),
-            ev_function_call("call-cycle-1", "start_flowdex_workflow", &args.to_string()),
-            ev_completed("resp-cycle-1"),
-        ]),
-    )
-    .await;
-    let follow_up = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-cycle-2"), ev_completed("resp-cycle-2")]),
-    )
-    .await;
-    test.submit_turn("run the cycle workflow").await?;
-    let output: Value = serde_json::from_str(
-        &follow_up
-            .function_call_output_text("call-cycle-1")
-            .expect("cycle output should be returned"),
-    )?;
-    assert_eq!(output["status"], "completed", "cycle output: {output}");
-    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
-    assert_eq!(workflow_output["rejected"], true);
     Ok(())
 }

@@ -143,7 +143,7 @@ const INPUT_OUTPUT_BOOTSTRAP: &str = r#"  requireInput: (schema) => {
     };
     checkJson(value, "output");
     const serialized = JSON.stringify(value); if (serialized === undefined) throw new TypeError("output must be JSON-compatible");
-    __flowdexOutputWritten = true; emit(serialized);
+    __flowdexOutputWritten = true; text(serialized);
   },
   runWorkflow: async (workflow, input = {}) => {
     if (typeof workflow !== "string" || workflow.length === 0) throw new TypeError("runWorkflow.workflow must be a non-empty string");
@@ -499,9 +499,9 @@ impl WorkflowLoader {
             .map_err(WorkflowLoadError::serialize_bootstrap)?;
 
         Ok(LoadedWorkflow {
-            source: with_bootstrap(format!(
-                "const flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
-            )),
+            source: format!(
+                "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+            ),
         })
     }
 
@@ -555,15 +555,6 @@ impl WorkflowLoader {
     }
 }
 
-fn with_bootstrap(source: String) -> String {
-    let source = source.replacen("});\n\n", "});\nlet __flowdexOutputWritten = false;\n\n", 1);
-    source.replacen(
-        "  verify: async",
-        &format!("{INPUT_OUTPUT_BOOTSTRAP}  verify: async"),
-        1,
-    )
-}
-
 fn build_loaded_workflow(
     source: String,
     workflow_path: &str,
@@ -574,9 +565,9 @@ fn build_loaded_workflow(
     let workflow_path =
         serde_json::to_string(workflow_path).map_err(WorkflowLoadError::serialize_bootstrap)?;
     Ok(LoadedWorkflow {
-        source: with_bootstrap(format!(
-            "const flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
-        )),
+        source: format!(
+            "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+        ),
     })
 }
 
@@ -857,12 +848,19 @@ mod tests {
                 Some(&json!({"quote": "line\nnext"})),
             )
             .expect("workflow should load");
-        assert!(loaded.source.starts_with("const flowdex = Object.freeze({"));
+        assert!(
+            loaded.source.starts_with(
+                "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({"
+            )
+        );
         assert!(loaded.source.contains("spawnAgent: async"));
         assert!(loaded.source.contains("sendMessage: async"));
         assert!(loaded.source.contains("waitAgent: async"));
         assert!(loaded.source.contains("resumeAgent: async"));
         assert!(loaded.source.contains("startRun: async"));
+        assert!(loaded.source.contains("requireInput: (schema)"));
+        assert!(loaded.source.contains("output: (value)"));
+        assert!(loaded.source.contains("runWorkflow: async"));
         assert!(loaded.source.contains("Object.freeze(handle)"));
         assert!(loaded.source.contains("tools.flowdex_start_run"));
         assert!(loaded.source.contains("tools.flowdex_queue_task"));
