@@ -36,6 +36,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -417,6 +418,23 @@ async fn on_event_updates_status_from_task_complete() {
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
+
+    let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-2".to_string(),
+        started_at: None,
+        last_agent_message: None,
+        error: Some(ErrorEvent {
+            message: "turn failed".to_string(),
+            codex_error_info: None,
+        }),
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+    assert_eq!(
+        status,
+        Some(AgentStatus::Errored("turn failed".to_string()))
+    );
 }
 
 #[tokio::test]
@@ -593,32 +611,89 @@ async fn subscribe_status_marks_existing_terminal_value_seen() {
 }
 
 #[tokio::test]
-async fn wait_for_submitted_operation_ignores_stale_terminal_status() {
+async fn wait_for_submitted_operation_ignores_foreign_terminal_status() {
     let control = AgentControl::default();
     let agent_id = ThreadId::new();
-    let (status_tx, status_rx) =
-        tokio::sync::watch::channel(AgentStatus::Completed(Some("previous turn".to_string())));
+    let operation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = Arc::clone(&operation_lock).lock_owned().await;
+    let (status_tx, status_rx) = tokio::sync::broadcast::channel(4);
+    let operation = SubmittedAgentOperation {
+        agent_id,
+        submission_id: "owned-operation".to_string(),
+        status_rx,
+        _guard: guard,
+    };
 
-    // A terminal value from before submission must not satisfy the waiter.
-    assert!(
-        timeout(
-            Duration::from_millis(20),
-            control.wait_for_submitted_operation(agent_id, status_rx.clone()),
-        )
-        .await
-        .is_err()
-    );
-
-    // Both updates may be coalesced before the waiter runs; the latest terminal
-    // value still belongs to the newly submitted operation.
-    status_tx.send(AgentStatus::Running).unwrap();
     status_tx
-        .send(AgentStatus::Completed(Some("new turn".to_string())))
+        .send(AgentOperationEvent::new(
+            "foreign-operation".to_string(),
+            AgentStatus::Completed(Some("foreign output".to_string())),
+            true,
+        ))
         .unwrap();
-    let status = control
-        .wait_for_submitted_operation(agent_id, status_rx)
+    status_tx
+        .send(AgentOperationEvent::new(
+            "owned-operation".to_string(),
+            AgentStatus::Completed(Some("owned output".to_string())),
+            true,
+        ))
+        .unwrap();
+
+    let status = control.wait_for_submitted_operation(operation).await;
+    assert_eq!(
+        status,
+        AgentStatus::Completed(Some("owned output".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn wait_for_submitted_compaction_preserves_error_before_completion() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    let guard = Arc::clone(&thread.session.agent_operation_lock)
+        .lock_owned()
         .await;
-    assert_eq!(status, AgentStatus::Completed(Some("new turn".to_string())));
+    let operation = SubmittedAgentOperation {
+        agent_id,
+        submission_id: "compact-operation".to_string(),
+        status_rx: thread.session.agent_operation_events.subscribe(),
+        _guard: guard,
+    };
+
+    thread
+        .session
+        .send_event_raw(Event {
+            id: "compact-operation".to_string(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: "compaction failed".to_string(),
+                codex_error_info: None,
+            }),
+        })
+        .await;
+    thread
+        .session
+        .send_event_raw(Event {
+            id: "compact-operation".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "compact-operation".to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })
+        .await;
+
+    let status = harness
+        .control
+        .wait_for_submitted_operation(operation)
+        .await;
+    assert_eq!(
+        status,
+        AgentStatus::Errored("compaction failed".to_string())
+    );
 }
 
 #[tokio::test]

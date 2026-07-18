@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
+use crate::agent::control::AgentOperationEvent;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -1985,7 +1986,20 @@ impl Session {
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+            self.agent_status.send_replace(status.clone());
+            if matches!(
+                &event.msg,
+                EventMsg::TurnComplete(_)
+                    | EventMsg::TurnAborted(_)
+                    | EventMsg::Error(_)
+                    | EventMsg::ShutdownComplete
+            ) {
+                let _ = self.agent_operation_events.send(AgentOperationEvent::new(
+                    event.id.clone(),
+                    status,
+                    !matches!(&event.msg, EventMsg::Error(_)),
+                ));
+            }
         }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");

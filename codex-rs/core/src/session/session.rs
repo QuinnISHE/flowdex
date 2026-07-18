@@ -1,5 +1,6 @@
 use super::input_queue::InputQueue;
 use super::*;
+use crate::agent::control::AgentOperationEvent;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
@@ -21,6 +22,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
+use tokio::sync::broadcast;
 
 /// Context for an initialized model agent
 ///
@@ -30,6 +32,8 @@ pub(crate) struct Session {
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
+    pub(crate) agent_operation_lock: Arc<Mutex<()>>,
+    pub(crate) agent_operation_events: broadcast::Sender<AgentOperationEvent>,
     pub(super) state: Mutex<SessionState>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
@@ -1149,6 +1153,8 @@ impl Session {
                 installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
+                agent_operation_lock: Arc::new(Mutex::new(())),
+                agent_operation_events: broadcast::channel(/*capacity*/ 512).0,
                 state: Mutex::new(state),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),

@@ -46,6 +46,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
+use tokio::sync::OwnedMutexGuard;
+use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -91,6 +93,30 @@ pub(crate) struct LiveAgent {
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentOperationEvent {
+    operation_id: String,
+    status: AgentStatus,
+    operation_finished: bool,
+}
+
+impl AgentOperationEvent {
+    pub(crate) fn new(operation_id: String, status: AgentStatus, operation_finished: bool) -> Self {
+        Self {
+            operation_id,
+            status,
+            operation_finished,
+        }
+    }
+}
+
+pub(crate) struct SubmittedAgentOperation {
+    agent_id: ThreadId,
+    submission_id: String,
+    status_rx: broadcast::Receiver<AgentOperationEvent>,
+    _guard: OwnedMutexGuard<()>,
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -159,12 +185,23 @@ impl AgentControl {
     }
 
     /// Submit the standalone native compaction operation to an existing agent.
-    pub(crate) async fn submit_compaction(&self, agent_id: ThreadId) -> CodexResult<String> {
+    pub(crate) async fn submit_compaction(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<SubmittedAgentOperation> {
         let state = self.upgrade()?;
+        let (guard, status_rx) = self.begin_submitted_operation(agent_id, &state).await?;
         let op = Op::Compact;
         self.ensure_execution_capacity_for_op(agent_id, &op).await?;
-        self.handle_thread_request_result(agent_id, &state, state.send_op(agent_id, op).await)
-            .await
+        let submission_id = self
+            .handle_thread_request_result(agent_id, &state, state.send_op(agent_id, op).await)
+            .await?;
+        Ok(SubmittedAgentOperation {
+            agent_id,
+            submission_id,
+            status_rx,
+            _guard: guard,
+        })
     }
 
     async fn send_input_after_capacity_check(
@@ -187,8 +224,23 @@ impl AgentControl {
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
+        if communication.trigger_turn {
+            let operation = self
+                .submit_inter_agent_communication_operation(
+                    agent_id,
+                    communication,
+                    agent_communication_context,
+                )
+                .await?;
+            let submission_id = operation.submission_id.clone();
+            let control = self.clone();
+            tokio::spawn(async move {
+                let _ = control.wait_for_submitted_operation(operation).await;
+            });
+            return Ok(submission_id);
+        }
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
+        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ false)
             .await?;
         self.send_inter_agent_communication_after_capacity_check(
             agent_id,
@@ -197,6 +249,48 @@ impl AgentControl {
             agent_communication_context,
         )
         .await
+    }
+
+    pub(crate) async fn submit_inter_agent_communication_operation(
+        &self,
+        agent_id: ThreadId,
+        communication: InterAgentCommunication,
+        agent_communication_context: AgentCommunicationContext,
+    ) -> CodexResult<SubmittedAgentOperation> {
+        debug_assert!(communication.trigger_turn);
+        let state = self.upgrade()?;
+        let (guard, status_rx) = self.begin_submitted_operation(agent_id, &state).await?;
+        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
+            .await?;
+        let submission_id = self
+            .send_inter_agent_communication_after_capacity_check(
+                agent_id,
+                &state,
+                communication,
+                agent_communication_context,
+            )
+            .await?;
+        Ok(SubmittedAgentOperation {
+            agent_id,
+            submission_id,
+            status_rx,
+            _guard: guard,
+        })
+    }
+
+    async fn begin_submitted_operation(
+        &self,
+        agent_id: ThreadId,
+        state: &Arc<ThreadManagerState>,
+    ) -> CodexResult<(
+        OwnedMutexGuard<()>,
+        broadcast::Receiver<AgentOperationEvent>,
+    )> {
+        let thread = state.get_thread(agent_id).await?;
+        let guard = Arc::clone(&thread.session.agent_operation_lock)
+            .lock_owned()
+            .await;
+        Ok((guard, thread.session.agent_operation_events.subscribe()))
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -330,6 +424,12 @@ impl AgentControl {
         Some(thread.config_snapshot().await)
     }
 
+    pub(crate) async fn get_agent_config(&self, agent_id: ThreadId) -> Option<Arc<Config>> {
+        let state = self.upgrade().ok()?;
+        let thread = state.get_thread(agent_id).await.ok()?;
+        Some(thread.session.get_config().await)
+    }
+
     pub(crate) async fn resolve_agent_reference(
         &self,
         _current_thread_id: ThreadId,
@@ -366,23 +466,30 @@ impl AgentControl {
         Ok(status_rx)
     }
 
-    /// Wait for a terminal status emitted after a new operation was submitted.
-    ///
-    /// The first status change is always awaited so a terminal status from the
-    /// preceding operation cannot satisfy this waiter. Tokio's watch channel
-    /// coalesces fast transitions, so the changed value may already be terminal.
+    /// Wait for the terminal event carrying the submitted operation's exact ID.
     pub(crate) async fn wait_for_submitted_operation(
         &self,
-        agent_id: ThreadId,
-        mut status_rx: watch::Receiver<AgentStatus>,
+        mut operation: SubmittedAgentOperation,
     ) -> AgentStatus {
+        let mut operation_error = None;
         loop {
-            if status_rx.changed().await.is_err() {
-                return self.get_status(agent_id).await;
-            }
-            let status = status_rx.borrow().clone();
-            if is_final(&status) {
-                return status;
+            match operation.status_rx.recv().await {
+                Ok(event) if matches!(event.status, AgentStatus::Shutdown) => return event.status,
+                Ok(event) if event.operation_id == operation.submission_id => {
+                    if event.operation_finished {
+                        return operation_error.unwrap_or(event.status);
+                    }
+                    operation_error = Some(event.status);
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return AgentStatus::Errored(
+                        "submitted operation status updates were lost".to_string(),
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return self.get_status(operation.agent_id).await;
+                }
             }
         }
     }
