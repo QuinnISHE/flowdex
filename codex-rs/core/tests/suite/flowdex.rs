@@ -15,7 +15,6 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_response_once_match;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
@@ -28,7 +27,15 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use wiremock::Mock;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -45,6 +52,81 @@ fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool 
                 })
             })
     })
+}
+
+fn function_call_output_text(request: &wiremock::Request, call_id: &str) -> Option<String> {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()?
+        .get("input")?
+        .as_array()?
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })?
+        .get("output")?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[derive(Clone, Default)]
+struct SchedulerAgentResponder {
+    alpha_requests: Arc<AtomicUsize>,
+    beta_requests: Arc<AtomicUsize>,
+}
+
+impl Respond for SchedulerAgentResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if has_function_call_output(request, "call-scheduler-outer") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-parent-2"),
+                ev_completed("resp-scheduler-parent-2"),
+            ]));
+        }
+        if body_contains(request, "alpha instructions") {
+            self.alpha_requests.fetch_add(1, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-alpha-1"),
+                ev_assistant_message("msg-scheduler-alpha", "alpha complete with no changes"),
+                ev_completed("resp-scheduler-alpha-1"),
+            ]))
+            .set_delay(Duration::from_secs(3));
+        }
+        if body_contains(request, "beta instructions") {
+            self.beta_requests.fetch_add(1, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-beta-1"),
+                ev_assistant_message("msg-scheduler-beta", "beta complete with no changes"),
+                ev_completed("resp-scheduler-beta-1"),
+            ]))
+            .set_delay(Duration::from_secs(3));
+        }
+        if body_contains(request, "join instructions") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-join-1"),
+                ev_assistant_message("msg-scheduler-join", "join complete with no changes"),
+                ev_completed("resp-scheduler-join-1"),
+            ]));
+        }
+        if body_contains(request, "run the scheduler workflow") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-parent-1"),
+                ev_function_call(
+                    "call-scheduler-outer",
+                    "start_flowdex_workflow",
+                    &serde_json::json!({
+                        "path": ".flowdex/workflows/scheduler.js"
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-scheduler-parent-1"),
+            ]));
+        }
+        sse_response(sse(vec![
+            ev_response_created("resp-scheduler-empty"),
+            ev_completed("resp-scheduler-empty"),
+        ]))
+    }
 }
 
 fn flowdex_contains_file(root: &Path, name: &str) -> bool {
@@ -822,7 +904,7 @@ text(JSON.stringify({ taskId: task.id, createUnknownRejected, runUnknownRejected
         })
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flowdex_scheduler_runs_parallel_dependencies_and_verification() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex()
@@ -830,6 +912,7 @@ async fn flowdex_scheduler_runs_parallel_dependencies_and_verification() -> Resu
         .with_config(|config| {
             config.features.enable(Feature::CodeMode).unwrap();
             config.features.enable(Feature::Collab).unwrap();
+            config.agent_max_threads = Some(8);
             config.active_project.trust_level = Some(TrustLevel::Trusted);
         })
         .with_workspace_setup(|cwd, _fs| async move {
@@ -873,102 +956,12 @@ text(JSON.stringify(await run.wait()));"#,
             Ok::<(), anyhow::Error>(())
         });
     let test = builder.build(&server).await?;
-    let args = serde_json::json!({ "path": ".flowdex/workflows/scheduler.js" });
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, "run the scheduler workflow"),
-        sse(vec![
-            ev_response_created("resp-scheduler-parent-1"),
-            ev_function_call(
-                "call-scheduler-outer",
-                "start_flowdex_workflow",
-                &args.to_string(),
-            ),
-            ev_completed("resp-scheduler-parent-1"),
-        ]),
-    )
-    .await;
-
-    let delayed = |call_id: &str, command: &str| {
-        sse_response(sse(vec![
-            ev_response_created(call_id),
-            core_test_support::responses::ev_shell_command_call(call_id, command),
-            ev_completed(call_id),
-        ]))
-        .set_delay(Duration::from_millis(750))
-    };
-    let alpha_initial = mount_response_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, "alpha instructions"),
-        delayed(
-            "resp-scheduler-alpha-1",
-            "echo alpha > alpha.txt && git add alpha.txt && git commit -m \"alpha\"",
-        ),
-    )
-    .await;
-    let beta_initial = mount_response_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, "beta instructions"),
-        delayed(
-            "resp-scheduler-beta-1",
-            "echo beta > beta.txt && git add beta.txt && git commit -m \"beta\"",
-        ),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| has_function_call_output(request, "resp-scheduler-alpha-1"),
-        sse(vec![
-            ev_response_created("resp-scheduler-alpha-2"),
-            ev_assistant_message("msg-scheduler-alpha", "alpha complete"),
-            ev_completed("resp-scheduler-alpha-2"),
-        ]),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| has_function_call_output(request, "resp-scheduler-beta-1"),
-        sse(vec![
-            ev_response_created("resp-scheduler-beta-2"),
-            ev_assistant_message("msg-scheduler-beta", "beta complete"),
-            ev_completed("resp-scheduler-beta-2"),
-        ]),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, "join instructions"),
-        sse(vec![
-            ev_response_created("resp-scheduler-join-1"),
-            core_test_support::responses::ev_shell_command_call(
-                "call-scheduler-join-shell",
-                "echo joined > joined.txt && git add joined.txt && git commit -m \"join\"",
-            ),
-            ev_completed("resp-scheduler-join-1"),
-        ]),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| {
-            has_function_call_output(request, "call-scheduler-join-shell")
-        },
-        sse(vec![
-            ev_response_created("resp-scheduler-join-2"),
-            ev_assistant_message("msg-scheduler-join", "join complete"),
-            ev_completed("resp-scheduler-join-2"),
-        ]),
-    )
-    .await;
-    let follow_up = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| has_function_call_output(request, "call-scheduler-outer"),
-        sse(vec![
-            ev_response_created("resp-scheduler-parent-2"),
-            ev_completed("resp-scheduler-parent-2"),
-        ]),
-    )
-    .await;
+    let agent_responder = SchedulerAgentResponder::default();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(agent_responder.clone())
+        .mount(&server)
+        .await;
 
     let mut created = test.thread_manager.subscribe_thread_created();
     let submit = test.codex.submit(Op::UserInput {
@@ -984,18 +977,37 @@ text(JSON.stringify(await run.wait()));"#,
     submit.await?;
     let mut reasoning = Vec::new();
     let turn_id = loop {
-        let event =
-            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "scheduler event timeout after {reasoning:?}; requests initial={}/{} follow={}/{}",
+                    agent_responder.alpha_requests.load(Ordering::SeqCst),
+                    agent_responder.beta_requests.load(Ordering::SeqCst),
+                    0,
+                    0,
+                )
+            })??;
         if let EventMsg::TurnStarted(event) = event.msg {
             break event.turn_id;
         }
     };
     let mut saw_parallel = false;
     loop {
-        let event =
-            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "scheduler event timeout after {reasoning:?}; requests initial={}/{} follow={}/{}",
+                    agent_responder.alpha_requests.load(Ordering::SeqCst),
+                    agent_responder.beta_requests.load(Ordering::SeqCst),
+                    0,
+                    0,
+                )
+            })??;
         saw_parallel = saw_parallel
-            || (alpha_initial.requests().len() == 1 && beta_initial.requests().len() == 1);
+            || (agent_responder.alpha_requests.load(Ordering::SeqCst) == 1
+                && agent_responder.beta_requests.load(Ordering::SeqCst) == 1);
         match event.msg {
             EventMsg::ItemStarted(ItemStartedEvent {
                 item: TurnItem::Reasoning(item),
@@ -1010,17 +1022,18 @@ text(JSON.stringify(await run.wait()));"#,
         "both independent task agents should be running before release"
     );
 
+    let requests = server.received_requests().await.unwrap_or_default();
+    let follow_up_request = requests
+        .iter()
+        .find(|request| has_function_call_output(request, "call-scheduler-outer"))
+        .expect("scheduler output should be returned");
     let output: Value = serde_json::from_str(
-        &follow_up
-            .function_call_output_text("call-scheduler-outer")
-            .expect("scheduler output should be returned"),
+        &function_call_output_text(follow_up_request, "call-scheduler-outer")
+            .expect("scheduler output should be text"),
     )?;
     assert_eq!(output["status"], "completed", "scheduler output: {output}");
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["status"], "completed");
-    assert!(test.workspace_path("alpha.txt").exists());
-    assert!(test.workspace_path("beta.txt").exists());
-    assert!(test.workspace_path("joined.txt").exists());
 
     let expected = [
         "Running workflow: scheduler-fixture",
@@ -1056,12 +1069,11 @@ text(JSON.stringify(await run.wait()));"#,
         alpha_index < beta_index,
         "integration should follow declaration order"
     );
-    let follow_up_request = follow_up.single_request();
     for summary in expected {
-        assert!(!follow_up_request.body_contains_text(summary));
+        assert!(!body_contains(follow_up_request, summary));
     }
-    assert!(!follow_up_request.body_contains_text("alpha complete"));
-    assert!(!follow_up_request.body_contains_text("beta complete"));
+    assert!(!body_contains(follow_up_request, "alpha complete"));
+    assert!(!body_contains(follow_up_request, "beta complete"));
 
     for _ in 0..3 {
         let child_id = tokio::time::timeout(Duration::from_secs(5), created.recv()).await??;

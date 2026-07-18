@@ -306,7 +306,7 @@ impl FlowdexStore {
                     .bind(phase.open as i64).bind((!phase.open) as i64).bind(encode(&phase.verification)).bind(if phase.open { PhaseState::Pending.as_str() } else { PhaseState::Sealed.as_str() })
                     .execute(&mut *tx).await?;
                 for (task_index, task) in phase.tasks.iter().enumerate() {
-                    let task_id = format!("{}:{}:{}", info.run_id, phase.name, task.name);
+                    let task_id = uuid::Uuid::new_v4().to_string();
                     insert_schedule_row(&mut tx, &task_id, &info.run_id, &phase.name, &phase.instructions, task_index as i64, task, SchedulerTaskState::Queued).await?;
                 }
             }

@@ -225,7 +225,7 @@ fn parse(payload: ToolPayload, message: &str) -> Result<String, FunctionCallErro
         _ => Err(FunctionCallError::RespondToModel(message.into())),
     }
 }
-fn runtime_id(invocation: &ToolInvocation) -> Result<String, FunctionCallError> {
+pub(crate) fn runtime_id(invocation: &ToolInvocation) -> Result<String, FunctionCallError> {
     match &invocation.source {
         crate::tools::context::ToolCallSource::CodeMode { cell_id, .. } => Ok(cell_id.clone()),
         _ => Err(FunctionCallError::RespondToModel(
@@ -728,7 +728,7 @@ pub(crate) fn associate_task_agent(id: ThreadId, task: &str) {
     associate(id, task);
 }
 
-pub(crate) struct JsonOutput(Value);
+pub(crate) struct JsonOutput(pub(crate) Value);
 impl ToolOutput for JsonOutput {
     fn log_preview(&self) -> String {
         self.0.to_string()
