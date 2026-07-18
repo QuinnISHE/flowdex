@@ -67,6 +67,34 @@ pub(crate) async fn execute_source(
     ),
     String,
 > {
+    execute_source_with_cell_hook(
+        exec,
+        call_id,
+        source,
+        nested_tool_specs,
+        yield_time_ms,
+        max_output_tokens,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_source_with_cell_hook(
+    exec: &ExecContext,
+    call_id: String,
+    source: String,
+    nested_tool_specs: &[ToolSpec],
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    cell_started: Option<Box<dyn FnOnce(&codex_code_mode::CellId) + Send>>,
+) -> Result<
+    (
+        codex_code_mode::RuntimeResponse,
+        codex_code_mode::CellId,
+        std::time::Instant,
+    ),
+    String,
+> {
     let enabled_tools = codex_tools::collect_code_mode_tool_definitions(nested_tool_specs);
     let started_at = std::time::Instant::now();
     let started_cell = exec
@@ -82,6 +110,9 @@ pub(crate) async fn execute_source(
         })
         .await?;
     let cell_id = started_cell.cell_id.clone();
+    if let Some(cell_started) = cell_started {
+        cell_started(&cell_id);
+    }
     let runtime_cell_id = cell_id.to_string();
     let code_cell_trace = exec
         .session

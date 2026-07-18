@@ -464,17 +464,26 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
                     .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
             }
             RunStatus::Completed => {
+                runs().lock().await.remove(&args.run_id);
                 return Ok(task::JsonOutput(
                     serde_json::json!({"runId": args.run_id, "status": "completed"}),
                 ));
             }
-            RunStatus::Failed(error) => return Err(FunctionCallError::RespondToModel(error)),
+            RunStatus::Failed(error) => {
+                runs().lock().await.remove(&args.run_id);
+                return Err(FunctionCallError::RespondToModel(error));
+            }
         }
     }
 }
 
 async fn run_scheduler(controller: Arc<RunController>) {
-    let result = run_scheduler_inner(&controller).await;
+    let result = tokio::select! {
+        _ = controller.invocation.cancellation_token.cancelled() => {
+            Err("Flowdex run cancelled".to_string())
+        }
+        result = run_scheduler_inner(&controller) => result,
+    };
     if let Err(error) = result {
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();

@@ -45,7 +45,7 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
-pub(crate) use execute_handler::execute_source;
+pub(crate) use execute_handler::execute_source_with_cell_hook;
 pub(crate) use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 

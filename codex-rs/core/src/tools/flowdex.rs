@@ -1,7 +1,7 @@
 use crate::function_tool::FunctionCallError;
 use crate::session::InputQueueActivity;
 use crate::tools::code_mode::ExecContext;
-use crate::tools::code_mode::execute_source;
+use crate::tools::code_mode::execute_source_with_cell_hook;
 use crate::tools::code_mode::into_function_call_output_content_items;
 use crate::tools::code_mode::truncate_code_mode_result;
 use crate::tools::context::FunctionToolOutput;
@@ -26,6 +26,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use tokio_util::sync::CancellationToken;
@@ -383,27 +384,55 @@ impl FlowdexRunWorkflowHandler {
             .load_reference(&reference, &root, args.input.as_ref())
             .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
         let exec = ExecContext { session, turn };
-        let (response, child_cell, _) = execute_source(
-            &exec,
-            format!("{RUN_TOOL_NAME}-{call_id}"),
-            loaded.into_source(),
-            &self.nested_tool_specs,
-            None,
-            None,
-        )
-        .await
-        .map_err(FunctionCallError::RespondToModel)?;
-        workflow_chains()
-            .lock()
-            .expect("workflow chain mutex poisoned")
-            .insert(
-                child_cell.to_string(),
-                WorkflowInvocation {
-                    chain: child_chain,
-                    parent_run_id: Some(parent_cell),
-                    workflow_identity: Some(identity),
-                },
-            );
+        let chain_for_registration = child_chain.clone();
+        let identity_for_registration = identity.clone();
+        let parent_for_registration = parent_cell.clone();
+        let started_child = Arc::new(Mutex::new(None));
+        let started_child_for_registration = Arc::clone(&started_child);
+        let (response, child_cell, _) = tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                let child_cell = started_child
+                    .lock()
+                    .expect("child cell mutex poisoned")
+                    .clone();
+                if let Some(child_cell) = child_cell {
+                    let terminal = exec
+                        .session
+                        .services
+                        .code_mode_service
+                        .terminate(child_cell.clone())
+                        .await
+                        .ok()
+                        .map(Into::into);
+                    finish_nested_dispatch(&exec, &child_cell, terminal.as_ref());
+                }
+                return Err(FunctionCallError::RespondToModel("Flowdex nested workflow cancelled".to_string()));
+            }
+            result = execute_source_with_cell_hook(
+                &exec,
+                format!("{RUN_TOOL_NAME}-{call_id}"),
+                loaded.into_source(),
+                &self.nested_tool_specs,
+                None,
+                None,
+                Some(Box::new(move |child_cell| {
+                    *started_child_for_registration
+                        .lock()
+                        .expect("child cell mutex poisoned") = Some(child_cell.clone());
+                    workflow_chains()
+                        .lock()
+                        .expect("workflow chain mutex poisoned")
+                        .insert(
+                            child_cell.to_string(),
+                            WorkflowInvocation {
+                                chain: chain_for_registration,
+                                parent_run_id: Some(parent_for_registration),
+                                workflow_identity: Some(identity_for_registration),
+                            },
+                        );
+                })),
+            ) => result.map_err(FunctionCallError::RespondToModel)?,
+        };
         let result =
             wait_nested_workflow(&exec, child_cell.clone(), response, cancellation_token).await;
         workflow_chains()
@@ -477,29 +506,48 @@ async fn wait_nested_workflow(
                     .await
                 {
                     let terminal: codex_code_mode::RuntimeResponse = terminal.into();
-                    exec.session
-                        .services
-                        .rollout_thread_trace
-                        .code_cell_trace_context(&exec.turn.sub_id, cell_id.as_str())
-                        .record_ended(&terminal);
-                    exec.session
-                        .services
-                        .code_mode_service
-                        .finish_cell_dispatch(&cell_id);
+                    finish_nested_dispatch(exec, &cell_id, Some(&terminal));
+                } else {
+                    finish_nested_dispatch(exec, &cell_id, Some(&response));
                 }
                 return Err("Flowdex nested workflow cancelled".to_string());
             }
             wait = exec.session.services.code_mode_service.wait(codex_code_mode::WaitRequest { cell_id: cell_id.clone(), yield_time_ms: 10_000 }) => match wait {
                 Ok(wait) => wait,
                 Err(error) => {
-                    let _ = exec.session.services.code_mode_service.terminate(cell_id.clone()).await;
-                    exec.session.services.code_mode_service.finish_cell_dispatch(&cell_id);
+                    let terminal = exec
+                        .session
+                        .services
+                        .code_mode_service
+                        .terminate(cell_id.clone())
+                        .await
+                        .ok()
+                        .map(Into::into);
+                    finish_nested_dispatch(exec, &cell_id, terminal.as_ref().or(Some(&response)));
                     return Err(error);
                 }
             },
         };
         response = wait.into();
     }
+}
+
+fn finish_nested_dispatch(
+    exec: &ExecContext,
+    cell_id: &codex_code_mode::CellId,
+    terminal: Option<&codex_code_mode::RuntimeResponse>,
+) {
+    if let Some(terminal) = terminal {
+        exec.session
+            .services
+            .rollout_thread_trace
+            .code_cell_trace_context(&exec.turn.sub_id, cell_id.as_str())
+            .record_ended(terminal);
+    }
+    exec.session
+        .services
+        .code_mode_service
+        .finish_cell_dispatch(cell_id);
 }
 
 fn nested_workflow_result(response: codex_code_mode::RuntimeResponse) -> Result<Value, String> {
@@ -512,6 +560,11 @@ fn nested_workflow_result(response: codex_code_mode::RuntimeResponse) -> Result<
         return Err("Flowdex nested workflow terminated".to_string());
     };
     if let Some(error) = error_text {
+        let bounded = truncate_code_mode_result(
+            vec![codex_protocol::models::FunctionCallOutputContentItem::InputText { text: error }],
+            None,
+        );
+        let error = function_call_output_content_items_to_text(&bounded).unwrap_or_default();
         return Err(format!("Flowdex nested workflow failed: {error}"));
     }
     let items = into_function_call_output_content_items(content_items);
@@ -646,15 +699,20 @@ impl StartFlowdexWorkflowHandler {
             ));
         };
         let args: StartArgs = parse_arguments(&arguments)?;
-        let cwd = turn
-            .environments
-            .single_local_environment_cwd()
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "start_flowdex_workflow requires one local environment".to_string(),
-                )
-            })?;
-        let loaded = if let Ok(reference) = WorkflowRef::parse(&args.path) {
+        let reference = WorkflowRef::parse(&args.path).ok();
+        let cwd = match reference.as_ref().map(WorkflowRef::scope) {
+            Some(WorkflowScope::Global) => None,
+            _ => Some(
+                turn.environments
+                    .single_local_environment_cwd()
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(
+                            "start_flowdex_workflow requires one local environment".to_string(),
+                        )
+                    })?,
+            ),
+        };
+        let loaded = if let Some(reference) = reference.clone() {
             if matches!(reference.scope(), WorkflowScope::Repo)
                 && !turn.config.active_project.is_trusted()
             {
@@ -663,7 +721,10 @@ impl StartFlowdexWorkflowHandler {
                 ));
             }
             let root = match reference.scope() {
-                WorkflowScope::Repo => cwd.to_path_buf(),
+                WorkflowScope::Repo => cwd
+                    .as_ref()
+                    .expect("repo workflows require cwd")
+                    .to_path_buf(),
                 WorkflowScope::Global => turn.config.codex_home.to_path_buf(),
             };
             let loader_root = AbsolutePathBuf::from_absolute_path(root.clone())
@@ -672,34 +733,42 @@ impl StartFlowdexWorkflowHandler {
                 .load_reference(&reference, &root, args.input.as_ref())
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         } else {
-            WorkflowLoader::new(cwd)
+            WorkflowLoader::new(cwd.expect("path workflows require cwd"))
                 .load(Path::new(&args.path), args.input.as_ref())
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         };
         let exec = ExecContext { session, turn };
-        let (response, cell_id, _started_at) = execute_source(
+        let workflow_metadata = reference.as_ref().map(|reference| {
+            (
+                reference.normalized_display(),
+                reference.normalized_display(),
+            )
+        });
+        let (response, cell_id, _started_at) = execute_source_with_cell_hook(
             &exec,
             call_id,
             loaded.into_source(),
             &self.nested_tool_specs,
             None,
             None,
+            workflow_metadata.map(|(identity, chain_identity)| {
+                Box::new(move |cell_id: &codex_code_mode::CellId| {
+                    workflow_chains()
+                        .lock()
+                        .expect("workflow chain mutex poisoned")
+                        .insert(
+                            cell_id.to_string(),
+                            WorkflowInvocation {
+                                chain: vec![chain_identity],
+                                parent_run_id: None,
+                                workflow_identity: Some(identity),
+                            },
+                        );
+                }) as Box<dyn FnOnce(&codex_code_mode::CellId) + Send>
+            }),
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
-        if let Some(reference) = WorkflowRef::parse(&args.path).ok() {
-            workflow_chains()
-                .lock()
-                .expect("workflow chain mutex poisoned")
-                .insert(
-                    cell_id.to_string(),
-                    WorkflowInvocation {
-                        chain: vec![reference.normalized_display()],
-                        parent_run_id: None,
-                        workflow_identity: Some(reference.normalized_display()),
-                    },
-                );
-        }
         if matches!(
             response,
             codex_code_mode::RuntimeResponse::Result { .. }

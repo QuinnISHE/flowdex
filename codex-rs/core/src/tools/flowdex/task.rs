@@ -565,14 +565,57 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     .await?;
     let status = match child.initial_operation {
         Some(operation) => {
-            invocation
-                .session
-                .services
-                .agent_control
-                .wait_for_submitted_operation(operation)
-                .await
+            tokio::select! {
+                _ = invocation.cancellation_token.cancelled() => {
+                    let _ = invocation
+                        .session
+                        .services
+                        .agent_control
+                        .interrupt_agent(id)
+                        .await;
+                    let _ = finish_task_operation(
+                        &invocation.session,
+                        &invocation.turn,
+                        &task.id,
+                        &operation_id,
+                        "cancelled",
+                    )
+                    .await;
+                    return Err(FunctionCallError::RespondToModel(
+                        "Flowdex task cancelled".to_string(),
+                    ));
+                }
+                status = invocation
+                    .session
+                    .services
+                    .agent_control
+                    .wait_for_submitted_operation(operation) => status,
+            }
         }
-        None => super::agents::wait_for_terminal(&invocation.session, id).await,
+        None => {
+            tokio::select! {
+                _ = invocation.cancellation_token.cancelled() => {
+                    let _ = invocation
+                        .session
+                        .services
+                        .agent_control
+                        .interrupt_agent(id)
+                        .await;
+                    let _ = finish_task_operation(
+                        &invocation.session,
+                        &invocation.turn,
+                        &task.id,
+                        &operation_id,
+                        "cancelled",
+                    )
+                    .await;
+                    return Err(FunctionCallError::RespondToModel(
+                        "Flowdex task cancelled".to_string(),
+                    ));
+                }
+                status = super::agents::wait_for_terminal(&invocation.session, id) => status,
+            }
+        }
     };
     let terminal = if matches!(status, crate::agent::AgentStatus::Completed(_)) {
         "completed"
