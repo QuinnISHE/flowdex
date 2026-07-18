@@ -83,6 +83,11 @@ impl TurnEnvironment {
         &self.cwd
     }
 
+    pub(crate) fn set_runtime_cwd(&mut self, cwd: PathUri) {
+        self.cwd = cwd.clone();
+        self.workspace_roots = vec![cwd];
+    }
+
     pub(crate) fn workspace_roots(&self) -> &[PathUri] {
         &self.workspace_roots
     }
@@ -175,6 +180,7 @@ impl Clone for TurnContext {
             model_verification_emitted: AtomicBool::new(self.model_verification_emitted.load(Ordering::Relaxed)),
         }
     }
+
 }
 
 enum TurnMultiAgentRuntime {

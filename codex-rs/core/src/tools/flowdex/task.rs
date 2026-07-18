@@ -557,7 +557,14 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     let config = std::sync::Arc::make_mut(&mut turn.config);
     config.cwd = task_cwd.clone();
     config.workspace_roots = vec![task_cwd.clone()];
-    config.permissions.set_workspace_roots(vec![task_cwd]);
+    config.permissions.set_workspace_roots(vec![task_cwd.clone()]);
+    let step_context = std::sync::Arc::make_mut(&mut task_invocation.step_context);
+    step_context.turn = task_invocation.turn.clone();
+    for environment in &mut step_context.environments.environments {
+        if let crate::environment_selection::TurnEnvironmentState::Ready(environment) = environment {
+            environment.set_runtime_cwd(PathUri::from_abs_path(&task_cwd));
+        }
+    }
     let verifier = FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic);
     let output = verifier
         .handle_for_workdir(task_invocation.clone(), &task.worktree_path)
