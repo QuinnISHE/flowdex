@@ -161,6 +161,7 @@ pub struct TurnContext {
     pub(crate) model_verification_emitted: AtomicBool,
 }
 
+#[allow(deprecated)]
 impl Clone for TurnContext {
     fn clone(&self) -> Self {
         Self {
