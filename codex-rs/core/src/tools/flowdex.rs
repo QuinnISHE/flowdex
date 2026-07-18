@@ -21,9 +21,11 @@ use serde_json::Value;
 use std::path::Path;
 
 mod agents;
+mod verification;
 pub(crate) use agents::FlowdexSendMessageHandler;
 pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
+pub(crate) use verification::FlowdexVerifyHandler;
 
 const TOOL_NAME: &str = "start_flowdex_workflow";
 

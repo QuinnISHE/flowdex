@@ -25,7 +25,7 @@ mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
-mod shell;
+pub(crate) mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -146,7 +146,7 @@ where
     parse_arguments(arguments)
 }
 
-fn resolve_workdir_base_path(
+pub(crate) fn resolve_workdir_base_path(
     arguments: &str,
     default_cwd: &AbsolutePathBuf,
 ) -> Result<AbsolutePathBuf, FunctionCallError> {

@@ -196,3 +196,60 @@ async fn flowdex_workflow_spawns_and_waits_without_parent_completion_notificatio
     assert!(!follow_up_request.body_contains_text("Message Type: FINAL_ANSWER"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flowdex_workflow_verifies_commands_in_order() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.features.enable(Feature::CodeMode).unwrap();
+    });
+    builder = builder.with_workspace_setup(|cwd, _fs| async move {
+        let workflow_dir = cwd.join(".flowdex/workflows");
+        fs::create_dir_all(&workflow_dir)?;
+        fs::write(
+            workflow_dir.join("verify.js"),
+            "const result = await flowdex.verify(['echo first', 'exit 7', 'echo after']); text(JSON.stringify(result));",
+        )?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/verify.js" });
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-verify-1"),
+            ev_function_call("call-verify-1", "start_flowdex_workflow", &args.to_string()),
+            ev_completed("resp-verify-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-verify-2"),
+            ev_completed("resp-verify-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("run verification").await?;
+
+    let output = follow_up
+        .function_call_output_text("call-verify-1")
+        .expect("verification output should be returned");
+    let output: Value = serde_json::from_str(&output)?;
+    let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
+    assert_eq!(workflow_output["passed"], false);
+    let commands = workflow_output["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0]["command"], "echo first");
+    assert_eq!(commands[0]["exitCode"], 0);
+    assert!(commands[0].get("output").is_none());
+    assert_eq!(commands[1]["command"], "exit 7");
+    assert_eq!(commands[1]["exitCode"], 7);
+    assert!(commands[1]["durationMs"].is_u64());
+    if let Some(output) = commands[1].get("output") {
+        assert!(output.as_str().is_some());
+    }
+    Ok(())
+}

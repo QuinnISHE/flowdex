@@ -5,6 +5,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
@@ -202,6 +203,18 @@ fn build_tool_specs_and_registry(
         planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
     }
+    let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
+        let name = runtime.tool_name();
+        name == ToolName::plain("shell_command") || name == ToolName::plain("exec_command")
+    });
+    if flowdex_verification_enabled {
+        planned_tools.add_with_exposure(
+            FlowdexVerifyHandler::new(shell_command_backend_for_features(
+                turn_context.config.features.get(),
+            )),
+            ToolExposure::Hidden,
+        );
+    }
     let mut flowdex_nested_tool_specs = planned_tools
         .runtimes()
         .iter()
@@ -217,6 +230,14 @@ fn build_tool_specs_and_registry(
             FlowdexSendMessageHandler.spec(),
             FlowdexWaitAgentHandler.spec(),
         ]);
+    }
+    if flowdex_verification_enabled {
+        flowdex_nested_tool_specs.push(
+            FlowdexVerifyHandler::new(shell_command_backend_for_features(
+                turn_context.config.features.get(),
+            ))
+            .spec(),
+        );
     }
     planned_tools.add_with_exposure(
         StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
