@@ -108,7 +108,7 @@ impl StartFlowdexWorkflowHandler {
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
-        let (status, content_items, error) = match response {
+        let (status, content_items, error_text) = match response {
             codex_code_mode::RuntimeResponse::Yielded { content_items, .. } => {
                 ("yielded", content_items, None)
             }
@@ -124,6 +124,17 @@ impl StartFlowdexWorkflowHandler {
         let content_items =
             truncate_code_mode_result(into_function_call_output_content_items(content_items), None);
         let output = function_call_output_content_items_to_text(&content_items).unwrap_or_default();
+        let error = error_text.map(|error| {
+            let items = truncate_code_mode_result(
+                vec![
+                    codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                        text: error,
+                    },
+                ],
+                None,
+            );
+            function_call_output_content_items_to_text(&items).unwrap_or_default()
+        });
         let mut result = serde_json::json!({
             "runId": cell_id.to_string(),
             "status": if error.is_some() { "failed" } else { status },

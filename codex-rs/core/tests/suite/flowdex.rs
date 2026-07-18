@@ -60,3 +60,51 @@ async fn start_flowdex_workflow_executes_saved_v8_module() -> Result<()> {
     assert!(output.get("error").is_none());
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_flowdex_workflow_bounds_javascript_errors() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let workflow_dir = cwd.join(".flowdex/workflows");
+            fs::create_dir_all(&workflow_dir)?;
+            fs::write(
+                workflow_dir.join("error.js"),
+                "throw new Error('x'.repeat(100000));",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let args = serde_json::json!({ "path": ".flowdex/workflows/error.js" });
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-error-1"),
+            ev_function_call("call-error-1", "start_flowdex_workflow", &args.to_string()),
+            ev_completed("resp-error-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-error-2"),
+            ev_completed("resp-error-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("start the failing workflow").await?;
+
+    let output = follow_up
+        .function_call_output_text("call-error-1")
+        .expect("start tool output should be sent back to the model");
+    let output: Value = serde_json::from_str(&output)?;
+    assert_eq!(output["status"], "failed");
+    let error = output["error"].as_str().expect("error should be present");
+    assert!(error.len() < 100_000);
+    Ok(())
+}
