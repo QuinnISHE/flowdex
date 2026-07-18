@@ -139,12 +139,22 @@ macro_rules! executor {
 }
 executor!(FlowdexCreateTaskHandler, CREATE, create_spec, handle_create);
 executor!(FlowdexTaskRunAgentHandler, RUN, run_spec, handle_run);
-executor!(
-    FlowdexTaskVerifyHandler,
-    VERIFY,
-    task_verify_spec,
-    handle_verify
-);
+impl ToolExecutor<ToolInvocation> for FlowdexTaskVerifyHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(VERIFY)
+    }
+    fn spec(&self) -> ToolSpec {
+        task_verify_spec()
+    }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move { handle_verify(invocation).await.map(boxed_tool_output) })
+    }
+}
+impl CoreToolRuntime for FlowdexTaskVerifyHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}
 executor!(
     FlowdexTaskIntegrateHandler,
     INTEGRATE,
@@ -661,7 +671,7 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     )?)
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let _gate = task_gate(&args.task_id).await;
-    let (store, repository_root, _) = task_store(&invocation).await?;
+    let (store, repository_root, base_identity) = task_store(&invocation).await?;
     let task_id = args.task_id.clone();
     let task = tokio::task::spawn_blocking({
         let id = task_id.clone();
@@ -683,6 +693,27 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     task_invocation.payload = payload;
     let task_cwd = AbsolutePathBuf::from_absolute_path(&task.worktree_path)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    if invocation.cancellation_token.is_cancelled() {
+        return Err(FunctionCallError::RespondToModel(
+            "verification cancelled".to_string(),
+        ));
+    }
+    let worktree_path = task.worktree_path.clone();
+    let worktree_identity =
+        tokio::task::spawn_blocking(move || repository_identity(&worktree_path))
+            .await
+            .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+            .map_err(FunctionCallError::RespondToModel)?;
+    if worktree_identity != base_identity {
+        return Err(FunctionCallError::RespondToModel(
+            "task worktree is not part of the trusted repository".to_string(),
+        ));
+    }
+    if invocation.cancellation_token.is_cancelled() {
+        return Err(FunctionCallError::RespondToModel(
+            "verification cancelled".to_string(),
+        ));
+    }
     let turn = std::sync::Arc::make_mut(&mut task_invocation.turn);
     let config = std::sync::Arc::make_mut(&mut turn.config);
     config.cwd = task_cwd.clone();

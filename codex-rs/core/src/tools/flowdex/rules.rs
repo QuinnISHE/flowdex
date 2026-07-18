@@ -8,7 +8,7 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_flowdex::AstGrepResult;
-use codex_flowdex::run_ast_grep_rules;
+use codex_flowdex::ast_grep::run_ast_grep_rules_with_cancellation;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -78,8 +78,14 @@ pub(crate) async fn run_rules(
     }
     let trusted_repository_root = trusted_repository_root.to_path_buf();
     let execution_root = execution_root.to_path_buf();
+    let scan_cancellation = cancellation_token.clone();
     let result = tokio::task::spawn_blocking(move || {
-        run_ast_grep_rules(&trusted_repository_root, &execution_root, &rule_ids)
+        run_ast_grep_rules_with_cancellation(
+            &trusted_repository_root,
+            &execution_root,
+            &rule_ids,
+            || scan_cancellation.is_cancelled(),
+        )
     })
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
