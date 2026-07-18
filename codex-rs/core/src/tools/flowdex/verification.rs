@@ -21,6 +21,8 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -40,6 +42,7 @@ impl FlowdexVerifyHandler {
         &self,
         mut invocation: ToolInvocation,
         workdir: &std::path::Path,
+        runtime_cwd: Option<&AbsolutePathBuf>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return Err(FunctionCallError::RespondToModel(
@@ -52,7 +55,7 @@ impl FlowdexVerifyHandler {
         invocation.payload = ToolPayload::Function {
             arguments: value.to_string(),
         };
-        self.handle_call(invocation).await
+        self.handle_call(invocation, runtime_cwd).await
     }
 }
 
@@ -93,7 +96,7 @@ impl ToolExecutor<ToolInvocation> for FlowdexVerifyHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(self.handle_call(invocation))
+        Box::pin(self.handle_call(invocation, None))
     }
 }
 
@@ -107,6 +110,7 @@ impl FlowdexVerifyHandler {
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
+        runtime_cwd: Option<&AbsolutePathBuf>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -139,11 +143,14 @@ impl FlowdexVerifyHandler {
             ));
         }
 
-        let Some(turn_environment) = step_context.environments.primary().cloned() else {
+        let Some(mut turn_environment) = step_context.environments.primary().cloned() else {
             return Err(FunctionCallError::RespondToModel(
                 "verification is unavailable in this session".to_string(),
             ));
         };
+        if let Some(runtime_cwd) = runtime_cwd {
+            turn_environment.set_runtime_cwd(PathUri::from_abs_path(runtime_cwd));
+        }
         let environment_cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
             FunctionCallError::RespondToModel(format!(
                 "verification cwd `{}` is not native to the Codex host: {err}",
