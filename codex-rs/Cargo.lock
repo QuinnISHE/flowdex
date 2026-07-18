@@ -2641,6 +2641,7 @@ dependencies = [
  "codex-features",
  "codex-feedback",
  "codex-file-system",
+ "codex-flowdex",
  "codex-git-utils",
  "codex-home",
  "codex-hooks",

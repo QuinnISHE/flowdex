@@ -25,6 +25,7 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::StartFlowdexWorkflowHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -192,6 +193,19 @@ fn build_tool_specs_and_registry(
     add_tool_sources(&context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
+    let flowdex_nested_tool_specs = planned_tools
+        .runtimes()
+        .iter()
+        .filter(|runtime| {
+            runtime.exposure() != ToolExposure::DirectModelOnly
+                && runtime.exposure() != ToolExposure::Hidden
+        })
+        .map(|runtime| runtime.spec())
+        .collect();
+    planned_tools.add_with_exposure(
+        StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
+        ToolExposure::DirectModelOnly,
+    );
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
 }

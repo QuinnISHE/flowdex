@@ -7,7 +7,7 @@ trait IntoProtocol<T> {
     fn into_protocol(self) -> T;
 }
 
-pub(super) fn into_function_call_output_content_items(
+pub(crate) fn into_function_call_output_content_items(
     items: Vec<codex_code_mode::FunctionCallOutputContentItem>,
 ) -> Vec<FunctionCallOutputContentItem> {
     items.into_iter().map(IntoProtocol::into_protocol).collect()

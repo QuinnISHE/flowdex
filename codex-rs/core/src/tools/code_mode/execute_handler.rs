@@ -36,60 +36,78 @@ impl CodeModeExecuteHandler {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let enabled_tools =
-            codex_tools::collect_code_mode_tool_definitions(&self.nested_tool_specs);
-        let started_at = std::time::Instant::now();
-        let started_cell = exec
-            .session
-            .services
-            .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                tool_call_id: call_id.clone(),
-                enabled_tools,
-                source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-            })
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        let cell_id = started_cell.cell_id.clone();
-        let runtime_cell_id = cell_id.to_string();
-        let code_cell_trace = exec
-            .session
-            .services
-            .rollout_thread_trace
-            .start_code_cell_trace(
-                exec.turn.sub_id.as_str(),
-                runtime_cell_id.as_str(),
-                call_id.as_str(),
-                args.code.as_str(),
-            );
-        exec.session
-            .services
-            .code_mode_service
-            .mark_cell_ready_for_dispatch(&cell_id);
-        let response = started_cell
-            .initial_response()
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        // Record the raw runtime boundary. The model-visible custom-tool output
-        // is produced by `handle_runtime_response` and later linked through
-        // `CodeCell.output_item_ids` in the reduced trace.
-        code_cell_trace.record_initial_response(&response);
-        // Yielded cells keep running, so terminal lifecycle is only emitted
-        // here when the first response also ended the runtime.
-        if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
-            code_cell_trace.record_ended(&response);
-            exec.session
-                .services
-                .code_mode_service
-                .finish_cell_dispatch(&cell_id);
-        }
-        exec.session.services.elicitations.wait_until_clear().await;
+        let (response, _cell_id, started_at) = execute_source(
+            &exec,
+            call_id,
+            args.code,
+            &self.nested_tool_specs,
+            args.yield_time_ms,
+            args.max_output_tokens,
+        )
+        .await
+        .map_err(FunctionCallError::RespondToModel)?;
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await
             .map_err(FunctionCallError::RespondToModel)
     }
+}
+
+pub(crate) async fn execute_source(
+    exec: &ExecContext,
+    call_id: String,
+    source: String,
+    nested_tool_specs: &[ToolSpec],
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+) -> Result<
+    (
+        codex_code_mode::RuntimeResponse,
+        codex_code_mode::CellId,
+        std::time::Instant,
+    ),
+    String,
+> {
+    let enabled_tools = codex_tools::collect_code_mode_tool_definitions(nested_tool_specs);
+    let started_at = std::time::Instant::now();
+    let started_cell = exec
+        .session
+        .services
+        .code_mode_service
+        .execute(codex_code_mode::ExecuteRequest {
+            tool_call_id: call_id.clone(),
+            enabled_tools,
+            source: source.clone(),
+            yield_time_ms,
+            max_output_tokens,
+        })
+        .await?;
+    let cell_id = started_cell.cell_id.clone();
+    let runtime_cell_id = cell_id.to_string();
+    let code_cell_trace = exec
+        .session
+        .services
+        .rollout_thread_trace
+        .start_code_cell_trace(
+            exec.turn.sub_id.as_str(),
+            runtime_cell_id.as_str(),
+            call_id.as_str(),
+            source.as_str(),
+        );
+    exec.session
+        .services
+        .code_mode_service
+        .mark_cell_ready_for_dispatch(&cell_id);
+    let response = started_cell.initial_response().await?;
+    code_cell_trace.record_initial_response(&response);
+    if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+        code_cell_trace.record_ended(&response);
+        exec.session
+            .services
+            .code_mode_service
+            .finish_cell_dispatch(&cell_id);
+    }
+    exec.session.services.elicitations.wait_until_clear().await;
+    Ok((response, cell_id, started_at))
 }
 
 impl ToolExecutor<ToolInvocation> for CodeModeExecuteHandler {
