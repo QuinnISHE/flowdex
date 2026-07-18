@@ -38,12 +38,22 @@ impl ConnectionDriver {
                 self.requests.push_deferred_wait(wait);
                 continue;
             }
-            if !self.start_wait(
-                wait.session,
-                wait.request,
-                wait.caller_cancellation,
-                wait.response_tx,
-            ) {
+            let started = if wait.until_yield {
+                self.start_wait_until_yield(
+                    wait.session,
+                    wait.request.cell_id,
+                    wait.caller_cancellation,
+                    wait.response_tx,
+                )
+            } else {
+                self.start_wait(
+                    wait.session,
+                    wait.request,
+                    wait.caller_cancellation,
+                    wait.response_tx,
+                )
+            };
+            if !started {
                 for wait in deferred {
                     let _ = wait
                         .response_tx
@@ -232,7 +242,12 @@ impl ConnectionDriver {
                         }
                         Ok(public_wait_outcome(session.generation, outcome.into()))
                     }
-                    Ok(_) => Err("code-mode host returned an invalid cell response".to_string()),
+                    Ok(_) => {
+                        let reason = "code-mode host returned an invalid cell response".to_string();
+                        let _ = response_tx.send(Err(reason.clone()));
+                        self.fail(reason);
+                        return false;
+                    }
                     Err(err) => Err(err),
                 };
                 let _ = response_tx.send(result);

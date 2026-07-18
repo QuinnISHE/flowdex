@@ -69,6 +69,13 @@ impl InputQueue {
         (activity_rx, pending_activity)
     }
 
+    pub(crate) async fn has_pending_user_input_for_turn_state(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> bool {
+        turn_state.lock().await.pending_input.has_user_input()
+    }
+
     pub(crate) async fn enqueue_mailbox_communication(
         &self,
         communication: InterAgentCommunication,

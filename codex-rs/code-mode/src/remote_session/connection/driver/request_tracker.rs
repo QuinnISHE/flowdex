@@ -154,6 +154,16 @@ impl RequestTracker {
                 } if pending_session == session
                     && pending_cell_id == cell_id
                     && cancellation.is_cancelled()
+            ) || matches!(
+                pending,
+                PendingRequest::WaitUntilYield {
+                    session: pending_session,
+                    cell_id: pending_cell_id,
+                    cancellation,
+                    ..
+                } if pending_session == session
+                    && pending_cell_id == cell_id
+                    && cancellation.is_cancelled()
             )
         })
     }

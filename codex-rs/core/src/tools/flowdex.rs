@@ -157,8 +157,26 @@ impl WaitFlowdexWorkflowHandler {
                     return Err(FunctionCallError::RespondToModel("wait_flowdex_workflow cancelled".to_string()));
                 }
                 result = &mut cell_wait => {
-                    let response = result.map_err(FunctionCallError::RespondToModel)?;
-                    let (result, terminal) = flowdex_result(args.run_id.clone(), response.into());
+                    let wait_response = result.map_err(FunctionCallError::RespondToModel)?;
+                    if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response
+                        && !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. })
+                    {
+                        let runtime_cell_id = match response {
+                            codex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
+                            | codex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
+                            | codex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
+                        };
+                        session
+                            .services
+                            .rollout_thread_trace
+                            .code_cell_trace_context(&turn.sub_id, runtime_cell_id.as_str())
+                            .record_ended(response);
+                        session
+                            .services
+                            .code_mode_service
+                            .finish_cell_dispatch(runtime_cell_id);
+                    }
+                    let (result, terminal) = flowdex_result(args.run_id.clone(), wait_response.into());
                     if terminal {
                         session.services.elicitations.wait_until_clear().await;
                     }
@@ -167,6 +185,19 @@ impl WaitFlowdexWorkflowHandler {
                 changed = activity_rx.changed() => {
                     if changed.is_err() {
                         return Err(FunctionCallError::RespondToModel("input queue activity stopped".to_string()));
+                    }
+                    let pending_steer = match turn_state.as_deref() {
+                        Some(turn_state) => session
+                            .input_queue
+                            .has_pending_user_input_for_turn_state(turn_state)
+                            .await,
+                        None => false,
+                    };
+                    if pending_steer {
+                        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                            serde_json::json!({"runId": args.run_id, "status": "steered"}).to_string(),
+                            Some(true),
+                        )));
                     }
                     let activity = *activity_rx.borrow_and_update();
                     match activity {

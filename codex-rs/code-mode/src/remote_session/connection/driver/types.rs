@@ -180,6 +180,7 @@ pub(super) struct DeferredWait {
     pub(super) request: WireWaitRequest,
     pub(super) caller_cancellation: CancellationToken,
     pub(super) response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    pub(super) until_yield: bool,
 }
 
 impl PendingRequest {
