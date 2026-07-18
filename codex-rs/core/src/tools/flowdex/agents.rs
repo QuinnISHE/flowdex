@@ -364,12 +364,55 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         if !matches!(compact_status, AgentStatus::Completed(_)) {
             return Ok(JsonOutput::new(status_value(id, compact_status)));
         }
-        let status = submit_trigger_turn(&session, &turn, id, instructions).await?;
+        let operation = submit_trigger_turn(&session, &turn, id, instructions).await?;
+        let status = session
+            .services
+            .agent_control
+            .wait_for_submitted_operation(operation)
+            .await;
         return Ok(JsonOutput::new(status_value(id, status)));
     }
 
     if mode == "handoff" {
-        let handoff_status = submit_trigger_turn(&session, &turn, id, HANDOFF_PROMPT).await?;
+        let handoff_operation = submit_trigger_turn(&session, &turn, id, HANDOFF_PROMPT).await?;
+        let handoff_submission_id = handoff_operation.submission_id().to_string();
+        let task_model = session
+            .services
+            .agent_control
+            .get_agent_config(id)
+            .await
+            .and_then(|config| config.model.clone())
+            .unwrap_or_default();
+        if let Some(task_id) = super::task::task_associated_agent(id) {
+            super::task::start_task_operation(
+                &session,
+                &turn,
+                &task_id,
+                &handoff_submission_id,
+                &id.to_string(),
+                &task_model,
+            )
+            .await?;
+        }
+        let handoff_status = session
+            .services
+            .agent_control
+            .wait_for_submitted_operation(handoff_operation)
+            .await;
+        if let Some(task_id) = super::task::task_associated_agent(id) {
+            super::task::finish_task_operation(
+                &session,
+                &turn,
+                &task_id,
+                &handoff_submission_id,
+                if matches!(handoff_status, AgentStatus::Completed(_)) {
+                    "completed"
+                } else {
+                    "errored"
+                },
+            )
+            .await?;
+        }
         let handoff_text = match handoff_status {
             AgentStatus::Completed(Some(text)) if !text.trim().is_empty() => text,
             status => return Ok(JsonOutput::new(status_value(id, status))),
@@ -409,6 +452,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             truncate_message(&handoff_text),
             instructions
         );
+        let replacement_model = config.model.clone().unwrap_or_default();
         let child = session
             .services
             .agent_control
@@ -431,15 +475,76 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         let replacement_id = child.thread_id;
         if let Some(task_id) = super::task::task_associated_agent(id) {
             super::task::associate_task_agent(replacement_id, &task_id);
+            super::task::start_task_operation(
+                &session,
+                &turn,
+                &task_id,
+                &child.initial_submission_id,
+                &replacement_id.to_string(),
+                &replacement_model,
+            )
+            .await?;
         }
         let replacement_status = wait_for_terminal(&session, replacement_id).await;
+        if let Some(task_id) = super::task::task_associated_agent(replacement_id) {
+            super::task::finish_task_operation(
+                &session,
+                &turn,
+                &task_id,
+                &child.initial_submission_id,
+                if matches!(replacement_status, AgentStatus::Completed(_)) {
+                    "completed"
+                } else {
+                    "errored"
+                },
+            )
+            .await?;
+        }
         return Ok(JsonOutput::new(status_value(
             replacement_id,
             replacement_status,
         )));
     }
 
-    let status = submit_trigger_turn(&session, &turn, id, instructions).await?;
+    let operation = submit_trigger_turn(&session, &turn, id, instructions).await?;
+    let submission_id = operation.submission_id().to_string();
+    let task_model = session
+        .services
+        .agent_control
+        .get_agent_config(id)
+        .await
+        .and_then(|config| config.model.clone())
+        .unwrap_or_default();
+    if let Some(task_id) = super::task::task_associated_agent(id) {
+        super::task::start_task_operation(
+            &session,
+            &turn,
+            &task_id,
+            &submission_id,
+            &id.to_string(),
+            &task_model,
+        )
+        .await?;
+    }
+    let status = session
+        .services
+        .agent_control
+        .wait_for_submitted_operation(operation)
+        .await;
+    if let Some(task_id) = super::task::task_associated_agent(id) {
+        super::task::finish_task_operation(
+            &session,
+            &turn,
+            &task_id,
+            &submission_id,
+            if matches!(status, AgentStatus::Completed(_)) {
+                "completed"
+            } else {
+                "errored"
+            },
+        )
+        .await?;
+    }
     Ok(JsonOutput::new(status_value(id, status)))
 }
 
@@ -448,7 +553,7 @@ async fn submit_trigger_turn(
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
     id: ThreadId,
     message: &str,
-) -> Result<AgentStatus, FunctionCallError> {
+) -> Result<crate::agent::control::SubmittedAgentOperation, FunctionCallError> {
     let metadata = session
         .services
         .agent_control
@@ -476,11 +581,7 @@ async fn submit_trigger_turn(
         .submit_inter_agent_communication_operation(id, communication, context)
         .await
         .map_err(|err| collab_agent_error(id, err))?;
-    Ok(session
-        .services
-        .agent_control
-        .wait_for_submitted_operation(operation)
-        .await)
+    Ok(operation)
 }
 
 pub(crate) async fn wait_for_terminal(

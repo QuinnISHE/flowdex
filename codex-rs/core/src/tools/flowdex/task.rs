@@ -226,13 +226,26 @@ fn local_cwd(invocation: &ToolInvocation) -> Result<PathBuf, FunctionCallError> 
 async fn task_store(
     invocation: &ToolInvocation,
 ) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
-    if !invocation.turn.config.active_project.is_trusted() {
+    open_store(&invocation.session, &invocation.turn).await
+}
+
+async fn open_store(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+) -> Result<(TaskStore, PathBuf, String), FunctionCallError> {
+    if !turn.config.active_project.is_trusted() {
         return Err(FunctionCallError::RespondToModel(
             "Flowdex tasks require a trusted Git repository".into(),
         ));
     }
-    let cwd = local_cwd(invocation)?;
-    let home = invocation.turn.config.codex_home.to_path_buf();
+    let cwd = turn
+        .environments
+        .single_local_environment_cwd()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel("Flowdex tasks require one local environment".into())
+        })?;
+    let home = turn.config.codex_home.to_path_buf();
     let (root, _) = tokio::task::spawn_blocking({
         let cwd = cwd.clone();
         move || {
@@ -262,6 +275,46 @@ async fn task_store(
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
         .map_err(task_error)?;
     Ok((store, cwd, root))
+}
+
+pub(crate) async fn start_task_operation(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    task_id: &str,
+    operation_id: &str,
+    agent_id: &str,
+    model: &str,
+) -> Result<(), FunctionCallError> {
+    let (store, _, _) = open_store(session, turn).await?;
+    let task_id = task_id.to_string();
+    let operation_id = operation_id.to_string();
+    let agent_id = agent_id.to_string();
+    let model = model.to_string();
+    tokio::task::spawn_blocking(move || {
+        store.start_operation(&task_id, &operation_id, &agent_id, &model)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)?;
+    Ok(())
+}
+
+pub(crate) async fn finish_task_operation(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    task_id: &str,
+    operation_id: &str,
+    terminal: &str,
+) -> Result<(), FunctionCallError> {
+    let (store, _, _) = open_store(session, turn).await?;
+    let task_id = task_id.to_string();
+    let operation_id = operation_id.to_string();
+    let terminal = terminal.to_string();
+    tokio::task::spawn_blocking(move || store.finish_operation(&task_id, &operation_id, &terminal))
+        .await
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(task_error)?;
+    Ok(())
 }
 fn task_error(error: TaskStoreError) -> FunctionCallError {
     FunctionCallError::RespondToModel(format!("Flowdex task failed: {error}"))

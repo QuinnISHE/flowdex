@@ -120,6 +120,12 @@ pub(crate) struct SubmittedAgentOperation {
     _guard: OwnedMutexGuard<()>,
 }
 
+impl SubmittedAgentOperation {
+    pub(crate) fn submission_id(&self) -> &str {
+        &self.submission_id
+    }
+}
+
 /// Control-plane handle for multi-agent operations.
 /// `AgentControl` is held by each session (via `SessionServices`). It provides capability to
 /// spawn new agents and the inter-agent communication layer.
