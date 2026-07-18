@@ -776,9 +776,17 @@ async fn run_phase(
                 format!("Integrating task: {}", task_def.name),
             )
             .await;
-            run_integrate_handler(controller.invocation.clone(), scheduled.task_id.clone())
-                .await
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = run_integrate_handler(
+                controller.invocation.clone(),
+                scheduled.task_id.clone(),
+            )
+            .await
+            {
+                let store = Arc::clone(&controller.store);
+                let task_id = scheduled.task_id.clone();
+                let _ = tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
+                return Err(error.to_string());
+            }
             let store = Arc::clone(&controller.store);
             let id = scheduled.task_id.clone();
             tokio::task::spawn_blocking(move || store.mark_task_integrated(&id))
