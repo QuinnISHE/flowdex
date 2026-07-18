@@ -1,7 +1,7 @@
 use super::*;
+use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
-use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
