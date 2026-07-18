@@ -338,7 +338,7 @@ pub(crate) async fn run_shell_command_post_hooks(
     call_id: String,
     command: String,
     output: &ExecToolCallOutput,
-) -> Result<(), FunctionCallError> {
+) -> Result<Option<String>, FunctionCallError> {
     let outcome = run_post_tool_use_hooks(
         session,
         turn,
@@ -360,7 +360,7 @@ pub(crate) async fn run_shell_command_post_hooks(
                 .unwrap_or_else(|| "PostToolUse hook blocked the tool result".to_string()),
         ));
     }
-    Ok(())
+    Ok(outcome.feedback_message)
 }
 
 #[cfg(test)]

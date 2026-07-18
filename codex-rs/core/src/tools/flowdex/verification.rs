@@ -142,6 +142,7 @@ impl FlowdexVerifyHandler {
         );
 
         let mut results = Vec::with_capacity(args.commands.len());
+        let mut feedback_messages = Vec::new();
         for (index, original_command) in args.commands.iter().enumerate() {
             if cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
@@ -217,19 +218,26 @@ impl FlowdexVerifyHandler {
             if failed {
                 return Ok(boxed_tool_output(VerificationOutput {
                     value: serde_json::json!({"passed": false, "commands": results}),
+                    model_output: None,
                 }));
             }
-            run_shell_command_post_hooks(&session, &turn, command_call_id, command, &output)
-                .await?;
+            if let Some(feedback) =
+                run_shell_command_post_hooks(&session, &turn, command_call_id, command, &output)
+                    .await?
+            {
+                feedback_messages.push(feedback);
+            }
         }
         Ok(boxed_tool_output(VerificationOutput {
             value: serde_json::json!({"passed": true, "commands": results}),
+            model_output: (!feedback_messages.is_empty()).then(|| feedback_messages.join("\n")),
         }))
     }
 }
 
 struct VerificationOutput {
     value: Value,
+    model_output: Option<String>,
 }
 
 impl ToolOutput for VerificationOutput {
@@ -245,7 +253,11 @@ impl ToolOutput for VerificationOutput {
         ResponseInputItem::FunctionCallOutput {
             call_id: call_id.to_string(),
             output: codex_protocol::models::FunctionCallOutputPayload {
-                body: codex_protocol::models::FunctionCallOutputBody::Text(self.value.to_string()),
+                body: codex_protocol::models::FunctionCallOutputBody::Text(
+                    self.model_output
+                        .clone()
+                        .unwrap_or_else(|| self.value.to_string()),
+                ),
                 success: Some(true),
             },
         }
