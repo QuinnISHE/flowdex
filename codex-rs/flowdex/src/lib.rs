@@ -47,7 +47,7 @@ const CHECK_RULES_BOOTSTRAP: &str = r#"  checkRules: async (...args) => {
       throw new TypeError("checkRules expects one non-empty array of rule IDs");
     }
     const ruleIds = args[0];
-    if (ruleIds.some((id) => typeof id !== "string" || id.length === 0)) {
+    if (ruleIds.some((id) => typeof id !== "string" || id.trim().length === 0)) {
       throw new TypeError("checkRules rule IDs must be non-empty strings");
     }
     if (new Set(ruleIds).size !== ruleIds.length) {
