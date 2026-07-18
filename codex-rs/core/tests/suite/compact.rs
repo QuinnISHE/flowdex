@@ -4256,6 +4256,87 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_context_tool_compacts_before_follow_up() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_function_call("compact-call", "compact_context", "{}"),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 10),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("summary", &auto_summary(AUTO_SUMMARY_TEXT)),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10),
+    ]);
+    let follow_up_turn = sse(vec![
+        ev_assistant_message("done", FINAL_REPLY),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 10),
+    ]);
+    let first_mock = mount_sse_once(&server, first_turn).await;
+    let compact_mock = mount_sse_once(&server, compact_turn).await;
+    let follow_up_mock = mount_sse_once(&server, follow_up_turn).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .unwrap()
+        .codex;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "compact this thread".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnComplete(_))).await;
+
+    let tools = first_mock.single_request().body_json()["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(tools.iter().any(|tool| tool["name"] == "compact_context"));
+    assert_eq!(
+        compact_mock
+            .single_request()
+            .function_call_output_text("compact-call"),
+        Some("Context compaction scheduled.".to_string())
+    );
+    let compact_metadata: Value = serde_json::from_str(
+        &compact_mock
+            .single_request()
+            .header("x-codex-turn-metadata")
+            .expect("inline compact request should include turn metadata"),
+    )
+    .expect("inline compact metadata should be valid json");
+    assert_eq!(
+        compact_metadata["compaction"],
+        json!({
+            "trigger": "manual",
+            "reason": "user_requested",
+            "implementation": "responses",
+            "phase": "mid_turn",
+            "strategy": "memento",
+        })
+    );
+    assert!(
+        follow_up_mock
+            .single_request()
+            .body_contains_text(AUTO_SUMMARY_TEXT)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();
 

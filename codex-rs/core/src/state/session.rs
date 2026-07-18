@@ -11,6 +11,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use super::auto_compact_window::PendingContextAction;
 use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
@@ -191,8 +192,12 @@ impl SessionState {
         self.auto_compact_window.request_new_context_window();
     }
 
-    pub(crate) fn take_new_context_window_request(&mut self) -> bool {
-        self.auto_compact_window.take_new_context_window_request()
+    pub(crate) fn request_compact(&mut self) {
+        self.auto_compact_window.request_compact();
+    }
+
+    pub(crate) fn take_pending_context_action(&mut self) -> Option<PendingContextAction> {
+        self.auto_compact_window.take_pending_context_action()
     }
 
     pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {

@@ -44,17 +44,18 @@ use request::run_remote_compact_attempt;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
-pub(crate) async fn run_inline_remote_auto_compact_task(
+pub(crate) async fn run_inline_remote_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
     turn_state: Arc<OnceLock<String>>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
-        CompactionTrigger::Auto,
+        trigger,
         reason,
         CompactionImplementation::ResponsesCompact,
         phase,

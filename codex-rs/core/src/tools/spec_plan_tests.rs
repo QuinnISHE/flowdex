@@ -47,6 +47,29 @@ use crate::tools::router::ToolSuggestPresentation;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 
+#[tokio::test]
+async fn compact_context_is_empty_direct_model_only_tool() {
+    let plan = probe(|_| {}).await;
+    plan.assert_visible_contains(&["compact_context"]);
+    plan.assert_registered_contains(&["compact_context"]);
+    assert_eq!(
+        plan.exposure("compact_context"),
+        ToolExposure::DirectModelOnly
+    );
+
+    let ToolSpec::Function(tool) = plan.visible_spec("compact_context") else {
+        panic!("expected compact_context function spec");
+    };
+    assert_eq!(
+        serde_json::to_value(&tool.parameters).expect("serialize compact_context schema"),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    );
+}
+
 #[derive(Default)]
 struct ToolPlanInputs {
     tool_runtimes: Vec<Arc<dyn CoreToolRuntime>>,

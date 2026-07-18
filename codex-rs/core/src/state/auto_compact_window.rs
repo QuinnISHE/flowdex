@@ -31,10 +31,16 @@ enum AutoCompactWindowPrefill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingContextAction {
+    NewContextWindow,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AutoCompactWindow {
     window_number: u64,
     ids: AutoCompactWindowIds,
-    new_context_window_requested: bool,
+    pending_context_action: Option<PendingContextAction>,
     /// Absolute input-token baseline for the current compaction window.
     ///
     /// `body_after_prefix` subtracts this from later active-context usage. It is
@@ -50,7 +56,7 @@ impl AutoCompactWindow {
         Self {
             window_number: 0,
             ids,
-            new_context_window_requested: false,
+            pending_context_action: None,
             prefill_input_tokens: None,
             token_budget_reminder_delivered: false,
             auto_compact_fallback_delivered: false,
@@ -78,7 +84,7 @@ impl AutoCompactWindow {
         self.window_number = self.window_number.saturating_add(1);
         self.ids.previous_window_id = Some(self.ids.window_id);
         self.ids.window_id = Uuid::now_v7();
-        self.new_context_window_requested = false;
+        self.pending_context_action = None;
         self.token_budget_reminder_delivered = false;
         self.auto_compact_fallback_delivered = false;
         (self.window_number, self.ids)
@@ -93,13 +99,17 @@ impl AutoCompactWindow {
     }
 
     pub(super) fn request_new_context_window(&mut self) {
-        self.new_context_window_requested = true;
+        if self.pending_context_action != Some(PendingContextAction::Compact) {
+            self.pending_context_action = Some(PendingContextAction::NewContextWindow);
+        }
     }
 
-    pub(super) fn take_new_context_window_request(&mut self) -> bool {
-        let requested = self.new_context_window_requested;
-        self.new_context_window_requested = false;
-        requested
+    pub(super) fn request_compact(&mut self) {
+        self.pending_context_action = Some(PendingContextAction::Compact);
+    }
+
+    pub(super) fn take_pending_context_action(&mut self) -> Option<PendingContextAction> {
+        self.pending_context_action.take()
     }
 
     /// Records the request-input side of the first server usage sample. The
@@ -179,9 +189,18 @@ mod tests {
         assert!(window.claim_auto_compact_fallback());
         assert!(!window.claim_auto_compact_fallback());
         window.request_new_context_window();
-        assert!(window.take_new_context_window_request());
-        assert!(!window.take_new_context_window_request());
+        assert_eq!(
+            window.take_pending_context_action(),
+            Some(PendingContextAction::NewContextWindow)
+        );
+        assert_eq!(window.take_pending_context_action(), None);
         window.request_new_context_window();
+        window.request_compact();
+        assert_eq!(
+            window.take_pending_context_action(),
+            Some(PendingContextAction::Compact)
+        );
+        window.request_compact();
         let (window_number, ids) = window.advance();
         assert_eq!(window_number, 4);
         assert_eq!(window.window_number(), 4);
@@ -190,7 +209,7 @@ mod tests {
         assert_eq!(ids.previous_window_id, Some(restored_window_id));
         assert_eq!(ids.window_id.get_version_num(), 7);
         assert_ne!(ids.window_id, restored_window_id);
-        assert!(!window.take_new_context_window_request());
+        assert_eq!(window.take_pending_context_action(), None);
         assert!(window.claim_token_budget_reminder());
         assert!(window.claim_auto_compact_fallback());
 

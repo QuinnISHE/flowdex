@@ -313,6 +313,7 @@ use crate::shell;
 use crate::skills::SkillLoadOutcome;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
+use crate::state::PendingContextAction;
 use crate::state::PendingRequestPermissions;
 use crate::state::SessionServices;
 use crate::state::SessionState;
@@ -3560,9 +3561,14 @@ impl Session {
         state.request_new_context_window();
     }
 
-    pub(crate) async fn take_new_context_window_request(&self) -> bool {
+    pub(crate) async fn request_compact(&self) {
         let mut state = self.state.lock().await;
-        state.take_new_context_window_request()
+        state.request_compact();
+    }
+
+    pub(crate) async fn take_pending_context_action(&self) -> Option<PendingContextAction> {
+        let mut state = self.state.lock().await;
+        state.take_pending_context_action()
     }
 
     pub(crate) async fn start_new_context_window(

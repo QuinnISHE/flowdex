@@ -46,10 +46,11 @@ pub(crate) async fn run_manual_compact_task(
 /// Token-budget compaction skips model/server summarization and installs a fresh context window
 /// instead. It is still modeled as compaction so compact hooks and `ContextCompaction` turn items
 /// observe the same lifecycle as local or remote compaction.
-pub(crate) async fn run_inline_auto_compact_task(
+pub(crate) async fn run_inline_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let world_state = match initial_context_injection {
@@ -58,7 +59,7 @@ pub(crate) async fn run_inline_auto_compact_task(
             Arc::new(sess.build_world_state_for_step(&step_context).await)
         }
     };
-    run_compact_task_inner(&sess, turn_context, world_state, CompactionTrigger::Auto).await
+    run_compact_task_inner(&sess, turn_context, world_state, trigger).await
 }
 
 async fn run_compact_task_inner(

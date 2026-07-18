@@ -56,17 +56,18 @@ const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
 
-pub(crate) async fn run_inline_remote_auto_compact_task(
+pub(crate) async fn run_inline_remote_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
     client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
-        CompactionTrigger::Auto,
+        trigger,
         reason,
         CompactionImplementation::ResponsesCompactionV2,
         phase,
