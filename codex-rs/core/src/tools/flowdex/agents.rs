@@ -485,7 +485,16 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             )
             .await?;
         }
-        let replacement_status = wait_for_terminal(&session, replacement_id).await;
+        let replacement_status = match child.initial_operation {
+            Some(operation) => {
+                session
+                    .services
+                    .agent_control
+                    .wait_for_submitted_operation(operation)
+                    .await
+            }
+            None => wait_for_terminal(&session, replacement_id).await,
+        };
         if let Some(task_id) = super::task::task_associated_agent(replacement_id) {
             super::task::finish_task_operation(
                 &session,

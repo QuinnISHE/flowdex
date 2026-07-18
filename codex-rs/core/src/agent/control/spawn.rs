@@ -527,11 +527,12 @@ impl AgentControl {
         .await;
 
         let (initial_submission_id, initial_operation) = match initial_input {
-            SpawnInitialInput::UserInput(input) => (
-                self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
-                    .await?,
-                None,
-            ),
+            SpawnInitialInput::UserInput(input) => {
+                let operation = self
+                    .submit_input_operation(new_thread.thread_id, input)
+                    .await?;
+                (operation.submission_id().to_string(), Some(operation))
+            }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 let operation = self
                     .submit_inter_agent_communication_operation(

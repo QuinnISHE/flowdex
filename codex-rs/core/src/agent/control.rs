@@ -211,6 +211,30 @@ impl AgentControl {
         })
     }
 
+    pub(crate) async fn submit_input_operation(
+        &self,
+        agent_id: ThreadId,
+        input: Vec<UserInput>,
+    ) -> CodexResult<SubmittedAgentOperation> {
+        let state = self.upgrade()?;
+        let (guard, status_rx) = self.begin_submitted_operation(agent_id, &state).await?;
+        self.ensure_execution_capacity_for_turn_start(agent_id, true)
+            .await?;
+        let submission_id = self
+            .handle_thread_request_result(
+                agent_id,
+                &state,
+                state.send_op(agent_id, input.into()).await,
+            )
+            .await?;
+        Ok(SubmittedAgentOperation {
+            agent_id,
+            submission_id,
+            status_rx,
+            _guard: guard,
+        })
+    }
+
     async fn send_input_after_capacity_check(
         &self,
         agent_id: ThreadId,
