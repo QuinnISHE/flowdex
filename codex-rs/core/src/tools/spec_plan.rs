@@ -5,6 +5,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::flowdex::FlowdexProgressHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
@@ -198,6 +199,7 @@ fn build_tool_specs_and_registry(
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     let flowdex_agent_tools_enabled = collab_tools_enabled(turn_context);
+    planned_tools.add_with_exposure(FlowdexProgressHandler, ToolExposure::Hidden);
     if flowdex_agent_tools_enabled {
         planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
@@ -224,6 +226,7 @@ fn build_tool_specs_and_registry(
         })
         .map(|runtime| runtime.spec())
         .collect::<Vec<_>>();
+    flowdex_nested_tool_specs.push(FlowdexProgressHandler.spec());
     if flowdex_agent_tools_enabled {
         flowdex_nested_tool_specs.extend([
             FlowdexSpawnAgentHandler.spec(),

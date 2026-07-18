@@ -2021,6 +2021,46 @@ impl Session {
         .await;
     }
 
+    /// Delivers a Flowdex reasoning summary to live clients without recording it in the rollout.
+    pub(crate) async fn emit_flowdex_progress(&self, turn_context: &TurnContext, item: TurnItem) {
+        let started = EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item: item.clone(),
+            started_at_ms: now_unix_timestamp_ms(),
+        });
+        self.send_transient_event(turn_context, started).await;
+
+        let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            completed_at_ms: now_unix_timestamp_ms(),
+        });
+        self.send_transient_event(turn_context, completed).await;
+    }
+
+    async fn send_transient_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg: msg.clone(),
+        };
+        self.send_event_raw_with_persistence(event, /*persist*/ false)
+            .await;
+
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        for legacy in msg.as_legacy_events(show_raw_agent_reasoning) {
+            self.send_event_raw_with_persistence(
+                Event {
+                    id: turn_context.sub_id.clone(),
+                    msg: legacy,
+                },
+                /*persist*/ false,
+            )
+            .await;
+        }
+    }
+
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
     /// commands can use the newly approved prefix.
     pub(crate) async fn persist_execpolicy_amendment(
