@@ -649,8 +649,15 @@ async fn flowdex_workflow_verifies_commands_in_order() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flowdex_rules_run_during_verification_and_explicitly() -> Result<()> {
+#[test]
+fn flowdex_rules_run_during_verification_and_explicitly() -> Result<()> {
+    // V8-backed workflows exceed Windows' default Tokio worker stack.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()?
+        .block_on(async {
     let server = start_mock_server().await;
     let mut builder = test_codex()
         .with_config(|config| {
@@ -715,7 +722,8 @@ async fn flowdex_rules_run_during_verification_and_explicitly() -> Result<()> {
         workflow_output["explicit"]["findings"][0]["file"],
         "fixture.js"
     );
-    Ok(())
+            Ok(())
+        })
 }
 
 #[test]

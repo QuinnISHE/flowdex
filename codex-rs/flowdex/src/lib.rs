@@ -42,6 +42,20 @@ use thiserror::Error;
 const WORKFLOW_DIRECTORY: [&str; 2] = [".flowdex", "workflows"];
 const GLOBAL_WORKFLOW_DIRECTORY: [&str; 2] = ["flowdex", "workflows"];
 pub const MAX_WORKFLOW_SOURCE_BYTES: u64 = 1024 * 1024;
+const CHECK_RULES_BOOTSTRAP: &str = r#"  checkRules: async (...args) => {
+    if (args.length !== 1 || !Array.isArray(args[0]) || args[0].length === 0) {
+      throw new TypeError("checkRules expects one non-empty array of rule IDs");
+    }
+    const ruleIds = args[0];
+    if (ruleIds.some((id) => typeof id !== "string" || id.length === 0)) {
+      throw new TypeError("checkRules rule IDs must be non-empty strings");
+    }
+    if (new Set(ruleIds).size !== ruleIds.length) {
+      throw new TypeError("checkRules rule IDs must be unique");
+    }
+    return tools.flowdex_check_rules({ rule_ids: ruleIds });
+  },
+"#;
 const RESUME_AGENT_BOOTSTRAP: &str = r#"  resumeAgent: async (agentId, instructions, options = {}) => {
     if (options === null || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError("resumeAgent options must be an object");
@@ -560,7 +574,7 @@ impl WorkflowLoader {
 
         Ok(LoadedWorkflow {
             source: format!(
-                "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+                "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{CHECK_RULES_BOOTSTRAP}{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
             ),
         })
     }
