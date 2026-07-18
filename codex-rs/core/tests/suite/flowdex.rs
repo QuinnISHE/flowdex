@@ -633,21 +633,29 @@ fn flowdex_task_lifecycle_attributes_commits_and_cleans_up() -> Result<()> {
             fs::create_dir_all(cwd.join(".flowdex/workflows"))?;
             fs::write(
                 cwd.join(".flowdex/workflows/task.js"),
-                r#"const task = await flowdex.createTask({
+                r#"let createUnknownRejected = false;
+try {
+  await flowdex.createTask({ name: 'invalid', instructions: 'invalid', extra: true });
+} catch { createUnknownRejected = true; }
+const task = await flowdex.createTask({
   name: 'task-lifecycle',
   instructions: 'Update task.txt and commit the changes.',
   readScope: ['task.txt'],
   writeScope: ['task.txt'],
   verification: ['git status --porcelain'],
 });
-const initial = await task.runAgent({ name: 'task_worker', instructions: 'Make the initial change.', model: 'gpt-5.4' });
+let runUnknownRejected = false;
+try {
+  await task.runAgent({ name: 'invalid', instructions: 'invalid', model: 'gpt-5.4', extra: true });
+} catch { runUnknownRejected = true; }
+const initial = await task.runAgent({ name: 'task_worker', instructions: 'Make the initial change.', model: 'gpt-5.4', reasoningEffort: 'high' });
 const firstVerification = await task.verify();
-const resumed = await flowdex.resumeAgent(initial.agentId, 'Make a second change and commit it.');
+const resumed = await flowdex.resumeAgent(initial.agentId, 'Make a second change and commit it.', { contextMode: 'compact' });
 let staleRejected = false;
 try { await task.integrate(); } catch { staleRejected = true; }
 const secondVerification = await task.verify();
 const integrated = await task.integrate();
-text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, staleRejected, secondVerification, integrated }));"#,
+text(JSON.stringify({ taskId: task.id, createUnknownRejected, runUnknownRejected, initial, firstVerification, resumed, staleRejected, secondVerification, integrated }));"#,
             )?;
             fs::write(cwd.join("README.md"), "flowdex task fixture\n")?;
             run_git(&["init"])?;
@@ -697,6 +705,25 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
     .await;
     mount_sse_once_match(
         &server,
+        |request: &wiremock::Request| {
+            body_contains(request, "initial task change committed")
+                && body_contains(request, "compaction")
+        },
+        sse(vec![
+            ev_response_created("resp-task-compact"),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "TASK_COMPACTED_CONTEXT",
+                }
+            }),
+            ev_completed("resp-task-compact"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
         |request: &wiremock::Request| body_contains(request, "Make a second change"),
         sse(vec![
             ev_response_created("resp-task-child-2"),
@@ -741,6 +768,8 @@ text(JSON.stringify({ taskId: task.id, initial, firstVerification, resumed, stal
         .as_str()
         .expect("initial agent id");
     assert_eq!(workflow_output["initial"]["status"], "completed");
+    assert_eq!(workflow_output["createUnknownRejected"], true);
+    assert_eq!(workflow_output["runUnknownRejected"], true);
     assert_eq!(workflow_output["resumed"]["status"], "completed");
     assert_eq!(workflow_output["resumed"]["agentId"], agent_id);
     assert_eq!(workflow_output["firstVerification"]["passed"], true);

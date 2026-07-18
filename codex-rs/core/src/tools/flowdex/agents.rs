@@ -344,8 +344,9 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         ));
     }
 
-    let _task_gate = match super::task::task_associated_agent(id) {
-        Some(task_id) => Some(super::task::acquire_task_gate(&task_id).await),
+    let task_id = super::task::task_associated_agent(id);
+    let _task_gate = match task_id.as_deref() {
+        Some(task_id) => Some(super::task::acquire_task_gate(task_id).await),
         None => None,
     };
 
@@ -364,52 +365,45 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         if !matches!(compact_status, AgentStatus::Completed(_)) {
             return Ok(JsonOutput::new(status_value(id, compact_status)));
         }
-        let operation = submit_trigger_turn(&session, &turn, id, instructions).await?;
+        let operation =
+            submit_attributed_trigger_turn(&session, &turn, id, instructions, task_id.as_deref())
+                .await?;
+        let submission_id = operation.submission_id().to_string();
         let status = session
             .services
             .agent_control
             .wait_for_submitted_operation(operation)
             .await;
+        if let Some(task_id) = task_id.as_deref() {
+            super::task::finish_task_operation(
+                &session,
+                &turn,
+                task_id,
+                &submission_id,
+                terminal_state(&status),
+            )
+            .await?;
+        }
         return Ok(JsonOutput::new(status_value(id, status)));
     }
 
     if mode == "handoff" {
-        let handoff_operation = submit_trigger_turn(&session, &turn, id, HANDOFF_PROMPT).await?;
+        let handoff_operation =
+            submit_attributed_trigger_turn(&session, &turn, id, HANDOFF_PROMPT, task_id.as_deref())
+                .await?;
         let handoff_submission_id = handoff_operation.submission_id().to_string();
-        let task_model = session
-            .services
-            .agent_control
-            .get_agent_config(id)
-            .await
-            .and_then(|config| config.model.clone())
-            .unwrap_or_default();
-        if let Some(task_id) = super::task::task_associated_agent(id) {
-            super::task::start_task_operation(
-                &session,
-                &turn,
-                &task_id,
-                &handoff_submission_id,
-                &id.to_string(),
-                &task_model,
-            )
-            .await?;
-        }
         let handoff_status = session
             .services
             .agent_control
             .wait_for_submitted_operation(handoff_operation)
             .await;
-        if let Some(task_id) = super::task::task_associated_agent(id) {
+        if let Some(task_id) = task_id.as_deref() {
             super::task::finish_task_operation(
                 &session,
                 &turn,
-                &task_id,
+                task_id,
                 &handoff_submission_id,
-                if matches!(handoff_status, AgentStatus::Completed(_)) {
-                    "completed"
-                } else {
-                    "errored"
-                },
+                terminal_state(&handoff_status),
             )
             .await?;
         }
@@ -453,7 +447,14 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             instructions
         );
         let replacement_model = config.model.clone().unwrap_or_default();
-        let child = session
+        let replacement_reservation = match task_id.as_deref() {
+            Some(task_id) => Some(
+                super::task::reserve_task_operation(&session, &turn, task_id, &replacement_model)
+                    .await?,
+            ),
+            None => None,
+        };
+        let child = match session
             .services
             .agent_control
             .spawn_agent_with_metadata(
@@ -471,17 +472,35 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 },
             )
             .await
-            .map_err(collab_spawn_error)?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                if let (Some(task_id), Some(reservation_id)) =
+                    (task_id.as_deref(), replacement_reservation.as_deref())
+                {
+                    super::task::cancel_task_operation_reservation(
+                        &session,
+                        &turn,
+                        task_id,
+                        reservation_id,
+                    )
+                    .await?;
+                }
+                return Err(collab_spawn_error(error));
+            }
+        };
         let replacement_id = child.thread_id;
-        if let Some(task_id) = super::task::task_associated_agent(id) {
-            super::task::associate_task_agent(replacement_id, &task_id);
-            super::task::start_task_operation(
+        if let (Some(task_id), Some(reservation_id)) =
+            (task_id.as_deref(), replacement_reservation.as_deref())
+        {
+            super::task::associate_task_agent(replacement_id, task_id);
+            super::task::bind_task_operation(
                 &session,
                 &turn,
-                &task_id,
+                task_id,
+                reservation_id,
                 &child.initial_submission_id,
                 &replacement_id.to_string(),
-                &replacement_model,
             )
             .await?;
         }
@@ -501,11 +520,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 &turn,
                 &task_id,
                 &child.initial_submission_id,
-                if matches!(replacement_status, AgentStatus::Completed(_)) {
-                    "completed"
-                } else {
-                    "errored"
-                },
+                terminal_state(&replacement_status),
             )
             .await?;
         }
@@ -515,42 +530,22 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         )));
     }
 
-    let operation = submit_trigger_turn(&session, &turn, id, instructions).await?;
+    let operation =
+        submit_attributed_trigger_turn(&session, &turn, id, instructions, task_id.as_deref())
+            .await?;
     let submission_id = operation.submission_id().to_string();
-    let task_model = session
-        .services
-        .agent_control
-        .get_agent_config(id)
-        .await
-        .and_then(|config| config.model.clone())
-        .unwrap_or_default();
-    if let Some(task_id) = super::task::task_associated_agent(id) {
-        super::task::start_task_operation(
-            &session,
-            &turn,
-            &task_id,
-            &submission_id,
-            &id.to_string(),
-            &task_model,
-        )
-        .await?;
-    }
     let status = session
         .services
         .agent_control
         .wait_for_submitted_operation(operation)
         .await;
-    if let Some(task_id) = super::task::task_associated_agent(id) {
+    if let Some(task_id) = task_id.as_deref() {
         super::task::finish_task_operation(
             &session,
             &turn,
-            &task_id,
+            task_id,
             &submission_id,
-            if matches!(status, AgentStatus::Completed(_)) {
-                "completed"
-            } else {
-                "errored"
-            },
+            terminal_state(&status),
         )
         .await?;
     }
@@ -591,6 +586,63 @@ async fn submit_trigger_turn(
         .await
         .map_err(|err| collab_agent_error(id, err))?;
     Ok(operation)
+}
+
+async fn submit_attributed_trigger_turn(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    id: ThreadId,
+    message: &str,
+    task_id: Option<&str>,
+) -> Result<crate::agent::control::SubmittedAgentOperation, FunctionCallError> {
+    let model = session
+        .services
+        .agent_control
+        .get_agent_config(id)
+        .await
+        .and_then(|config| config.model.clone())
+        .unwrap_or_default();
+    let reservation_id = match task_id {
+        Some(task_id) => {
+            Some(super::task::reserve_task_operation(session, turn, task_id, &model).await?)
+        }
+        None => None,
+    };
+    let operation = match submit_trigger_turn(session, turn, id, message).await {
+        Ok(operation) => operation,
+        Err(error) => {
+            if let (Some(task_id), Some(reservation_id)) = (task_id, reservation_id.as_deref()) {
+                super::task::cancel_task_operation_reservation(
+                    session,
+                    turn,
+                    task_id,
+                    reservation_id,
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
+    if let (Some(task_id), Some(reservation_id)) = (task_id, reservation_id.as_deref()) {
+        super::task::bind_task_operation(
+            session,
+            turn,
+            task_id,
+            reservation_id,
+            operation.submission_id(),
+            &id.to_string(),
+        )
+        .await?;
+    }
+    Ok(operation)
+}
+
+fn terminal_state(status: &AgentStatus) -> &'static str {
+    if matches!(status, AgentStatus::Completed(_)) {
+        "completed"
+    } else {
+        "errored"
+    }
 }
 
 pub(crate) async fn wait_for_terminal(

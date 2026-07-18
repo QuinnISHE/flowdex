@@ -231,6 +231,11 @@ impl TaskStore {
         agent_id: &str,
         model: &str,
     ) -> Result<TaskOperation, TaskStoreError> {
+        let reservation_id = self.reserve_operation(task_id, model)?;
+        self.bind_operation(task_id, &reservation_id, operation_id, agent_id)
+    }
+
+    pub fn reserve_operation(&self, task_id: &str, model: &str) -> Result<String, TaskStoreError> {
         let task = self.task(task_id)?;
         let active: Option<String> = self.runtime.block_on(sqlx::query_scalar("SELECT operation_id FROM task_operations WHERE task_id=? AND terminal_state IS NULL").bind(task_id).fetch_optional(&self.pool))?;
         if let Some(active) = active {
@@ -246,14 +251,40 @@ impl TaskStore {
             .fetch_one(&self.pool),
         )?;
         let start_commit = git_stdout(&task.worktree_path, ["rev-parse", "HEAD"])?;
-        self.runtime.block_on(sqlx::query("INSERT INTO task_operations(operation_id,task_id,agent_id,model,start_commit,terminal_state,sequence) VALUES (?,?,?,?,?,NULL,?)").bind(operation_id).bind(task_id).bind(agent_id).bind(model).bind(&start_commit).bind(order).execute(&self.pool))?;
+        let reservation_id = uuid::Uuid::new_v4().to_string();
+        self.runtime.block_on(sqlx::query("INSERT INTO task_operations(operation_id,task_id,agent_id,model,start_commit,terminal_state,sequence) VALUES (?,?,'',?,?,NULL,?)").bind(&reservation_id).bind(task_id).bind(model).bind(&start_commit).bind(order).execute(&self.pool))?;
+        Ok(reservation_id)
+    }
+
+    pub fn bind_operation(
+        &self,
+        task_id: &str,
+        reservation_id: &str,
+        operation_id: &str,
+        agent_id: &str,
+    ) -> Result<TaskOperation, TaskStoreError> {
+        let row = self.runtime.block_on(sqlx::query("UPDATE task_operations SET operation_id=?,agent_id=? WHERE task_id=? AND operation_id=? AND terminal_state IS NULL RETURNING model,start_commit").bind(operation_id).bind(agent_id).bind(task_id).bind(reservation_id).fetch_optional(&self.pool))?.ok_or_else(|| TaskStoreError::Operation(reservation_id.to_string()))?;
+        let model = row.get(0);
+        let start_commit = row.get(1);
         Ok(TaskOperation {
             operation_id: operation_id.to_string(),
             task_id: task_id.to_string(),
             agent_id: agent_id.to_string(),
-            model: model.to_string(),
+            model,
             start_commit,
         })
+    }
+
+    pub fn cancel_operation_reservation(
+        &self,
+        task_id: &str,
+        reservation_id: &str,
+    ) -> Result<(), TaskStoreError> {
+        let result = self.runtime.block_on(sqlx::query("DELETE FROM task_operations WHERE task_id=? AND operation_id=? AND agent_id='' AND terminal_state IS NULL").bind(task_id).bind(reservation_id).execute(&self.pool))?;
+        if result.rows_affected() != 1 {
+            return Err(TaskStoreError::Operation(reservation_id.to_string()));
+        }
+        Ok(())
     }
 
     pub fn finish_operation(
@@ -727,6 +758,38 @@ mod tests {
         assert!(!task.worktree_path.exists());
         assert!(repo.path().join("x").exists());
         assert!(repo.path().join("y").exists());
+    }
+
+    #[test]
+    fn reservation_captures_head_before_operation_is_bound() {
+        let (_repo, _home, store, run) = store();
+        let task = store
+            .create_task(
+                &run,
+                &TaskDeclaration {
+                    id: "task".into(),
+                    name: "n".into(),
+                    instructions: "i".into(),
+                    read_scope: vec![],
+                    write_scope: vec![],
+                    verification: vec![],
+                },
+            )
+            .unwrap();
+        let reservation = store.reserve_operation("task", "model").unwrap();
+        fs::write(task.worktree_path.join("fast"), "commit before bind").unwrap();
+        git(&task.worktree_path, &["add", "fast"]);
+        git(&task.worktree_path, &["commit", "-qm", "fast"]);
+        let operation = store
+            .bind_operation("task", &reservation, "exact-op", "agent")
+            .unwrap();
+        assert_eq!(operation.operation_id, "exact-op");
+        let commits = store
+            .finish_operation("task", "exact-op", "completed")
+            .unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].summary, "fast");
+        assert_eq!(commits[0].agent_id, "agent");
     }
     #[test]
     fn conflict_preserves_task_and_rolls_back() {

@@ -39,6 +39,11 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
     if (declaration === null || typeof declaration !== "object" || Array.isArray(declaration)) {
       throw new TypeError("createTask declaration must be an object");
     }
+    const declarationKeys = new Set(["name", "instructions", "readScope", "writeScope", "verification"]);
+    const unknownDeclarationKeys = Object.keys(declaration).filter((key) => !declarationKeys.has(key));
+    if (unknownDeclarationKeys.length > 0) {
+      throw new TypeError(`createTask unknown field: ${unknownDeclarationKeys[0]}`);
+    }
     const created = await tools.flowdex_create_task({
       name: declaration.name,
       instructions: declaration.instructions,
@@ -49,7 +54,26 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
     });
     const task = {
       id: created.taskId,
-      runAgent: async (agentSpec) => tools.flowdex_task_run_agent({ task_id: created.taskId, agent: agentSpec }),
+      runAgent: async (agentSpec) => {
+        if (agentSpec === null || typeof agentSpec !== "object" || Array.isArray(agentSpec)) {
+          throw new TypeError("runAgent agentSpec must be an object");
+        }
+        const agentKeys = new Set(["name", "instructions", "profile", "model", "reasoningEffort"]);
+        const unknownAgentKeys = Object.keys(agentSpec).filter((key) => !agentKeys.has(key));
+        if (unknownAgentKeys.length > 0) {
+          throw new TypeError(`runAgent unknown field: ${unknownAgentKeys[0]}`);
+        }
+        return tools.flowdex_task_run_agent({
+          task_id: created.taskId,
+          agent: {
+            name: agentSpec.name,
+            instructions: agentSpec.instructions,
+            profile: agentSpec.profile,
+            model: agentSpec.model,
+            reasoning_effort: agentSpec.reasoningEffort,
+          },
+        });
+      },
       verify: async () => tools.flowdex_task_verify({ task_id: created.taskId }),
       integrate: async () => tools.flowdex_task_integrate({ task_id: created.taskId }),
     };
@@ -300,6 +324,13 @@ mod tests {
         assert!(loaded.source.contains("resumeAgent: async"));
         assert!(loaded.source.contains("options must be an object"));
         assert!(loaded.source.contains("key !== \"contextMode\""));
+        assert!(loaded.source.contains("createTask unknown field"));
+        assert!(loaded.source.contains("runAgent unknown field"));
+        assert!(
+            loaded
+                .source
+                .contains("reasoning_effort: agentSpec.reasoningEffort")
+        );
         assert!(loaded.source.contains("progress: async"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
         assert!(

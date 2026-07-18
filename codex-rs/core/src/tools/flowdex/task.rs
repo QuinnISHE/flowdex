@@ -30,15 +30,16 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
-use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_tools::shell_command_backend_for_features;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -255,57 +256,94 @@ async fn open_store(
             FunctionCallError::RespondToModel("Flowdex tasks require one local environment".into())
         })?;
     let home = turn.config.codex_home.to_path_buf();
-    let (root, _) = tokio::task::spawn_blocking({
+    let identity = tokio::task::spawn_blocking({
         let cwd = cwd.clone();
-        move || {
-            let output = Command::new("git")
-                .current_dir(&cwd)
-                .args(["rev-parse", "--show-toplevel"])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !output.status.success() {
-                return Err("current environment is not a Git repository".to_string());
-            }
-            let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if root.is_empty() {
-                Err("current environment is not a Git repository".to_string())
-            } else {
-                Ok((root, ()))
-            }
-        }
+        move || repository_identity(&cwd)
     })
     .await
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
     .map_err(FunctionCallError::RespondToModel)?;
-    let identity = root.clone();
+    let repository_identity = identity.clone();
     let store_cwd = cwd.clone();
-    let store = tokio::task::spawn_blocking(move || TaskStore::open(&home, identity, &store_cwd))
-        .await
-        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-        .map_err(task_error)?;
-    Ok((store, cwd, root))
+    let store = tokio::task::spawn_blocking(move || {
+        TaskStore::open(&home, repository_identity, &store_cwd)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)?;
+    Ok((store, cwd, identity))
 }
 
-pub(crate) async fn start_task_operation(
+fn repository_identity(cwd: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("current environment is not a Git repository".to_string());
+    }
+    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common_dir.is_empty() {
+        return Err("current environment is not a Git repository".to_string());
+    }
+    std::fs::canonicalize(common_dir)
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn reserve_task_operation(
     session: &std::sync::Arc<crate::session::session::Session>,
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
     task_id: &str,
+    model: &str,
+) -> Result<String, FunctionCallError> {
+    let (store, _, _) = open_store(session, turn).await?;
+    let task_id = task_id.to_string();
+    let model = model.to_string();
+    tokio::task::spawn_blocking(move || store.reserve_operation(&task_id, &model))
+        .await
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(task_error)
+}
+
+pub(crate) async fn bind_task_operation(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    task_id: &str,
+    reservation_id: &str,
     operation_id: &str,
     agent_id: &str,
-    model: &str,
 ) -> Result<(), FunctionCallError> {
     let (store, _, _) = open_store(session, turn).await?;
     let task_id = task_id.to_string();
+    let reservation_id = reservation_id.to_string();
     let operation_id = operation_id.to_string();
     let agent_id = agent_id.to_string();
-    let model = model.to_string();
     tokio::task::spawn_blocking(move || {
-        store.start_operation(&task_id, &operation_id, &agent_id, &model)
+        store.bind_operation(&task_id, &reservation_id, &operation_id, &agent_id)
     })
     .await
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
     .map_err(task_error)?;
     Ok(())
+}
+
+pub(crate) async fn cancel_task_operation_reservation(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    task_id: &str,
+    reservation_id: &str,
+) -> Result<(), FunctionCallError> {
+    let (store, _, _) = open_store(session, turn).await?;
+    let task_id = task_id.to_string();
+    let reservation_id = reservation_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        store.cancel_operation_reservation(&task_id, &reservation_id)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)
 }
 
 pub(crate) async fn finish_task_operation(
@@ -466,7 +504,13 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
         "Task requirements:\n{}\n\nRead scope (advisory): {:?}\nWrite scope (advisory): {:?}\n\n{}\n\nCommit any modifications before finishing with a brief useful summary.",
         task.instructions, task.read_scope, task.write_scope, supplied
     );
-    let child = invocation
+    let model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| invocation.turn.model_info.slug.clone());
+    let reservation_id =
+        reserve_task_operation(&invocation.session, &invocation.turn, &task.id, &model).await?;
+    let child = match invocation
         .session
         .services
         .agent_control
@@ -492,25 +536,31 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
             },
         )
         .await
-        .map_err(collab_spawn_error)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            cancel_task_operation_reservation(
+                &invocation.session,
+                &invocation.turn,
+                &task.id,
+                &reservation_id,
+            )
+            .await?;
+            return Err(collab_spawn_error(error));
+        }
+    };
     let id = child.thread_id;
     associate(id, &task.id);
     let operation_id = child.initial_submission_id.clone();
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| invocation.turn.model_info.slug.clone());
-    let (store, _, _) = task_store(&invocation).await?;
-    tokio::task::spawn_blocking({
-        let task_id = task.id.clone();
-        let agent_id = id.to_string();
-        let operation_id = operation_id.clone();
-        let model = model.clone();
-        move || store.start_operation(&task_id, &operation_id, &agent_id, &model)
-    })
-    .await
-    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-    .map_err(task_error)?;
+    bind_task_operation(
+        &invocation.session,
+        &invocation.turn,
+        &task.id,
+        &reservation_id,
+        &operation_id,
+        &id.to_string(),
+    )
+    .await?;
     let status = match child.initial_operation {
         Some(operation) => {
             invocation
@@ -542,6 +592,7 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         "flowdex task.verify expects JSON arguments",
     )?)
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let _gate = task_gate(&args.task_id).await;
     let (store, _, _) = task_store(&invocation).await?;
     let task_id = args.task_id.clone();
     let task = tokio::task::spawn_blocking({
@@ -571,7 +622,9 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
     config
         .permissions
         .set_workspace_roots(vec![task_cwd.clone()]);
-    let verifier = FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic);
+    let verifier = FlowdexVerifyHandler::new(shell_command_backend_for_features(
+        invocation.turn.config.features.get(),
+    ));
     let output = verifier
         .handle_for_workdir(
             task_invocation.clone(),
@@ -649,5 +702,50 @@ impl ToolOutput for JsonOutput {
     }
     fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
         self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repository_identity;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn repository_identity_is_shared_by_linked_worktrees() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let linked = directory.path().join("linked");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q"]);
+        git(
+            &repository,
+            &["config", "user.email", "flowdex@example.com"],
+        );
+        git(&repository, &["config", "user.name", "Flowdex"]);
+        fs::write(repository.join("README"), "base").unwrap();
+        git(&repository, &["add", "README"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        git(
+            &repository,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+
+        assert_eq!(
+            repository_identity(&repository).unwrap(),
+            repository_identity(&linked).unwrap()
+        );
     }
 }
