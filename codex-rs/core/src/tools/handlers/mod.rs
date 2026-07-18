@@ -94,7 +94,7 @@ where
     })
 }
 
-fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
+pub(crate) fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
     updated_input
         .get("command")
         .and_then(Value::as_str)

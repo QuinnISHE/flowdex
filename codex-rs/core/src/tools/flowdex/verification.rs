@@ -1,4 +1,5 @@
 use crate::function_tool::FunctionCallError;
+use crate::skills::maybe_emit_implicit_skill_invocation;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -9,6 +10,8 @@ use crate::tools::handlers::resolve_workdir_base_path;
 use crate::tools::handlers::shell::RunExecLikeArgs;
 use crate::tools::handlers::shell::RunExecLikeResult;
 use crate::tools::handlers::shell::run_exec_like_result;
+use crate::tools::handlers::shell::run_shell_command_post_hooks;
+use crate::tools::handlers::shell::run_shell_command_pre_hooks;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::models::ResponseInputItem;
@@ -75,7 +78,11 @@ impl ToolExecutor<ToolInvocation> for FlowdexVerifyHandler {
     }
 }
 
-impl CoreToolRuntime for FlowdexVerifyHandler {}
+impl CoreToolRuntime for FlowdexVerifyHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}
 
 impl FlowdexVerifyHandler {
     async fn handle_call(
@@ -135,12 +142,22 @@ impl FlowdexVerifyHandler {
         );
 
         let mut results = Vec::with_capacity(args.commands.len());
-        for (index, command) in args.commands.iter().enumerate() {
+        for (index, original_command) in args.commands.iter().enumerate() {
             if cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
                     "verification cancelled".to_string(),
                 ));
             }
+            let command_call_id = format!("{call_id}:verify:{index}");
+            let command = run_shell_command_pre_hooks(
+                &session,
+                &turn,
+                command_call_id.clone(),
+                original_command.clone(),
+            )
+            .await?;
+            maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &command, &cwd)
+                .await;
             let params = ShellCommandToolCallParams {
                 command: command.clone(),
                 workdir: args.workdir.clone(),
@@ -171,7 +188,7 @@ impl FlowdexVerifyHandler {
                 turn: turn.clone(),
                 turn_environment: turn_environment.clone(),
                 tracker: tracker.clone(),
-                call_id: format!("{call_id}:verify:{index}"),
+                call_id: command_call_id.clone(),
                 shell_runtime_backend,
             })
             .await?;
@@ -186,7 +203,7 @@ impl FlowdexVerifyHandler {
             };
             let failed = output.exit_code != 0 || output.timed_out;
             let mut entry = serde_json::json!({
-                "command": command,
+                "command": original_command,
                 "exitCode": output.exit_code,
                 "durationMs": output.duration.as_millis() as u64,
             });
@@ -202,6 +219,8 @@ impl FlowdexVerifyHandler {
                     value: serde_json::json!({"passed": false, "commands": results}),
                 }));
             }
+            run_shell_command_post_hooks(&session, &turn, command_call_id, command, &output)
+                .await?;
         }
         Ok(boxed_tool_output(VerificationOutput {
             value: serde_json::json!({"passed": true, "commands": results}),
@@ -234,5 +253,19 @@ impl ToolOutput for VerificationOutput {
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
         self.value.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_tools::ShellCommandBackendConfig;
+
+    #[test]
+    fn verifier_waits_for_runtime_cancellation() {
+        assert!(
+            FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic)
+                .waits_for_runtime_cancellation()
+        );
     }
 }

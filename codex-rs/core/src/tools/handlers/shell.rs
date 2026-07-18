@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
+use crate::hook_runtime::PreToolUseHookResult;
+use crate::hook_runtime::record_additional_contexts;
+use crate::hook_runtime::run_post_tool_use_hooks;
+use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
@@ -20,6 +24,8 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::updated_hook_command;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
@@ -298,6 +304,63 @@ pub(crate) async fn run_exec_like_result(
         post_tool_use_response,
         error,
     })
+}
+
+pub(crate) async fn run_shell_command_pre_hooks(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    call_id: String,
+    command: String,
+) -> Result<String, FunctionCallError> {
+    let tool_name = HookToolName::bash();
+    match run_pre_tool_use_hooks(
+        session,
+        turn,
+        call_id,
+        &tool_name,
+        &serde_json::json!({ "command": command }),
+    )
+    .await
+    {
+        PreToolUseHookResult::Blocked(message) => Err(FunctionCallError::RespondToModel(message)),
+        PreToolUseHookResult::Continue {
+            updated_input: Some(updated_input),
+        } => Ok(updated_hook_command(&updated_input)?.to_string()),
+        PreToolUseHookResult::Continue {
+            updated_input: None,
+        } => Ok(command),
+    }
+}
+
+pub(crate) async fn run_shell_command_post_hooks(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    call_id: String,
+    command: String,
+    output: &ExecToolCallOutput,
+) -> Result<(), FunctionCallError> {
+    let outcome = run_post_tool_use_hooks(
+        session,
+        turn,
+        call_id,
+        HookToolName::bash().name().to_string(),
+        HookToolName::bash().matcher_aliases().to_vec(),
+        serde_json::json!({ "command": command }),
+        JsonValue::String(crate::tools::format_exec_output_str(
+            output,
+            turn.model_info.truncation_policy.into(),
+        )),
+    )
+    .await;
+    record_additional_contexts(session, turn, outcome.additional_contexts).await;
+    if outcome.should_block {
+        return Err(FunctionCallError::RespondToModel(
+            outcome
+                .feedback_message
+                .unwrap_or_else(|| "PostToolUse hook blocked the tool result".to_string()),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
