@@ -90,6 +90,8 @@ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
 const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
 const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
 const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+const COMPACTION_REMINDER: &str =
+    "Your context window is growing. At the next natural task boundary, call compact_context.";
 
 pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
@@ -156,6 +158,54 @@ fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> V
             }
         }
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_reminder_is_added_once_per_context_window() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_usage("r1", /*input_tokens*/ 10, /*output_tokens*/ 100),
+    ]);
+    let second_turn = sse(vec![
+        ev_assistant_message("m2", SECOND_LARGE_REPLY),
+        ev_completed_with_usage("r2", /*input_tokens*/ 10, /*output_tokens*/ 10),
+    ]);
+    let third_turn = sse(vec![
+        ev_assistant_message("m3", FINAL_REPLY),
+        ev_completed_with_usage("r3", /*input_tokens*/ 10, /*output_tokens*/ 10),
+    ]);
+    let requests = mount_sse_sequence(&server, vec![first_turn, second_turn, third_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_context_window = Some(200_000);
+            config.flowdex_config.compaction_reminder_threshold_tokens = 100;
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("FIRST").await.expect("first turn");
+    test.submit_turn("SECOND").await.expect("second turn");
+    test.submit_turn("THIRD").await.expect("third turn");
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 3);
+    let reminder_count = |request: &responses::ResponsesRequest| {
+        request
+            .message_input_texts("developer")
+            .into_iter()
+            .filter(|text| text == COMPACTION_REMINDER)
+            .count()
+    };
+    assert_eq!(reminder_count(&requests[0]), 0);
+    assert_eq!(reminder_count(&requests[1]), 1);
+    assert_eq!(reminder_count(&requests[2]), 1);
 }
 
 fn body_contains_text(body: &str, text: &str) -> bool {

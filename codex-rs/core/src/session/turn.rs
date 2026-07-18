@@ -240,6 +240,8 @@ pub(crate) async fn run_turn(
         }
 
         let window_id = sess.current_window_id().await;
+        super::compaction_reminder::maybe_record(sess.as_ref(), turn_context.as_ref(), &window_id)
+            .await?;
         super::rollout_budget::maybe_record_reminder(
             sess.as_ref(),
             turn_context.as_ref(),
