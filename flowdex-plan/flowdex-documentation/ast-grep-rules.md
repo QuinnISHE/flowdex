@@ -14,6 +14,20 @@ ast_grep_always_run = ["rule-id", "another-rule"]
 
 The default is empty. `$CODEX_HOME/flowdex.toml` loads first. When trusted repository `.flowdex/config.toml` contains this setting, its value replaces the global list; omission preserves the global list. IDs must be unique and non-blank.
 
+## Candidate scans and promotion
+
+Flowdex can derive rule candidates from its durable review history. Configure the minimum number of resolved occurrences with:
+
+```toml
+ast_grep_candidate_threshold = 3
+```
+
+The threshold is a positive integer and defaults to `3`. `$CODEX_HOME/flowdex.toml` loads first; a value in a trusted repository's `.flowdex/config.toml` replaces it, while omission preserves the global value. It is loaded with the rest of Flowdex configuration and is not a scan argument.
+
+The user-started direct-model tool `scan_flowdex_rule_candidates({})` returns candidates in stable rule-key order, bounded to 50 candidates. A candidate is based on distinct findings that are AST-grep-suitable, have a non-empty rule key, and have a recorded resolution with an integrated commit. `resolvedOccurrences` counts the complete eligible history; each candidate includes at most three deterministic exact evidence examples with `file`, `lineStart`, `lineEnd`, `reason`, `sourceCommit`, and `integratedCommit`. The durable findings and resolutions remain the source of truth; Flowdex does not persist a candidate table. A candidate whose exact native YAML rule ID is already approved in the repository is excluded.
+
+Scanning is read-only and does no model work, dispatch, writing, configuration mutation, or approval-state tracking. After inspecting a candidate, the user may explicitly confirm that exact proposal. Only then may ordinary repository editing or an agent/skill draft and write a native YAML rule (and, if requested, add its ID to `ast_grep_always_run`). Approved rules continue through the existing YAML validation, explicit `flowdex.checkRules(...)`, and always-on verification paths.
+
 ## Saved-workflow API
 
 Saved JavaScript workflows can request exact rules:
@@ -51,4 +65,4 @@ Task verification loads rules from the trusted base repository, validates that t
 
 ## Current limits
 
-This batch does not create, promote, or modify rules; choose repair or review agents; add alternate rule directories, globs, language registries, enable flags, or compatibility aliases; or change scheduler policy.
+Candidate scanning does not automatically create, promote, enable, or modify rules; choose repair or review agents; add alternate rule directories, globs, language registries, enable flags, or compatibility aliases; or change scheduler policy. Every rule or always-on configuration edit requires explicit user approval of that individual proposal.
