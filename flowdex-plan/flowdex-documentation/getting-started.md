@@ -4,9 +4,10 @@ Flowdex workflows are ordinary asynchronous JavaScript executed by Codex's nativ
 
 ## Build and install
 
-From the repository root, build the modified CLI:
+From the repository root, build the modified CLI from the Rust workspace:
 
 ```text
+cd codex-rs
 cargo build -p codex-cli --bin codex
 ```
 
