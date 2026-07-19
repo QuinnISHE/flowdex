@@ -11,6 +11,8 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_flowdex::FlowdexStore;
+use codex_flowdex::PendingBoundary;
 use codex_flowdex::WorkflowLoader;
 use codex_flowdex::WorkflowRef;
 use codex_flowdex::WorkflowScope;
@@ -29,10 +31,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 mod agents;
 mod context;
+mod review;
 mod rules;
 mod scheduler;
 mod task;
@@ -43,6 +47,11 @@ pub(crate) use agents::FlowdexSpawnAgentHandler;
 pub(crate) use agents::FlowdexWaitAgentHandler;
 pub(crate) use context::PublishFlowdexContextHandler;
 pub(crate) use context::ReadFlowdexContextHandler;
+pub(crate) use review::FlowdexReviewReportHandler;
+pub(crate) use review::activate_review_agent;
+pub(crate) use review::deactivate_review_agent;
+pub(crate) use review::review_report_tool_visible;
+pub(crate) use review::review_reported;
 pub(crate) use rules::FlowdexCheckRulesHandler;
 pub(crate) use scheduler::{
     FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
@@ -58,6 +67,83 @@ const TOOL_NAME: &str = "start_flowdex_workflow";
 const WAIT_TOOL_NAME: &str = "wait_flowdex_workflow";
 const RUN_TOOL_NAME: &str = "flowdex_run_workflow";
 const SAVE_TOOL_NAME: &str = "save_flowdex_workflow";
+const CONTINUE_TOOL_NAME: &str = "continue_flowdex_workflow";
+
+struct BoundaryState {
+    store: Arc<FlowdexStore>,
+    signal: watch::Sender<Option<PendingBoundary>>,
+    terminal: bool,
+    consumed: bool,
+}
+
+static BOUNDARIES: OnceLock<Mutex<HashMap<String, BoundaryState>>> = OnceLock::new();
+
+fn boundaries() -> &'static Mutex<HashMap<String, BoundaryState>> {
+    BOUNDARIES.get_or_init(Default::default)
+}
+
+/// Registers the event channel used by a live scheduler run.
+pub(crate) fn register_flowdex_boundary_run(run_id: impl Into<String>, store: Arc<FlowdexStore>) {
+    let (signal, _) = watch::channel(None);
+    boundaries()
+        .lock()
+        .expect("Flowdex boundary registry poisoned")
+        .insert(
+            run_id.into(),
+            BoundaryState {
+                store,
+                signal,
+                terminal: false,
+                consumed: false,
+            },
+        );
+}
+
+pub(crate) async fn publish_flowdex_boundary(
+    store: Arc<FlowdexStore>,
+    boundary: PendingBoundary,
+) -> Result<(), String> {
+    let persisted = boundary.clone();
+    let store_for_persist = Arc::clone(&store);
+    tokio::task::spawn_blocking(move || store_for_persist.set_pending_boundary(&persisted))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let mut registry = boundaries()
+        .lock()
+        .map_err(|_| "Flowdex boundary registry poisoned".to_string())?;
+    let state = registry.entry(boundary.run_id.clone()).or_insert_with(|| {
+        let (signal, _) = watch::channel(None);
+        BoundaryState {
+            store: Arc::clone(&store),
+            signal,
+            terminal: false,
+            consumed: false,
+        }
+    });
+    state.consumed = false;
+    state
+        .signal
+        .send(Some(boundary))
+        .map_err(|_| "Flowdex boundary waiters stopped".to_string())
+}
+
+pub(crate) fn mark_flowdex_boundary_terminal(run_id: &str) {
+    if let Ok(mut registry) = boundaries().lock() {
+        if let Some(state) = registry.get_mut(run_id) {
+            state.terminal = true;
+        }
+    }
+}
+
+pub(crate) async fn subscribe_flowdex_boundary(
+    run_id: &str,
+) -> Option<watch::Receiver<Option<PendingBoundary>>> {
+    boundaries()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(run_id).map(|state| state.signal.subscribe()))
+}
 
 #[derive(Clone, Debug, Default)]
 struct WorkflowInvocation {
@@ -134,6 +220,92 @@ pub(crate) struct FlowdexRunWorkflowHandler {
 pub(crate) struct SaveFlowdexWorkflowHandler;
 
 pub(crate) struct WaitFlowdexWorkflowHandler;
+pub(crate) struct ContinueFlowdexWorkflowHandler;
+
+impl ToolExecutor<ToolInvocation> for ContinueFlowdexWorkflowHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(CONTINUE_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: CONTINUE_TOOL_NAME.to_string(),
+            description: "Continue the current durable Flowdex boundary once.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: JsonSchema::object(
+                BTreeMap::from([("run_id".to_string(), JsonSchema::string(None))]),
+                Some(vec!["run_id".to_string()]),
+                Some(false.into()),
+            ),
+            output_schema: Some(serde_json::json!({"type": "object"})),
+        })
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move { self.handle_call(invocation).await })
+    }
+}
+
+impl CoreToolRuntime for ContinueFlowdexWorkflowHandler {}
+
+impl ContinueFlowdexWorkflowHandler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let ToolInvocation {
+            payload: ToolPayload::Function { arguments },
+            ..
+        } = invocation
+        else {
+            return Err(FunctionCallError::RespondToModel(
+                "continue_flowdex_workflow expects JSON arguments".into(),
+            ));
+        };
+        let args: WaitArgs = parse_arguments(&arguments)?;
+        let (store, signal) = {
+            let mut registry = boundaries().lock().map_err(|_| {
+                FunctionCallError::RespondToModel("Flowdex boundary registry unavailable".into())
+            })?;
+            let state = registry.get_mut(&args.run_id).ok_or_else(|| {
+                FunctionCallError::RespondToModel("Flowdex boundary not found".into())
+            })?;
+            if state.terminal {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex run is terminal".into(),
+                ));
+            }
+            if state.consumed || state.signal.borrow().is_none() {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex boundary is stale or already consumed".into(),
+                ));
+            }
+            state.consumed = true;
+            let boundary = state.signal.borrow().clone();
+            state.signal.send(None).map_err(|_| {
+                FunctionCallError::RespondToModel("Flowdex boundary waiters stopped".into())
+            })?;
+            (Arc::clone(&state.store), boundary)
+        };
+        let Some(boundary) = signal else {
+            return Err(FunctionCallError::RespondToModel(
+                "Flowdex boundary is stale or already consumed".into(),
+            ));
+        };
+        let run_id = args.run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            store.clear_pending_boundary(&run_id, &boundary.scope_kind, &boundary.scope_id)
+        })
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            serde_json::json!({"runId": args.run_id, "status": "continued"}).to_string(),
+            Some(true),
+        )))
+    }
+}
 
 impl ToolExecutor<ToolInvocation> for WaitFlowdexWorkflowHandler {
     fn tool_name(&self) -> ToolName {
@@ -195,6 +367,8 @@ impl WaitFlowdexWorkflowHandler {
                 Some(true),
             )));
         }
+
+        let mut boundary_wait = Box::pin(wait_for_flowdex_boundary(args.run_id.clone()));
         if matches!(pending_activity, Some(InputQueueActivity::Mailbox))
             && session.input_queue.has_trigger_turn_mailbox_items().await
         {
@@ -241,6 +415,12 @@ impl WaitFlowdexWorkflowHandler {
                     }
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(result.to_string(), Some(true))));
                 }
+                boundary = &mut boundary_wait => {
+                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        flowdex_boundary_result(boundary).to_string(),
+                        Some(true),
+                    )));
+                }
                 changed = activity_rx.changed() => {
                     if changed.is_err() {
                         return Err(FunctionCallError::RespondToModel("input queue activity stopped".to_string()));
@@ -278,6 +458,30 @@ impl WaitFlowdexWorkflowHandler {
             }
         }
     }
+}
+
+async fn wait_for_flowdex_boundary(run_id: String) -> PendingBoundary {
+    let Some(mut signal) = subscribe_flowdex_boundary(&run_id).await else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(boundary) = signal.borrow_and_update().clone() {
+            return boundary;
+        }
+        if signal.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+fn flowdex_boundary_result(boundary: PendingBoundary) -> Value {
+    serde_json::json!({
+        "runId": boundary.run_id,
+        "status": "boundary",
+        "scope": {"kind": boundary.scope_kind, "name": boundary.scope_id},
+        "target": boundary.target,
+        "reason": boundary.reason,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -5,8 +5,10 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::flowdex::ContinueFlowdexWorkflowHandler;
 use crate::tools::flowdex::FlowdexCheckRulesHandler;
 use crate::tools::flowdex::FlowdexQueueTaskHandler;
+use crate::tools::flowdex::FlowdexReviewReportHandler;
 use crate::tools::flowdex::FlowdexRunWorkflowHandler;
 use crate::tools::flowdex::FlowdexSealPhaseHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
@@ -18,6 +20,7 @@ use crate::tools::flowdex::ReadFlowdexContextHandler;
 use crate::tools::flowdex::SaveFlowdexWorkflowHandler;
 use crate::tools::flowdex::SealFlowdexPhaseHandler;
 use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
+use crate::tools::flowdex::review_report_tool_visible;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
@@ -231,6 +234,9 @@ fn build_tool_specs_and_registry(
         planned_tools.add_with_exposure(FlowdexSealPhaseHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexWaitRunHandler, ToolExposure::Hidden);
     }
+    if review_report_tool_visible(turn_context.session_source.get_agent_path().as_ref()) {
+        planned_tools.add_with_exposure(FlowdexReviewReportHandler, ToolExposure::DirectModelOnly);
+    }
     let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
         let name = runtime.tool_name();
         name == ToolName::plain("shell_command") || name == ToolName::plain("exec_command")
@@ -290,6 +296,10 @@ fn build_tool_specs_and_registry(
     );
     planned_tools.add_with_exposure(SaveFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(WaitFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(
+        ContinueFlowdexWorkflowHandler,
+        ToolExposure::DirectModelOnly,
+    );
     planned_tools.add_with_exposure(PublishFlowdexContextHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(ReadFlowdexContextHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(QueueFlowdexTaskHandler, ToolExposure::DirectModelOnly);
