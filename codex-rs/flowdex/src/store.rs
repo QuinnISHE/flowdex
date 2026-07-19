@@ -927,6 +927,40 @@ impl FlowdexStore {
         self.increment_scope_counter(scope_kind, scope_id, "review_round_count")
     }
 
+    pub fn increment_phase_verification_repairs(
+        &self,
+        run_id: &str,
+        phase_name: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        self.increment_phase_counter(run_id, phase_name, "verification_repair_count")
+    }
+
+    pub fn increment_phase_review_rounds(
+        &self,
+        run_id: &str,
+        phase_name: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        self.increment_phase_counter(run_id, phase_name, "review_round_count")
+    }
+
+    fn increment_phase_counter(
+        &self,
+        run_id: &str,
+        phase_name: &str,
+        column: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        let row = match column {
+            "verification_repair_count" => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET verification_repair_count=verification_repair_count+1 WHERE run_id=? AND name=? RETURNING verification_repair_count").bind(run_id).bind(phase_name).fetch_optional(&self.pool))?,
+            "review_round_count" => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET review_round_count=review_round_count+1 WHERE run_id=? AND name=? RETURNING review_round_count").bind(run_id).bind(phase_name).fetch_optional(&self.pool))?,
+            _ => return Err(FlowdexStoreError::Integration(format!("unknown phase counter: {column}"))),
+        };
+        Ok(row
+            .ok_or_else(|| {
+                FlowdexStoreError::Integration(format!("phase not found: {run_id}:{phase_name}"))
+            })?
+            .get(0))
+    }
+
     fn increment_scope_counter(
         &self,
         scope_kind: &str,
