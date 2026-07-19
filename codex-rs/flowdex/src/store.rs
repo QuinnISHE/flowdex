@@ -1,3 +1,8 @@
+use crate::context::{
+    ContextError, ContextFragment, ContextPackDeclaration, ContextPackStatus, ContextPublication,
+    ContextPublisher, ContextStaleSource, ResolvedContextPack, read_source_range,
+    validate_publication,
+};
 use crate::workflow::{
     TaskDefinition, WorkflowDefinition, WorkflowValidationError, validate_task_definition,
     write_scope_conflicts,
@@ -38,6 +43,8 @@ pub enum FlowdexStoreError {
     Integration(String),
     #[error("invalid workflow: {0}")]
     Workflow(#[from] WorkflowValidationError),
+    #[error("invalid context publication: {0}")]
+    Context(#[from] ContextError),
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +291,209 @@ impl FlowdexStore {
         self.runtime.block_on(sqlx::query("INSERT INTO runs(run_id,parent_thread_id,workflow_path,parent_run_id,workflow_identity,repository_identity,integration_worktree,created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET parent_thread_id=excluded.parent_thread_id,workflow_path=excluded.workflow_path,parent_run_id=excluded.parent_run_id,workflow_identity=excluded.workflow_identity,integration_worktree=excluded.integration_worktree")
             .bind(&info.run_id).bind(&info.parent_thread_id).bind(&info.workflow_path).bind(&info.parent_run_id).bind(&info.workflow_identity).bind(&info.repository_identity).bind(info.integration_worktree.to_string_lossy().as_ref()).bind(now_unix()).execute(&self.pool))?;
         Ok(())
+    }
+
+    /// Declares the context packs available to a run.
+    pub fn declare_context_packs(
+        &self,
+        run_id: &str,
+        declarations: &[(String, ContextPackDeclaration)],
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            for (pack, declaration) in declarations {
+                if pack.trim().is_empty() {
+                    return Err(FlowdexStoreError::Context(ContextError::EmptyField("pack")));
+                }
+                if declaration.agent.trim().is_empty() {
+                    return Err(FlowdexStoreError::Context(ContextError::EmptyField("agent")));
+                }
+                if declaration.instructions.trim().is_empty() {
+                    return Err(FlowdexStoreError::Context(ContextError::EmptyField("instructions")));
+                }
+                let agent_exists: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM workflow_agents WHERE run_id=? AND name=?",
+                )
+                .bind(run_id)
+                .bind(&declaration.agent)
+                .fetch_one(&mut *tx)
+                .await?;
+                if agent_exists == 0 {
+                    return Err(FlowdexStoreError::Integration(format!(
+                        "context pack agent not found: {}",
+                        declaration.agent
+                    )));
+                }
+                sqlx::query(
+                    "INSERT INTO context_packs(run_id,name,agent,instructions) VALUES (?,?,?,?) ON CONFLICT(run_id,name) DO UPDATE SET agent=excluded.agent,instructions=excluded.instructions",
+                )
+                .bind(run_id)
+                .bind(pack)
+                .bind(&declaration.agent)
+                .bind(&declaration.instructions)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            Ok::<(), FlowdexStoreError>(())
+        })?;
+        Ok(())
+    }
+
+    /// Publishes an immutable context fragment from an explicit execution worktree.
+    pub fn publish_context_fragment(
+        &self,
+        run_id: &str,
+        execution_worktree: &Path,
+        trusted_repository_root: &Path,
+        publisher: &ContextPublisher,
+        publication: &ContextPublication,
+    ) -> Result<ContextFragment, FlowdexStoreError> {
+        validate_publication(publication)?;
+        let trusted_root = trusted_repository_root.canonicalize()?;
+        let execution_root = execution_worktree.canonicalize()?;
+        let expected_root = Path::new(&self.repository_identity)
+            .canonicalize()
+            .map_err(|_| {
+                FlowdexStoreError::Integration("repository identity is not a local root".into())
+            })?;
+        if trusted_root != expected_root {
+            return Err(FlowdexStoreError::Integration(
+                "trusted repository root does not match store repository".into(),
+            ));
+        }
+        // Validate the declaration against the trusted source tree, then read the
+        // selected range from the current execution tree that is being published.
+        let _ = read_source_range(
+            &trusted_root,
+            &publication.path,
+            publication.line_start,
+            publication.line_end,
+        )?;
+        let content = read_source_range(
+            &execution_root,
+            &publication.path,
+            publication.line_start,
+            publication.line_end,
+        )?;
+        let content_hash = hash_content(&content);
+        Ok(self.runtime.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let pack_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM context_packs WHERE run_id=? AND name=?",
+            )
+            .bind(run_id)
+            .bind(&publication.pack)
+            .fetch_one(&mut *tx)
+            .await?;
+            if pack_exists == 0 {
+                return Err(FlowdexStoreError::Integration(format!(
+                    "context pack not declared: {}",
+                    publication.pack
+                )));
+            }
+            let previous: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(version) FROM context_fragments WHERE run_id=? AND pack=? AND fragment_key=?",
+            )
+            .bind(run_id)
+            .bind(&publication.pack)
+            .bind(&publication.key)
+            .fetch_one(&mut *tx)
+            .await?;
+            let version = previous.unwrap_or(0) + 1;
+            sqlx::query("INSERT INTO context_fragments(run_id,pack,fragment_key,version,publisher_thread_id,publisher_agent_id,path,line_start,line_end,summary,content,content_hash,superseded_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(run_id)
+                .bind(&publication.pack)
+                .bind(&publication.key)
+                .bind(version)
+                .bind(&publisher.thread_id)
+                .bind(&publisher.agent_id)
+                .bind(publication.path.to_string_lossy().as_ref())
+                .bind(publication.line_start as i64)
+                .bind(publication.line_end as i64)
+                .bind(&publication.summary)
+                .bind(&content)
+                .bind(&content_hash)
+                .bind(previous)
+                .bind(now_unix())
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(ContextFragment {
+                pack: publication.pack.clone(),
+                key: publication.key.clone(),
+                version,
+                path: publication.path.clone(),
+                line_start: publication.line_start,
+                line_end: publication.line_end,
+                summary: publication.summary.clone(),
+                content,
+                content_hash,
+            })
+        })?)
+    }
+
+    /// Resolves active fragments against the supplied integration worktree.
+    pub fn resolve_context_pack(
+        &self,
+        run_id: &str,
+        pack: &str,
+        integration_worktree: &Path,
+    ) -> Result<ResolvedContextPack, FlowdexStoreError> {
+        let rows = self.runtime.block_on(
+            sqlx::query("SELECT f.fragment_key,f.version,f.path,f.line_start,f.line_end,f.summary,f.content,f.content_hash FROM context_fragments f JOIN (SELECT fragment_key,MAX(version) AS version FROM context_fragments WHERE run_id=? AND pack=? GROUP BY fragment_key) active ON active.fragment_key=f.fragment_key AND active.version=f.version WHERE f.run_id=? AND f.pack=? ORDER BY f.fragment_key")
+                .bind(run_id).bind(pack).bind(run_id).bind(pack).fetch_all(&self.pool),
+        )?;
+        if rows.is_empty() {
+            return Ok(ResolvedContextPack {
+                pack: pack.to_string(),
+                status: ContextPackStatus::Missing,
+                fragments: Vec::new(),
+                stale_sources: Vec::new(),
+            });
+        }
+        let root = integration_worktree.canonicalize()?;
+        let mut fragments = Vec::with_capacity(rows.len());
+        let mut stale_sources = Vec::new();
+        for row in rows {
+            let path: PathBuf = PathBuf::from(row.get::<String, _>(2));
+            let line_start = row.get::<i64, _>(3) as u32;
+            let line_end = row.get::<i64, _>(4) as u32;
+            let content = row.get::<String, _>(6);
+            let content_hash = row.get::<String, _>(7);
+            let fresh = read_source_range(&root, &path, line_start, line_end)
+                .map(|current| hash_content(&current) == content_hash)
+                .unwrap_or(false);
+            if !fresh {
+                stale_sources.push(ContextStaleSource {
+                    key: row.get(0),
+                    path: path.clone(),
+                    line_start,
+                    line_end,
+                });
+            }
+            fragments.push(ContextFragment {
+                pack: pack.to_string(),
+                key: row.get(0),
+                version: row.get(1),
+                path,
+                line_start,
+                line_end,
+                summary: row.get(5),
+                content,
+                content_hash,
+            });
+        }
+        Ok(ResolvedContextPack {
+            pack: pack.to_string(),
+            status: if stale_sources.is_empty() {
+                ContextPackStatus::Fresh
+            } else {
+                ContextPackStatus::Stale
+            },
+            fragments,
+            stale_sources,
+        })
     }
 
     /// Persists the ordered workflow graph in one transaction before any work starts.
@@ -949,6 +1159,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
       CREATE TABLE IF NOT EXISTS integration_lock(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS context_packs(run_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,instructions TEXT NOT NULL,PRIMARY KEY(run_id,name));
+      CREATE TABLE IF NOT EXISTS context_fragments(run_id TEXT NOT NULL,pack TEXT NOT NULL,fragment_key TEXT NOT NULL,version INTEGER NOT NULL,publisher_thread_id TEXT,publisher_agent_id TEXT,path TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,summary TEXT,content TEXT NOT NULL,content_hash TEXT NOT NULL,superseded_version INTEGER,created_at INTEGER NOT NULL,PRIMARY KEY(run_id,pack,fragment_key,version));
       INSERT OR IGNORE INTO integration_lock(id,generation) VALUES(1,0);";
     for statement in statements
         .split(';')
@@ -980,6 +1192,15 @@ fn repository_key(identity: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(identity.as_bytes());
     digest.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn hash_content(content: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(content.as_bytes());
+    digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -1148,6 +1369,7 @@ mod tests {
     use super::*;
     use crate::workflow::{AgentDefinition, PhaseDefinition, TaskDefinition, WorkflowDefinition};
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1362,6 +1584,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec!["git diff --check".into()],
+            context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
                 instructions: "phase instructions".into(),
@@ -1375,6 +1598,7 @@ mod tests {
                     read_scope: vec!["src/**".into()],
                     write_scope: vec!["src/**".into()],
                     verification: vec![],
+                    context: vec![],
                 }],
             }],
         };
@@ -1420,6 +1644,7 @@ mod tests {
             read_scope: vec![],
             write_scope: write_scope.iter().map(|value| (*value).into()).collect(),
             verification: vec![],
+            context: vec![],
         };
         let definition = WorkflowDefinition {
             name: "ordered".into(),
@@ -1434,6 +1659,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
                 instructions: "phase instructions".into(),
@@ -1493,5 +1719,127 @@ mod tests {
         );
         assert!(store.scheduler_task("run:phase:rejected").is_err());
         assert!(store.phase_metadata("run", "phase").unwrap().sealed);
+    }
+
+    fn context_store() -> (tempfile::TempDir, FlowdexStore, RunInfo) {
+        let (repo, _home, store, run) = store();
+        let definition = WorkflowDefinition {
+            name: "context".into(),
+            agents: [(
+                "worker".into(),
+                AgentDefinition {
+                    profile: Some("implementation_worker".into()),
+                    model: None,
+                    reasoning_effort: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            verification: vec![],
+            context_packs: BTreeMap::new(),
+            phases: vec![PhaseDefinition {
+                name: "phase".into(),
+                instructions: "phase".into(),
+                tasks: vec![],
+                open: true,
+                verification: vec![],
+            }],
+        };
+        store.initialize_workflow(&run, &definition).unwrap();
+        store
+            .declare_context_packs(
+                "run",
+                &[(
+                    "pack".into(),
+                    ContextPackDeclaration {
+                        agent: "worker".into(),
+                        instructions: "collect".into(),
+                    },
+                )],
+            )
+            .unwrap();
+        (repo, store, run)
+    }
+
+    #[test]
+    fn context_publish_supersedes_and_resolves_fresh_or_stale() {
+        let (repo, store, _run) = context_store();
+        fs::write(repo.path().join("source.txt"), "one\ntwo\n").unwrap();
+        let publication = ContextPublication {
+            pack: "pack".into(),
+            key: "source".into(),
+            path: PathBuf::from("source.txt"),
+            line_start: 1,
+            line_end: 1,
+            summary: Some("first".into()),
+        };
+        let publisher = ContextPublisher {
+            thread_id: Some("thread".into()),
+            agent_id: Some("worker".into()),
+        };
+        let first = store
+            .publish_context_fragment("run", repo.path(), repo.path(), &publisher, &publication)
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(
+            store
+                .resolve_context_pack("run", "pack", repo.path())
+                .unwrap()
+                .status,
+            ContextPackStatus::Fresh
+        );
+        fs::write(repo.path().join("source.txt"), "changed\ntwo\n").unwrap();
+        let stale = store
+            .resolve_context_pack("run", "pack", repo.path())
+            .unwrap();
+        assert_eq!(stale.status, ContextPackStatus::Stale);
+        assert_eq!(stale.stale_sources[0].key, "source");
+        let second = store
+            .publish_context_fragment(
+                "run",
+                repo.path(),
+                repo.path(),
+                &publisher,
+                &ContextPublication {
+                    summary: Some("second".into()),
+                    ..publication
+                },
+            )
+            .unwrap();
+        assert_eq!(second.version, 2);
+        let fresh = store
+            .resolve_context_pack("run", "pack", repo.path())
+            .unwrap();
+        assert_eq!(fresh.status, ContextPackStatus::Fresh);
+        assert_eq!(fresh.fragments[0].version, 2);
+        let superseded: Option<i64> = store.runtime.block_on(sqlx::query_scalar(
+            "SELECT superseded_version FROM context_fragments WHERE run_id='run' AND pack='pack' AND fragment_key='source' AND version=2"
+        ).fetch_one(&store.pool)).unwrap();
+        assert_eq!(superseded, Some(1));
+    }
+
+    #[test]
+    fn context_publication_rejects_parent_escape() {
+        let (repo, store, _run) = context_store();
+        let outside = repo.path().parent().unwrap().join("outside.txt");
+        fs::write(&outside, "secret").unwrap();
+        let result = store.publish_context_fragment(
+            "run",
+            repo.path(),
+            repo.path(),
+            &ContextPublisher::default(),
+            &ContextPublication {
+                pack: "pack".into(),
+                key: "escape".into(),
+                path: PathBuf::from("../outside.txt"),
+                line_start: 1,
+                line_end: 1,
+                summary: None,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(FlowdexStoreError::Context(ContextError::InvalidPath(_)))
+        ));
     }
 }
