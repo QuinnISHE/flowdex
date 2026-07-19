@@ -192,6 +192,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Started Batch 015 from authoritative commit `59a9acbf90`. The batch combines verification repair, structured task/phase review attribution, direct repair routing, independent budgets, and event-driven boundaries. Generic multi-agent rounds remain workflow-defined JavaScript control flow over role-neutral messaging and resume primitives.
 - **2026-07-19:** Accepted and integrated Batch 013 after Batch 014. Context packs now provide persisted immutable fragments, fresh/missing/stale resolution, automatic single collector dispatch, safe same-handle source reads, supersession, bounded task-only injection, and concurrent context preparation that does not block unrelated ready work.
 - **2026-07-19:** Accepted and integrated Batch 014 onto `codex/flowdex`. The installer now configures the current-user Codex desktop backend on Windows and macOS with strict executable identity checks and no scheduler/store coupling. The macOS path is statically and unit tested but still needs a real-host acceptance run when one is available.
 - **2026-07-19:** Anchored the accepted Batch 010/012 line plus integrated Batch 011 as the canonical `codex/flowdex` branch. Batch 012 reusable/nested workflows and Batch 011 AST-grep verification are complete. Prepared Batch 013 context packs and the disjoint Batch 014 Windows installer for parallel execution from that exact baseline.
