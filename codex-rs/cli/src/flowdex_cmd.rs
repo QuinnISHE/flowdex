@@ -179,6 +179,9 @@ mod macos {
     }
 
     pub fn shell_and_profile(shell: &str, home: &Path) -> Result<(Shell, PathBuf)> {
+        if !home.is_absolute() && !home.to_string_lossy().starts_with('/') {
+            anyhow::bail!("HOME must be an absolute path");
+        }
         let name = Path::new(shell)
             .file_name()
             .and_then(|name| name.to_str())
@@ -315,19 +318,46 @@ mod macos {
                 metadata.permissions().mode()
             })
             .unwrap_or(0o600);
-        let temp = parent.join(format!(".flowdex-profile-{}", std::process::id()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .with_context(|| format!("cannot create temporary profile {}", temp.display()))?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)
-            .with_context(|| format!("cannot replace profile {}", path.display()))
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let mut temp = None;
+        let mut file = None;
+        for attempt in 0..16 {
+            let candidate = parent.join(format!(
+                ".flowdex-profile-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(created) => {
+                    temp = Some(candidate);
+                    file = Some(created);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).context("cannot create temporary profile"),
+            }
+        }
+        let temp = temp.ok_or_else(|| anyhow::anyhow!("cannot allocate temporary profile"))?;
+        let result = (|| {
+            let mut file = file.take().expect("temporary profile file");
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, path)
+                .with_context(|| format!("cannot replace profile {}", path.display()))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
 
     #[cfg(target_os = "macos")]
@@ -381,6 +411,7 @@ mod macos {
                 home.join(".config/fish/conf.d/flowdex.fish")
             );
             assert!(shell_and_profile("/bin/tcsh", home).is_err());
+            assert!(shell_and_profile("/bin/zsh", Path::new("relative-home")).is_err());
         }
 
         #[test]
@@ -437,14 +468,23 @@ mod macos {
     }
 }
 
-fn validate_version_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<()> {
+fn validate_version_output(success: bool, stdout: &[u8], _stderr: &[u8]) -> Result<()> {
     if !success {
         anyhow::bail!("version command failed");
     }
-    let mut output = String::from_utf8_lossy(stdout).to_ascii_lowercase();
-    output.push_str(&String::from_utf8_lossy(stderr).to_ascii_lowercase());
-    if !output.contains("codex") {
-        anyhow::bail!("version output does not identify Codex");
+    let output = std::str::from_utf8(stdout).context("version output was not UTF-8")?;
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    let output = output.strip_suffix('\r').unwrap_or(output);
+    let Some(version) = output.strip_prefix("codex ") else {
+        anyhow::bail!("version output does not match `codex <version>`");
+    };
+    if version.is_empty()
+        || version.chars().any(char::is_whitespace)
+        || !version
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".+-".contains(character))
+    {
+        anyhow::bail!("version output does not match `codex <version>`");
     }
     Ok(())
 }
@@ -571,8 +611,11 @@ mod tests {
     #[test]
     fn version_output_must_succeed_and_identify_codex() {
         assert!(validate_version_output(true, b"codex 1.2.3", b"").is_ok());
+        assert!(validate_version_output(true, b"codex 1.2.3\n", b"").is_ok());
         assert!(validate_version_output(false, b"codex 1.2.3", b"").is_err());
-        assert!(validate_version_output(true, b"other 1.2.3", b"").is_err());
+        assert!(validate_version_output(true, b"not a codex-compatible tool", b"").is_err());
+        assert!(validate_version_output(true, b"", b"codex 1.2.3").is_err());
+        assert!(validate_version_output(true, b"codex", b"").is_err());
     }
 
     #[test]
