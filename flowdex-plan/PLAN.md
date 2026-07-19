@@ -184,7 +184,7 @@ Messages go directly to the target thread without passing through the orchestrat
 - Save this plan as `Flowdex Plan.md` when implementation begins.
 - Load global settings from `$CODEX_HOME/flowdex.toml`.
 - Overlay repository settings from `.flowdex/config.toml`.
-- Use these files for defaults, tool profiles, context-gathering agents, round limits, compaction threshold, and AST-grep behavior.
+- Use these files for tool profiles, compaction threshold, AST-grep behavior, and other defaults only when a completed feature consumes them. Keep agent selection and round budgets explicit in workflow definitions.
 - Keep one per-repository SQLite database under `$CODEX_HOME/flowdex/`.
 - Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-fragment versions, review history, and rule candidates.
 - Add `codex flowdex install --binary <absolute-path>` on Windows:

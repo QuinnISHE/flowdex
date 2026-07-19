@@ -45,7 +45,11 @@ JavaScript is the workflow definition and control language. The final authoring 
 
 - **Workflow authoring API:** run/phase/task scheduling, reusable nested workflows, context requirements, review/repair, and boundaries are settled. Tool profiles remain the final additive language slice.
 - **Workflow event wait:** V8-cell completion, scheduler completion/escalation/boundaries, and user steering are event-driven. Explicit named workflow signals remain.
-- **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles, agent defaults, and round limits remain.
+- **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles remain; agent selectors and round budgets stay explicit workflow data rather than unused global defaults.
+
+### In progress
+
+- **Agent tool profiles and named signals (Batch 016):** add tool-only global/repository profiles that compose with normal `.codex/agents` profiles, correct Flowdex-specific model/reasoning override precedence, and add a persisted FIFO signal that wakes the existing event-driven workflow wait without a model call at publication time.
 
 ## Remaining durable feature slices
 
@@ -74,7 +78,7 @@ Turn a validated definition into an executing run:
 
 This should consume the task/worktree lifecycle from Batch 009 rather than replace it.
 
-Complete in Batch 010 for live-process execution. Process-restart controller resumption remains deferred.
+Complete in Batch 010 for live-process execution. Process-restart controller resurrection and orphan cleanup are optional follow-up scope, not part of the requested Flowdex completion contract.
 
 ### 3. Reusable and nested workflow composition
 
@@ -136,7 +140,9 @@ If required context is absent or stale, queue a bounded context-gathering task, 
 
 Complete workflow-level reusable agent declarations using model, reasoning effort, existing `.codex/agents` profiles, and optional Flowdex tool profiles. Agent roles remain instructions and tool access, never worker/reviewer/explorer runtime enums.
 
-Expand global and trusted-repository configuration only for settings actually consumed by completed features: named tool profiles, agent defaults, context gathering, round limits, and AST-grep behavior.
+Expand global and trusted-repository configuration for named tool profiles, alongside the already consumed compaction and AST-grep settings. Do not add unused configuration defaults for values already explicit in a workflow.
+
+Batch 016 completes the remaining tool-profile composition. Existing `.codex/agents` profiles stay authoritative for reusable agent defaults, while selectors and operation budgets remain explicit in workflow definitions.
 
 ### 9. Review history and AST-grep rule promotion
 
@@ -191,6 +197,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Started Batch 016 from authoritative commit `e360b5fe6c`. It combines the final agent tool-profile composition with named workflow signals. The config/profile and signal/wait paths can proceed in parallel after one shared contract; process-restart controller recovery remains optional, out-of-scope machinery.
 - **2026-07-19:** Accepted Batch 015 and fast-forwarded `codex/flowdex` to `e360b5fe6c`. Verification repair, generic task/phase reviews, exact attribution routing, independent budgets, retained reviewed worktrees, and event-driven orchestrator/human boundaries are complete. Review-specific behavior is limited to the structured report tool; arbitrary agent rounds remain workflow-authored JavaScript.
 - **2026-07-19:** Started Batch 015 from authoritative commit `59a9acbf90`. The batch combines verification repair, structured task/phase review attribution, direct repair routing, independent budgets, and event-driven boundaries. Generic multi-agent rounds remain workflow-defined JavaScript control flow over role-neutral messaging and resume primitives.
 - **2026-07-19:** Accepted and integrated Batch 013 after Batch 014. Context packs now provide persisted immutable fragments, fresh/missing/stale resolution, automatic single collector dispatch, safe same-handle source reads, supersession, bounded task-only injection, and concurrent context preparation that does not block unrelated ready work.
