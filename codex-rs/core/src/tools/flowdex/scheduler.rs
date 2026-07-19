@@ -11,10 +11,13 @@ use codex_flowdex::context::{
     ContextPackDeclaration, ContextPackStatus, ContextStaleSource, ResolvedContextPack,
 };
 use codex_flowdex::store::{
-    FlowdexStore, FlowdexStoreError, RunInfo, RunState, SchedulerTaskState, TaskDeclaration,
+    FlowdexStore, FlowdexStoreError, PendingBoundary, RunInfo, RunState, SchedulerTaskState,
+    TaskDeclaration,
 };
 use codex_flowdex::workflow::ContextPackDefinition;
-use codex_flowdex::{PhaseDefinition, TaskDefinition, WorkflowDefinition};
+use codex_flowdex::{
+    Boundary, PhaseDefinition, ReviewDefinition, TaskDefinition, WorkflowDefinition,
+};
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_tools::shell_command_backend_for_features;
@@ -22,6 +25,7 @@ use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};
 use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
@@ -68,6 +72,8 @@ struct RawWorkflow {
     verification: Vec<String>,
     #[serde(default)]
     context_packs: std::collections::BTreeMap<String, RawContextPack>,
+    #[serde(default)]
+    boundary: Boundary,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,6 +101,10 @@ struct RawPhase {
     open: bool,
     #[serde(default)]
     verification: Vec<String>,
+    #[serde(default)]
+    boundary: Boundary,
+    #[serde(default)]
+    review: Option<ReviewDefinition>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +121,12 @@ struct RawTask {
     #[serde(default)]
     verification: Vec<String>,
     #[serde(default)]
+    verification_repair_limit: usize,
+    #[serde(default)]
+    review: Option<ReviewDefinition>,
+    #[serde(default)]
+    boundary: Boundary,
+    #[serde(default)]
     context: Vec<String>,
 }
 impl From<RawTask> for TaskDefinition {
@@ -123,6 +139,9 @@ impl From<RawTask> for TaskDefinition {
             read_scope: t.read_scope,
             write_scope: t.write_scope,
             verification: t.verification,
+            verification_repair_limit: t.verification_repair_limit,
+            review: t.review,
+            boundary: t.boundary,
             context: t.context,
         }
     }
@@ -154,9 +173,12 @@ impl From<RawWorkflow> for WorkflowDefinition {
                     tasks: p.tasks.into_iter().map(Into::into).collect(),
                     open: p.open,
                     verification: p.verification,
+                    boundary: p.boundary,
+                    review: p.review,
                 })
                 .collect(),
             verification: w.verification,
+            boundary: w.boundary,
             context_packs: w
                 .context_packs
                 .into_iter()
@@ -404,6 +426,7 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         .lock()
         .await
         .insert(run_id.clone(), Arc::clone(&controller));
+    super::register_flowdex_boundary_run(run_id.clone(), Arc::clone(&controller.store));
     // The scheduler owns the live run independently of the tool invocation turn.
     tokio::spawn(run_scheduler(controller));
     Ok(task::JsonOutput(serde_json::json!({"runId": run_id})))
@@ -598,6 +621,14 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), Stri
         .await;
         verify_commands(controller, &definition.verification).await?;
     }
+    await_boundary(
+        controller,
+        "run",
+        &controller.id,
+        definition.boundary,
+        format!("Completed workflow: {}", definition.name),
+    )
+    .await?;
     let set_run = (
         Arc::clone(&controller.store),
         controller.info.run_id.clone(),
@@ -701,6 +732,14 @@ async fn run_phase(
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
+            await_boundary(
+                controller,
+                "phase",
+                &phase.name,
+                phase.boundary,
+                format!("Completed phase: {}", phase.name),
+            )
+            .await?;
             progress(
                 &controller.invocation,
                 format!("Completed phase {}/{}: {}", index + 1, total, phase.name),
@@ -1063,27 +1102,77 @@ async fn complete_task(
     task_def: &TaskDefinition,
 ) -> Result<(), (String, String)> {
     if !task_def.verification.is_empty() {
-        progress(
-            &controller.invocation,
-            format!("Verifying task: {}", task_def.name),
-        )
-        .await;
-        let verification_output =
-            run_verify_handler(controller.invocation.clone(), task_id.to_string())
-                .await
-                .map_err(|error| ("verification".to_string(), error.to_string()))?;
-        if verification_output
-            .code_mode_result(&ToolPayload::Function {
-                arguments: serde_json::json!({"task_id": task_id}).to_string(),
+        let mut repairs = 0usize;
+        loop {
+            progress(
+                &controller.invocation,
+                format!("Verifying task: {}", task_def.name),
+            )
+            .await;
+            let verification_output =
+                run_verify_handler(controller.invocation.clone(), task_id.to_string())
+                    .await
+                    .map_err(|error| ("verification".to_string(), error.to_string()))?;
+            let passed = verification_output
+                .code_mode_result(&ToolPayload::Function {
+                    arguments: serde_json::json!({"task_id": task_id}).to_string(),
+                })
+                .get("passed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if passed {
+                break;
+            }
+            if repairs >= task_def.verification_repair_limit {
+                return Err((
+                    "verification".to_string(),
+                    format!("Task {} failed during verification", task_def.name),
+                ));
+            }
+            repairs += 1;
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let id = task_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                store.increment_verification_repairs("task", &run_id, &id)
             })
-            .get("passed")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        {
-            return Err((
-                "verification".to_string(),
-                format!("Task {} failed during verification", task_def.name),
-            ));
+            .await
+            .map_err(|error| ("verification repair".to_string(), error.to_string()))?
+            .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
+            progress(
+                &controller.invocation,
+                format!(
+                    "Repairing verification: {} ({repairs}/{})",
+                    task_def.name, task_def.verification_repair_limit
+                ),
+            )
+            .await;
+            let agent_def = controller
+                .definition
+                .lock()
+                .await
+                .agents
+                .get(&task_def.agent)
+                .cloned()
+                .ok_or_else(|| {
+                    (
+                        "verification repair".to_string(),
+                        "agent missing".to_string(),
+                    )
+                })?;
+            let agent = AgentSpec {
+                name: task_def.name.clone(),
+                instructions: format!(
+                    "Verification failed for this task. Repair the failure, rerun the declared verification commands, and commit the fix.\n\n{}",
+                    task_def.instructions
+                ),
+                profile: agent_def.profile,
+                model: agent_def.model,
+                reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
+            };
+            run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
+                .await
+                .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
         }
         let store = Arc::clone(&controller.store);
         let id = task_id.to_string();
@@ -1093,6 +1182,11 @@ async fn complete_task(
         .await
         .map_err(|error| ("verification".to_string(), error.to_string()))?
         .map_err(|error| ("verification".to_string(), error.to_string()))?;
+    }
+    if let Some(review) = task_def.review.as_ref() {
+        review_task(controller, task_id, task_def, review)
+            .await
+            .map_err(|error| ("review".to_string(), error))?;
     }
     progress(
         &controller.invocation,
@@ -1108,11 +1202,261 @@ async fn complete_task(
         .await
         .map_err(|error| ("integration".to_string(), error.to_string()))?
         .map_err(|error| ("integration".to_string(), error.to_string()))?;
+    await_boundary(
+        controller,
+        "task",
+        task_id,
+        task_def.boundary,
+        format!("Completed task: {}", task_def.name),
+    )
+    .await
+    .map_err(|error| ("boundary".to_string(), error))?;
     progress(
         &controller.invocation,
         format!("Completed task: {}", task_def.name),
     )
     .await;
+    Ok(())
+}
+
+async fn await_boundary(
+    controller: &Arc<RunController>,
+    scope_kind: &str,
+    scope_id: &str,
+    boundary: Boundary,
+    reason: String,
+) -> Result<(), String> {
+    if boundary == Boundary::Continue {
+        progress(
+            &controller.invocation,
+            format!("Boundary continued: {scope_kind} {scope_id}"),
+        )
+        .await;
+        return Ok(());
+    }
+    let pending = PendingBoundary {
+        run_id: controller.id.clone(),
+        scope_kind: scope_kind.to_string(),
+        scope_id: scope_id.to_string(),
+        target: match boundary {
+            Boundary::Continue => "continue",
+            Boundary::Orchestrator => "orchestrator",
+            Boundary::Human => "human",
+        }
+        .to_string(),
+        reason,
+        transition: "awaiting_continuation".to_string(),
+    };
+    super::publish_flowdex_boundary(Arc::clone(&controller.store), pending.clone()).await?;
+    progress(
+        &controller.invocation,
+        format!("Boundary: {} {}", pending.scope_kind, pending.scope_id),
+    )
+    .await;
+    super::wait_flowdex_boundary_continuation(
+        &pending.run_id,
+        &pending.scope_kind,
+        &pending.scope_id,
+    )
+    .await;
+    Ok(())
+}
+
+async fn review_task(
+    controller: &Arc<RunController>,
+    task_id: &str,
+    task_def: &TaskDefinition,
+    review: &ReviewDefinition,
+) -> Result<(), String> {
+    let reviewer = controller
+        .definition
+        .lock()
+        .await
+        .agents
+        .get(&review.agent)
+        .cloned()
+        .ok_or_else(|| format!("review agent {} is missing", review.agent))?;
+    let task = {
+        let store = Arc::clone(&controller.store);
+        let id = task_id.to_string();
+        tokio::task::spawn_blocking(move || store.task(&id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+    };
+    let diff = tokio::task::spawn_blocking({
+        let path = task.worktree_path.clone();
+        let base = task.base_commit.clone();
+        move || {
+            Command::new("git")
+                .current_dir(path)
+                .args(["diff", &base, "HEAD"])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .chars()
+                        .take(64 * 1024)
+                        .collect::<String>()
+                })
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    for round in 1..=review.max_rounds {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let id = task_id.to_string();
+        tokio::task::spawn_blocking(move || store.increment_review_rounds("task", &run_id, &id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let operation = codex_flowdex::store::ReviewOperation {
+            operation_id: Uuid::new_v4().to_string(),
+            run_id: controller.id.clone(),
+            scope_kind: "task".into(),
+            scope_id: task_id.into(),
+            round: round as i64,
+            reviewer_thread_id: String::new(),
+            state: "pending".into(),
+        };
+        let operation_id = operation.operation_id.clone();
+        let store = Arc::clone(&controller.store);
+        tokio::task::spawn_blocking({
+            let operation = operation.clone();
+            move || store.record_review_operation(&operation)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        let agent = AgentSpec {
+            name: format!("review-{}-{}", task_def.name, round),
+            instructions: format!(
+                "{}\n\nReview the committed task diff below against the task requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nTask requirements:\n{}\n\nCommitted diff:\n{}",
+                review.instructions, task.instructions, diff
+            ),
+            profile: reviewer.profile.clone(),
+            model: reviewer.model.clone(),
+            reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
+        };
+        let reviewer_result = task::run_task_agent_with_review(
+            controller.invocation.clone(),
+            task_id.to_string(),
+            agent,
+            task::ReviewDispatch {
+                operation: codex_flowdex::store::ReviewOperation {
+                    operation_id: operation_id.clone(),
+                    ..operation.clone()
+                },
+                store: Arc::clone(&controller.store),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let reviewer_thread_id = reviewer_result
+            .code_mode_result(&ToolPayload::Function {
+                arguments: serde_json::json!({"task_id": task_id}).to_string(),
+            })
+            .get("agentId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !reviewer_thread_id.is_empty() {
+            let store = Arc::clone(&controller.store);
+            let mut updated = operation.clone();
+            updated.reviewer_thread_id = reviewer_thread_id;
+            updated.state = "accepted".to_string();
+            tokio::task::spawn_blocking(move || store.record_review_operation(&updated))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+        let store = Arc::clone(&controller.store);
+        let accepted = tokio::task::spawn_blocking({
+            let id = operation_id.clone();
+            move || store.review_operation(&id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        if accepted.state != "accepted" {
+            return Err("review agent completed without a report".into());
+        }
+        let store = Arc::clone(&controller.store);
+        let findings = tokio::task::spawn_blocking({
+            let id = operation_id.clone();
+            move || store.review_findings(&id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        if findings.is_empty() {
+            return Ok(());
+        }
+        if round == review.max_rounds {
+            return Err(format!(
+                "task review exhausted after {} rounds",
+                review.max_rounds
+            ));
+        }
+        let repair = findings
+            .iter()
+            .map(|finding| {
+                format!(
+                    "{}:{}-{}: {}",
+                    finding.file, finding.line_start, finding.line_end, finding.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let agent = AgentSpec {
+            name: task_def.name.clone(),
+            instructions: format!(
+                "Repair these review findings, rerun verification, and commit:\n{repair}\n\n{}",
+                task_def.instructions
+            ),
+            profile: controller
+                .definition
+                .lock()
+                .await
+                .agents
+                .get(&task_def.agent)
+                .and_then(|a| a.profile.clone()),
+            model: controller
+                .definition
+                .lock()
+                .await
+                .agents
+                .get(&task_def.agent)
+                .and_then(|a| a.model.clone()),
+            reasoning_effort: controller
+                .definition
+                .lock()
+                .await
+                .agents
+                .get(&task_def.agent)
+                .and_then(|a| a.reasoning_effort.clone())
+                .and_then(parse_effort),
+        };
+        run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !task_def.verification.is_empty() {
+            let output = run_verify_handler(controller.invocation.clone(), task_id.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+            if output
+                .code_mode_result(&ToolPayload::Function {
+                    arguments: serde_json::json!({"task_id": task_id}).to_string(),
+                })
+                .get("passed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err("review repair failed verification".into());
+            }
+        }
+    }
     Ok(())
 }
 

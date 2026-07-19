@@ -425,6 +425,18 @@ async fn handle_create(invocation: ToolInvocation) -> Result<JsonOutput, Functio
 }
 
 async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {
+    handle_run_with_review(invocation, None).await
+}
+
+pub(crate) struct ReviewDispatch {
+    pub(crate) operation: codex_flowdex::store::ReviewOperation,
+    pub(crate) store: std::sync::Arc<codex_flowdex::store::FlowdexStore>,
+}
+
+pub(crate) async fn handle_run_with_review(
+    invocation: ToolInvocation,
+    review: Option<ReviewDispatch>,
+) -> Result<JsonOutput, FunctionCallError> {
     let args: RunArgs = serde_json::from_str(&parse(
         invocation.payload.clone(),
         "flowdex task.runAgent expects JSON arguments",
@@ -510,6 +522,13 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     let child_path = source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel("spawned agent is missing an agent path".into())
     })?;
+    if let Some(review) = review.as_ref() {
+        super::review::activate_review_agent(
+            child_path.clone(),
+            review.operation.clone(),
+            Arc::clone(&review.store),
+        );
+    }
     let author = invocation
         .turn
         .session_source
@@ -533,7 +552,7 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
             config.clone(),
             InterAgentCommunication::new_encrypted(
                 author,
-                child_path,
+                child_path.clone(),
                 Vec::new(),
                 instructions,
                 true,
@@ -554,6 +573,9 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
     {
         Ok(child) => child,
         Err(error) => {
+            if review.is_some() {
+                super::review::deactivate_review_agent(&child_path);
+            }
             cancel_task_operation_reservation(
                 &invocation.session,
                 &invocation.turn,
@@ -630,6 +652,9 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
             }
         }
     };
+    if review.is_some() {
+        super::review::deactivate_review_agent(&child_path);
+    }
     let terminal = if matches!(status, crate::agent::AgentStatus::Completed(_)) {
         "completed"
     } else {
@@ -665,6 +690,28 @@ pub(crate) async fn run_task_agent(
         .to_string(),
     };
     handle_run(invocation).await
+}
+
+pub(crate) async fn run_task_agent_with_review(
+    mut invocation: ToolInvocation,
+    task_id: String,
+    agent: AgentSpec,
+    review: ReviewDispatch,
+) -> Result<JsonOutput, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "task_id": task_id,
+            "agent": {
+                "name": agent.name,
+                "instructions": agent.instructions,
+                "profile": agent.profile,
+                "model": agent.model,
+                "reasoning_effort": agent.reasoning_effort,
+            }
+        })
+        .to_string(),
+    };
+    handle_run_with_review(invocation, Some(review)).await
 }
 
 async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {

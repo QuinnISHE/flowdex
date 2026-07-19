@@ -474,6 +474,27 @@ async fn wait_for_flowdex_boundary(run_id: String) -> PendingBoundary {
     }
 }
 
+pub(crate) async fn wait_flowdex_boundary_continuation(
+    run_id: &str,
+    scope_kind: &str,
+    scope_id: &str,
+) {
+    let Some(mut signal) = subscribe_flowdex_boundary(run_id).await else {
+        return;
+    };
+    loop {
+        let matching = signal.borrow().as_ref().is_some_and(|boundary| {
+            boundary.scope_kind == scope_kind && boundary.scope_id == scope_id
+        });
+        if signal.changed().await.is_err() {
+            return;
+        }
+        if matching && signal.borrow().is_none() {
+            return;
+        }
+    }
+}
+
 fn flowdex_boundary_result(boundary: PendingBoundary) -> Value {
     serde_json::json!({
         "runId": boundary.run_id,
