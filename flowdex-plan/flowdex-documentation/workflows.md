@@ -9,7 +9,7 @@ const run = await flowdex.startRun({
   name: "update-record-layout",
   boundary: "continue",
   agents: {
-    implementer: { profile: "implementation_worker" },
+    implementer: { profile: "implementation_worker", toolProfile: "development" },
     fastFix: { model: "gpt-5.6-luna", reasoningEffort: "high" },
   },
   phases: [
@@ -62,6 +62,11 @@ scheduler integrates completed tasks in declaration order, and avoids an
 obvious equal-or-ancestor write-scope collision by serializing that pair.
 Scopes remain advisory declarations, not access controls. The phase and run
 verification commands execute separately against the integrated worktree.
+Declared agents use the same resolved tool profile for initial execution,
+verification repair, task and phase review, attributed review repair,
+context-pack collection, and handoff replacements. Resolution starts from the
+parent configuration snapshot, then applies the `.codex/agents` profile, the
+Flowdex tool profile, and finally explicit model and reasoning overrides.
 
 An open phase can receive tasks while it is active. A saved workflow uses the
 handle methods; an awake orchestrator may use the direct model-only

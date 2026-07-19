@@ -43,6 +43,26 @@ A parent-directed agent message that requests a turn wake returns:
 { "runId": "cell-1", "status": "message" }
 ```
 
+A saved workflow can publish a named signal:
+
+```js
+await flowdex.signal("build-complete");
+```
+
+`signal` accepts exactly one non-empty name and resolves to JavaScript
+`undefined`. Publication queues the signal without invoking a model or adding a
+message, progress item, conversation item, rollout item, or next-request input.
+The eventual wait result is the signal's only model-visible representation:
+
+```json
+{ "runId": "cell-1", "status": "signal", "signal": "build-complete" }
+```
+
+Signals are persisted per run in FIFO order, so publication immediately before
+a wait and repeated same-name publications are not lost or coalesced. A wait
+consumes exactly the signal it returns. If steering wins a simultaneous wake,
+the wait returns `steered` and leaves every queued signal for a later wait.
+
 Neither result includes the pending input. Steering and message activity remain
 owned by the input queue and are delivered once through Codex's normal next-turn
 input path. They do not cancel the live workflow, drain its input, or consume
@@ -61,7 +81,6 @@ For a boundary, call the direct model-only
 `run_id`, resumes that run's current boundary once, and rejects missing, stale,
 terminal, or already-consumed boundaries. Steering wakes do not consume it.
 
-## Current limits
-
-This slice provides no scheduler, durable event history, named signals, human
-checkpoints, or generic wait selector.
+Scheduler task, phase, and run boundaries use the same event-driven wait. There
+is no generic event bus, payload-bearing signal, external signal producer,
+generic wait selector, or process-restart controller recovery.
