@@ -1,7 +1,16 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextPackDeclaration {
@@ -69,6 +78,8 @@ pub enum ContextError {
     OutsideRoot(PathBuf),
     #[error("context source is a directory: {0}")]
     Directory(PathBuf),
+    #[error("context source is a link or reparse point: {0}")]
+    Reparse(PathBuf),
     #[error("context line range is invalid: {start}..={end}")]
     InvalidRange { start: u32, end: u32 },
     #[error("unable to read context source {path}: {source}")]
@@ -138,17 +149,32 @@ pub(crate) fn read_source_range(
     if !canonical.starts_with(&canonical_root) {
         return Err(ContextError::OutsideRoot(relative_path.to_path_buf()));
     }
-    let metadata = canonical.metadata().map_err(|source| ContextError::Read {
-        path: canonical.clone(),
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(&candidate)
+        .map_err(|source| ContextError::Read {
+            path: candidate.clone(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| ContextError::Read {
+        path: candidate.clone(),
         source,
     })?;
+    #[cfg(unix)]
+    let is_reparse = metadata.file_type().is_symlink();
+    #[cfg(windows)]
+    let is_reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
     if metadata.is_dir() {
         return Err(ContextError::Directory(relative_path.to_path_buf()));
     }
-    let mut file = File::open(&canonical).map_err(|source| ContextError::Read {
-        path: canonical,
-        source,
-    })?;
+    if is_reparse {
+        return Err(ContextError::Reparse(relative_path.to_path_buf()));
+    }
     let mut source = String::new();
     file.read_to_string(&mut source)
         .map_err(|source_error| ContextError::Read {

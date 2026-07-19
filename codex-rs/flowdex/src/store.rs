@@ -1880,4 +1880,37 @@ mod tests {
             .unwrap();
         assert_eq!(fragment.content, "execution\n");
     }
+
+    #[test]
+    fn context_publication_rejects_final_component_link() {
+        let (repo, store, _run) = context_store();
+        let target = repo.path().join("target.txt");
+        let link = repo.path().join("link.txt");
+        fs::write(&target, "secret\n").unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        if linked.is_err() {
+            return;
+        }
+        let result = store.publish_context_fragment(
+            "run",
+            repo.path(),
+            repo.path(),
+            &ContextPublisher::default(),
+            &ContextPublication {
+                pack: "pack".into(),
+                key: "link".into(),
+                path: PathBuf::from("link.txt"),
+                line_start: 1,
+                line_end: 1,
+                summary: None,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(FlowdexStoreError::Context(ContextError::Reparse(_)))
+        ));
+    }
 }
