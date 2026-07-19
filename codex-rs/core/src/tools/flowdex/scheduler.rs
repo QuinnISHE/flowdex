@@ -1,7 +1,7 @@
 use super::task::{self, AgentSpec};
 use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output};
+use crate::tools::context::{boxed_tool_output, ToolInvocation, ToolOutput, ToolPayload};
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::{
     FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
@@ -23,7 +23,7 @@ use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
 const START: &str = "flowdex_start_run";
@@ -716,83 +716,78 @@ async fn run_phase(
                 .map_err(|_| "scheduler activity stopped".to_string())?;
             continue;
         }
-        let mut operations = Vec::new();
-        for scheduled in ready {
-            let details = {
+        let completed = join_all(ready.into_iter().map(|scheduled| {
+            let controller = Arc::clone(controller);
+            async move {
+                let details = {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = scheduled.task_id.clone();
+                    tokio::task::spawn_blocking(move || store.scheduler_task(&task_id))
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?
+                };
+                let task_def = controller
+                    .definition
+                    .lock()
+                    .await
+                    .phases
+                    .get(index)
+                    .and_then(|phase| phase.tasks.iter().find(|task| task.name == details.name))
+                    .cloned()
+                    .ok_or_else(|| "scheduled task missing definition".to_string())?;
+                let task_instructions =
+                    prepare_task_instructions(&controller, &details.instructions, &task_def)
+                        .await?;
+                ensure_task_record(
+                    &controller,
+                    TaskDeclaration {
+                        id: details.task_id.clone(),
+                        name: details.name.clone(),
+                        instructions: task_instructions.clone(),
+                        read_scope: details.read_scope.clone(),
+                        write_scope: details.write_scope.clone(),
+                        verification: details.verification.clone(),
+                    },
+                )
+                .await?;
+                progress(
+                    &controller.invocation,
+                    format!("Running task: {}", task_def.name),
+                )
+                .await;
+                let agent_def = controller
+                    .definition
+                    .lock()
+                    .await
+                    .agents
+                    .get(&task_def.agent)
+                    .cloned()
+                    .ok_or_else(|| "agent missing".to_string())?;
+                let agent = AgentSpec {
+                    name: task_def.name.clone(),
+                    instructions: task_instructions,
+                    profile: agent_def.profile,
+                    model: agent_def.model,
+                    reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
+                };
                 let store = Arc::clone(&controller.store);
-                let task_id = scheduled.task_id.clone();
-                tokio::task::spawn_blocking(move || store.scheduler_task(&task_id))
+                let id = scheduled.task_id.clone();
+                tokio::task::spawn_blocking(move || store.mark_task_running(&id))
                     .await
                     .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?
-            };
-            let task_def = controller
-                .definition
-                .lock()
-                .await
-                .phases
-                .get(index)
-                .and_then(|phase| phase.tasks.iter().find(|task| task.name == details.name))
-                .cloned()
-                .ok_or_else(|| "scheduled task missing definition".to_string())?;
-            let task_instructions =
-                prepare_task_instructions(controller, &details.instructions, &task_def).await?;
-            ensure_task_record(
-                controller,
-                TaskDeclaration {
-                    id: details.task_id.clone(),
-                    name: details.name.clone(),
-                    instructions: task_instructions.clone(),
-                    read_scope: details.read_scope.clone(),
-                    write_scope: details.write_scope.clone(),
-                    verification: details.verification.clone(),
-                },
-            )
-            .await?;
-            progress(
-                &controller.invocation,
-                format!("Running task: {}", task_def.name),
-            )
-            .await;
-            let agent_def = controller
-                .definition
-                .lock()
-                .await
-                .agents
-                .get(&task_def.agent)
-                .cloned()
-                .ok_or_else(|| "agent missing".to_string())?;
-            let agent = AgentSpec {
-                name: task_def.name.clone(),
-                instructions: task_instructions,
-                profile: agent_def.profile,
-                model: agent_def.model,
-                reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
-            };
-            let store = Arc::clone(&controller.store);
-            let id = scheduled.task_id.clone();
-            tokio::task::spawn_blocking(move || store.mark_task_running(&id))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
-            let task_id = scheduled.task_id.clone();
-            operations.push((
-                scheduled,
-                task_def.clone(),
-                run_task_handler(controller.invocation.clone(), task_id, agent),
-            ));
-        }
-        let completed = join_all(
-            operations
-                .into_iter()
-                .map(|(scheduled, task_def, operation)| async move {
-                    (scheduled, task_def, operation.await)
-                }),
-        )
+                    .map_err(|e| e.to_string())?;
+                let task_id = scheduled.task_id.clone();
+                let operation =
+                    run_task_handler(controller.invocation.clone(), task_id, agent).await;
+                Ok::<_, String>((scheduled, task_def, operation))
+            }
+        }))
         .await;
         let mut retry_capacity = false;
         let mut first_error = None;
-        for (scheduled, task_def, operation) in completed {
+        for completed in completed {
+            let (scheduled, task_def, operation) = completed?;
             if let Err(error) = operation {
                 let store = Arc::clone(&controller.store);
                 let task_id = scheduled.task_id.clone();
@@ -1015,20 +1010,26 @@ async fn collect_context(
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
     };
-    tokio::spawn(run_task_handler(
-        controller.invocation.clone(),
-        task_id,
-        agent,
-    ))
-    .await
-    .map_err(|e| format!("context collector task panicked for {pack}: {e}"))?
-    .map_err(|e| format!("context collector failed for {pack}: {e}"))?;
+    let result = run_task_handler(controller.invocation.clone(), task_id.clone(), agent).await;
+    let cleanup = task::integrate_task(controller.invocation.clone(), task_id)
+        .await
+        .map_err(|e| format!("context collector cleanup failed for {pack}: {e}"));
+    match result {
+        Ok(_) => {
+            cleanup?;
+        }
+        Err(error) => {
+            let _ = cleanup;
+            return Err(format!("context collector failed for {pack}: {error}"));
+        }
+    }
     Ok(())
 }
 
 fn format_stale_source(source: &ContextStaleSource) -> String {
     format!(
-        "{} ({}-{})",
+        "{}: {} ({}-{})",
+        source.key,
         source.path.display(),
         source.line_start,
         source.line_end
