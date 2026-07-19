@@ -288,6 +288,40 @@ pub(crate) async fn open_store(
     Ok((store, cwd, identity))
 }
 
+pub(crate) async fn open_existing_store(
+    _session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+) -> Result<(Option<FlowdexStore>, PathBuf), FunctionCallError> {
+    if !turn.config.active_project.is_trusted() {
+        return Err(FunctionCallError::RespondToModel(
+            "Flowdex tasks require a trusted Git repository".into(),
+        ));
+    }
+    let cwd = turn
+        .environments
+        .single_local_environment_cwd()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel("Flowdex tasks require one local environment".into())
+        })?;
+    let home = turn.config.codex_home.to_path_buf();
+    let (identity, repository_root) = tokio::task::spawn_blocking({
+        let cwd = cwd.clone();
+        move || Ok::<_, String>((repository_identity(&cwd)?, repository_root(&cwd)?))
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(FunctionCallError::RespondToModel)?;
+    let integration_worktree = cwd;
+    let store = tokio::task::spawn_blocking(move || {
+        FlowdexStore::open_existing(&home, identity, &integration_worktree)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)?;
+    Ok((store, repository_root))
+}
+
 fn repository_identity(cwd: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -304,6 +338,22 @@ fn repository_identity(cwd: &Path) -> Result<String, String> {
     std::fs::canonicalize(common_dir)
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|e| e.to_string())
+}
+
+fn repository_root(cwd: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("current environment is not a Git repository".to_string());
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return Err("current environment is not a Git repository".to_string());
+    }
+    std::fs::canonicalize(root).map_err(|e| e.to_string())
 }
 
 pub(crate) async fn reserve_task_operation(
@@ -928,6 +978,7 @@ impl ToolOutput for JsonOutput {
 #[cfg(test)]
 mod tests {
     use super::repository_identity;
+    use super::repository_root;
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
@@ -966,6 +1017,19 @@ mod tests {
         assert_eq!(
             repository_identity(&repository).unwrap(),
             repository_identity(&linked).unwrap()
+        );
+    }
+
+    #[test]
+    fn repository_root_resolves_from_nested_cwd() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let nested = repository.join("src").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        git(&repository, &["init", "-q"]);
+        assert_eq!(
+            repository_root(&nested).unwrap(),
+            repository.canonicalize().unwrap()
         );
     }
 }

@@ -114,8 +114,11 @@ async fn handle_scan_rule_candidates(
         ));
     };
     let _: ScanRuleCandidatesArgs = parse_arguments(arguments)?;
-    let (store, repository_root, _) =
-        super::task::open_store(&invocation.session, &invocation.turn).await?;
+    let (store, repository_root) =
+        super::task::open_existing_store(&invocation.session, &invocation.turn).await?;
+    let Some(store) = store else {
+        return Ok(RulesOutput(serde_json::json!({"candidates": []})));
+    };
     let threshold = u64::try_from(
         invocation
             .turn

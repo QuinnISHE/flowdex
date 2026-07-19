@@ -78,7 +78,7 @@ fn function_call_output_text(request: &wiremock::Request, call_id: &str) -> Opti
 }
 
 async fn scan_candidate_call(
-    mut builder: core_test_support::test_codex::TestCodexBuilder,
+    mut builder: Box<core_test_support::test_codex::TestCodexBuilder>,
     prompt: &str,
 ) -> Result<Value> {
     let server = start_mock_server().await;
@@ -112,7 +112,7 @@ async fn scan_flowdex_rule_candidates_rejects_untrusted_repository() -> Result<(
     let builder = test_codex().with_config(|config| {
         config.active_project.trust_level = Some(TrustLevel::Untrusted);
     });
-    let output = scan_candidate_call(builder, "scan candidates").await?;
+    let output = scan_candidate_call(Box::new(builder), "scan candidates").await?;
     assert!(
         output
             .as_str()
@@ -126,7 +126,7 @@ async fn scan_flowdex_rule_candidates_rejects_missing_git_repository() -> Result
     let builder = test_codex().with_config(|config| {
         config.active_project.trust_level = Some(TrustLevel::Trusted);
     });
-    let output = scan_candidate_call(builder, "scan candidates").await?;
+    let output = scan_candidate_call(Box::new(builder), "scan candidates").await?;
     assert!(
         output
             .as_str()
@@ -156,8 +156,58 @@ async fn scan_flowdex_rule_candidates_returns_empty_result() -> Result<()> {
             git(&["commit", "-qm", "fixture"])?;
             Ok::<(), anyhow::Error>(())
         });
-    let output = scan_candidate_call(builder, "scan candidates").await?;
+    let output = scan_candidate_call(Box::new(builder), "scan candidates").await?;
     assert_eq!(output, serde_json::json!({"candidates": []}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_flowdex_rule_candidates_first_use_does_not_create_store() -> Result<()> {
+    let mut builder = test_codex()
+        .with_config(|config| {
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                anyhow::ensure!(output.status.success(), "git command failed");
+                Ok(())
+            };
+            git(&["init", "-q"])?;
+            git(&["config", "user.name", "Flowdex Test"])?;
+            git(&["config", "user.email", "flowdex-test@example.com"])?;
+            fs::write(cwd.join("README.md"), "fixture\n")?;
+            git(&["add", "."])?;
+            git(&["commit", "-qm", "fixture"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let server = start_mock_server().await;
+    let test = builder.build(&server).await?;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-1"),
+            ev_function_call("scan-call-1", "scan_flowdex_rule_candidates", "{}"),
+            ev_completed("scan-resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-2"),
+            ev_completed("scan-resp-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn("scan candidates").await?;
+    assert_eq!(
+        follow_up
+            .function_call_output_text("scan-call-1")
+            .as_deref(),
+        Some(r#"{"candidates":[]}"#)
+    );
+    assert!(!test.codex_home_path().join("flowdex").exists());
     Ok(())
 }
 

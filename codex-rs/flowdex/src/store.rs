@@ -303,6 +303,52 @@ pub struct FlowdexStore {
 }
 
 impl FlowdexStore {
+    /// Opens an existing repository-local Flowdex database without creating or
+    /// migrating anything. Returns `None` when the database does not exist.
+    pub fn open_existing(
+        codex_home: &Path,
+        repository_identity: impl Into<String>,
+        integration_worktree: &Path,
+    ) -> Result<Option<Self>, FlowdexStoreError> {
+        let repository_identity = repository_identity.into();
+        let key = repository_key(&repository_identity);
+        let flowdex_root = codex_home.join("flowdex");
+        let database_path = flowdex_root.join(format!("{key}.sqlite"));
+        if !database_path.is_file() {
+            return Ok(None);
+        }
+        let worktree_root = flowdex_root.join("worktrees").join(&key);
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|error| FlowdexStoreError::Integration(error.to_string()))?;
+        let options = SqliteConnectOptions::new()
+            .filename(database_path)
+            .create_if_missing(false)
+            .read_only(true)
+            .busy_timeout(Duration::from_secs(30));
+        let pool = runtime.block_on(
+            SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options),
+        )?;
+        let existing: Option<String> = runtime.block_on(async {
+            sqlx::query_scalar("SELECT identity FROM repository LIMIT 1")
+                .fetch_optional(&pool)
+                .await
+        })?;
+        if existing.as_deref() != Some(repository_identity.as_str()) {
+            return Err(FlowdexStoreError::Integration(
+                "Flowdex database repository identity mismatch".to_string(),
+            ));
+        }
+        Ok(Some(Self {
+            pool,
+            runtime: ManuallyDrop::new(runtime),
+            worktree_root,
+            repository_identity,
+            integration_worktree: integration_worktree.to_path_buf(),
+        }))
+    }
+
     /// Opens the repository-local Flowdex database and verifies its identity.
     pub fn open(
         codex_home: &Path,
