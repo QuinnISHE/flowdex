@@ -9,6 +9,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_flowdex::AstGrepResult;
 use codex_flowdex::ast_grep::run_ast_grep_rules_with_cancellation;
+use codex_flowdex::discover_approved_rule_ids;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -17,13 +18,20 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "flowdex_check_rules";
+const SCAN_CANDIDATES_TOOL_NAME: &str = "scan_flowdex_rule_candidates";
 
 pub(crate) struct FlowdexCheckRulesHandler;
+pub(crate) struct FlowdexScanRuleCandidatesHandler;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanRuleCandidatesArgs {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +71,79 @@ impl CoreToolRuntime for FlowdexCheckRulesHandler {
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }
+}
+
+impl ToolExecutor<ToolInvocation> for FlowdexScanRuleCandidatesHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(SCAN_CANDIDATES_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: SCAN_CANDIDATES_TOOL_NAME.to_string(),
+            description: "Scan resolved Flowdex findings for rule candidates.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::new(), None, Some(false.into())),
+            output_schema: Some(serde_json::json!({"type": "object"})),
+        })
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move {
+            handle_scan_rule_candidates(invocation)
+                .await
+                .map(boxed_tool_output)
+        })
+    }
+}
+
+impl CoreToolRuntime for FlowdexScanRuleCandidatesHandler {}
+
+async fn handle_scan_rule_candidates(
+    invocation: ToolInvocation,
+) -> Result<RulesOutput, FunctionCallError> {
+    if !matches!(invocation.source, ToolCallSource::Direct) {
+        return Err(FunctionCallError::RespondToModel(
+            "scan_flowdex_rule_candidates is available only to the direct model".into(),
+        ));
+    }
+    let ToolPayload::Function { arguments } = &invocation.payload else {
+        return Err(FunctionCallError::RespondToModel(
+            "scan_flowdex_rule_candidates expects JSON arguments".into(),
+        ));
+    };
+    let _: ScanRuleCandidatesArgs = parse_arguments(arguments)?;
+    let (store, repository_root, _) =
+        super::task::open_store(&invocation.session, &invocation.turn).await?;
+    let threshold = u64::try_from(
+        invocation
+            .turn
+            .config
+            .flowdex_config
+            .ast_grep_candidate_threshold,
+    )
+    .map_err(|_| FunctionCallError::RespondToModel("invalid Flowdex candidate threshold".into()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        let rules_dir = repository_root.join(".flowdex/ast-grep/rules");
+        let approved = if rules_dir.is_dir() {
+            discover_approved_rule_ids(&repository_root).map_err(|_| scan_error())?
+        } else {
+            BTreeSet::new()
+        };
+        store
+            .rule_candidates(threshold, &approved)
+            .map_err(|_| scan_error())
+    })
+    .await
+    .map_err(|_| scan_error())??;
+    let value = serde_json::to_value(&result)
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    Ok(RulesOutput(value))
+}
+
+fn scan_error() -> FunctionCallError {
+    FunctionCallError::RespondToModel("Flowdex rule candidate scan failed".into())
 }
 
 pub(crate) async fn run_rules(

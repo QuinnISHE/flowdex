@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_features::Feature;
+use codex_flowdex::{FlowdexStore, ReviewFinding, ReviewResolution, RunInfo, TaskDeclaration};
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
@@ -74,6 +75,224 @@ fn function_call_output_text(request: &wiremock::Request, call_id: &str) -> Opti
         .get("output")?
         .as_str()
         .map(str::to_string)
+}
+
+async fn scan_candidate_call(
+    mut builder: core_test_support::test_codex::TestCodexBuilder,
+    prompt: &str,
+) -> Result<Value> {
+    let server = start_mock_server().await;
+    let test = builder.build(&server).await?;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-1"),
+            ev_function_call("scan-call-1", "scan_flowdex_rule_candidates", "{}"),
+            ev_completed("scan-resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-2"),
+            ev_completed("scan-resp-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn(prompt).await?;
+    let output = follow_up
+        .function_call_output_text("scan-call-1")
+        .expect("scan tool output should be sent back to the model");
+    Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_flowdex_rule_candidates_rejects_untrusted_repository() -> Result<()> {
+    let builder = test_codex().with_config(|config| {
+        config.active_project.trust_level = Some(TrustLevel::Untrusted);
+    });
+    let output = scan_candidate_call(builder, "scan candidates").await?;
+    assert!(
+        output
+            .as_str()
+            .is_some_and(|text| text.contains("trusted Git repository"))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_flowdex_rule_candidates_rejects_missing_git_repository() -> Result<()> {
+    let builder = test_codex().with_config(|config| {
+        config.active_project.trust_level = Some(TrustLevel::Trusted);
+    });
+    let output = scan_candidate_call(builder, "scan candidates").await?;
+    assert!(
+        output
+            .as_str()
+            .is_some_and(|text| text.contains("not a Git repository"))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_flowdex_rule_candidates_returns_empty_result() -> Result<()> {
+    let builder = test_codex()
+        .with_config(|config| {
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+            config.flowdex_config.ast_grep_candidate_threshold = 1;
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                anyhow::ensure!(output.status.success(), "git command failed");
+                Ok(())
+            };
+            git(&["init", "-q"])?;
+            git(&["config", "user.name", "Flowdex Test"])?;
+            git(&["config", "user.email", "flowdex-test@example.com"])?;
+            fs::write(cwd.join("README.md"), "fixture\n")?;
+            git(&["add", "."])?;
+            git(&["commit", "-qm", "fixture"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let output = scan_candidate_call(builder, "scan candidates").await?;
+    assert_eq!(output, serde_json::json!({"candidates": []}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_flowdex_rule_candidates_serializes_candidate_result() -> Result<()> {
+    let mut builder = test_codex()
+        .with_config(|config| {
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+            config.flowdex_config.ast_grep_candidate_threshold = 1;
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            let git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                anyhow::ensure!(output.status.success(), "git command failed");
+                Ok(())
+            };
+            git(&["init", "-q"])?;
+            git(&["config", "user.name", "Flowdex Test"])?;
+            git(&["config", "user.email", "flowdex-test@example.com"])?;
+            fs::write(cwd.join("README.md"), "fixture\n")?;
+            git(&["add", "."])?;
+            git(&["commit", "-qm", "fixture"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let server = start_mock_server().await;
+    let test = builder.build(&server).await?;
+    let workspace = test.workspace_path(".");
+    let codex_home = test.codex_home_path().to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let identity = String::from_utf8(
+            Command::new("git")
+                .current_dir(&workspace)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        let identity = fs::canonicalize(identity)?.to_string_lossy().into_owned();
+        let store = FlowdexStore::open(&codex_home, identity.clone(), &workspace)?;
+        let run = RunInfo {
+            run_id: "scan-run".into(),
+            parent_thread_id: "thread".into(),
+            workflow_path: ".flowdex/workflows/test.js".into(),
+            parent_run_id: None,
+            workflow_identity: None,
+            repository_identity: identity,
+            integration_worktree: workspace.clone(),
+        };
+        let task = store.create_task(
+            &run,
+            &TaskDeclaration {
+                id: "scan-task".into(),
+                name: "scan task".into(),
+                instructions: "repair".into(),
+                read_scope: vec![],
+                write_scope: vec![],
+                verification: vec![],
+            },
+        )?;
+        let operation = store.start_operation("scan-task", "scan-op", "agent", "model")?;
+        fs::write(task.worktree_path.join("repair.rs"), "repair\n")?;
+        Command::new("git")
+            .current_dir(&task.worktree_path)
+            .args(["add", "."])
+            .status()?;
+        Command::new("git")
+            .current_dir(&task.worktree_path)
+            .args(["commit", "-qm", "repair"])
+            .status()?;
+        let commits = store.finish_operation("scan-task", &operation.operation_id, "completed")?;
+        let integrated = store.integrate("scan-task")?;
+        let findings = (0..3)
+            .map(|index| ReviewFinding {
+                finding_id: format!("scan-finding-{index}"),
+                operation_id: "review-op".into(),
+                finding_order: index,
+                file: format!("src/layout-{index}.rs"),
+                line_start: 42 + index,
+                line_end: 44 + index,
+                reason: "The cast bypasses the checked layout helper.".into(),
+                rule_key: Some("avoid-unchecked-layout-cast".into()),
+                ast_grep_suitable: true,
+                attributed_task_id: None,
+                attributed_operation_id: None,
+                attributed_agent_id: None,
+            })
+            .collect::<Vec<_>>();
+        store.record_review_findings(&findings)?;
+        for finding in findings {
+            store.record_review_resolution(&ReviewResolution {
+                finding_id: finding.finding_id,
+                repair_operation_id: operation.operation_id.clone(),
+                source_commit: commits[0].source_commit.clone(),
+                integrated_commit: integrated.commits[0].integrated_commit.clone(),
+            })?;
+        }
+        Ok(())
+    })
+    .await??;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-1"),
+            ev_function_call("scan-call-1", "scan_flowdex_rule_candidates", "{}"),
+            ev_completed("scan-resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("scan-resp-2"),
+            ev_completed("scan-resp-2"),
+        ]),
+    )
+    .await;
+    test.submit_turn("scan candidates").await?;
+    let output = follow_up
+        .function_call_output_text("scan-call-1")
+        .expect("scan output");
+    let output: Value = serde_json::from_str(&output)?;
+    assert_eq!(
+        output["candidates"][0]["ruleKey"],
+        "avoid-unchecked-layout-cast"
+    );
+    assert_eq!(output["candidates"][0]["resolvedOccurrences"], 3);
+    assert_eq!(output["candidates"][0]["examples"][0]["lineStart"], 42);
+    assert_eq!(
+        output["candidates"][0]["examples"][0]["integratedCommit"]
+            .as_str()
+            .map(str::len),
+        Some(40)
+    );
+    Ok(())
 }
 
 #[derive(Clone, Default)]

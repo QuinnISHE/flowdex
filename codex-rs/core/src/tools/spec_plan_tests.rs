@@ -70,6 +70,47 @@ async fn compact_context_is_empty_direct_model_only_tool() {
     );
 }
 
+#[tokio::test]
+async fn scan_flowdex_rule_candidates_is_strict_direct_model_only() {
+    let plan = probe(|_| {}).await;
+    plan.assert_visible_contains(&["scan_flowdex_rule_candidates"]);
+    plan.assert_registered_contains(&["scan_flowdex_rule_candidates"]);
+    assert_eq!(
+        plan.exposure("scan_flowdex_rule_candidates"),
+        ToolExposure::DirectModelOnly
+    );
+    let ToolSpec::Function(tool) = plan.visible_spec("scan_flowdex_rule_candidates") else {
+        panic!("expected scan_flowdex_rule_candidates function spec");
+    };
+    assert!(tool.strict);
+    assert_eq!(
+        serde_json::to_value(&tool.parameters).expect("serialize scan schema"),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    );
+
+    let code_mode = probe(|turn| {
+        set_features(turn, &[Feature::CodeMode]);
+    })
+    .await;
+    assert!(
+        !code_mode
+            .namespace_function_names("tools")
+            .iter()
+            .any(|name| name == "scan_flowdex_rule_candidates")
+    );
+
+    let subagent = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other("ordinary".into()));
+    })
+    .await;
+    subagent.assert_visible_lacks(&["scan_flowdex_rule_candidates"]);
+    subagent.assert_registered_lacks(&["scan_flowdex_rule_candidates"]);
+}
+
 #[derive(Default)]
 struct ToolPlanInputs {
     tool_runtimes: Vec<Arc<dyn CoreToolRuntime>>,

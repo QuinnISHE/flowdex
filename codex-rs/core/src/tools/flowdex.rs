@@ -51,6 +51,7 @@ pub(crate) use context::ReadFlowdexContextHandler;
 pub(crate) use review::FlowdexReviewReportHandler;
 pub(crate) use review::review_report_tool_visible;
 pub(crate) use rules::FlowdexCheckRulesHandler;
+pub(crate) use rules::FlowdexScanRuleCandidatesHandler;
 pub(crate) use scheduler::{
     FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
     FlowdexWaitRunHandler, QueueFlowdexTaskHandler, SealFlowdexPhaseHandler,

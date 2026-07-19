@@ -253,7 +253,7 @@ pub(crate) async fn task_store(
     open_store(&invocation.session, &invocation.turn).await
 }
 
-async fn open_store(
+pub(crate) async fn open_store(
     _session: &std::sync::Arc<crate::session::session::Session>,
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
 ) -> Result<(FlowdexStore, PathBuf, String), FunctionCallError> {

@@ -10,6 +10,7 @@ use crate::tools::flowdex::FlowdexCheckRulesHandler;
 use crate::tools::flowdex::FlowdexQueueTaskHandler;
 use crate::tools::flowdex::FlowdexReviewReportHandler;
 use crate::tools::flowdex::FlowdexRunWorkflowHandler;
+use crate::tools::flowdex::FlowdexScanRuleCandidatesHandler;
 use crate::tools::flowdex::FlowdexSealPhaseHandler;
 use crate::tools::flowdex::FlowdexSignalHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
@@ -238,6 +239,12 @@ fn build_tool_specs_and_registry(
     }
     if review_report_tool_visible(turn_context.session_source.get_agent_path().as_ref()) {
         planned_tools.add_with_exposure(FlowdexReviewReportHandler, ToolExposure::DirectModelOnly);
+    }
+    if !turn_context.session_source.is_non_root_agent() {
+        planned_tools.add_with_exposure(
+            FlowdexScanRuleCandidatesHandler,
+            ToolExposure::DirectModelOnly,
+        );
     }
     let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
         let name = runtime.tool_name();
