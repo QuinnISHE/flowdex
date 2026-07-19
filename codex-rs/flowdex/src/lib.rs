@@ -31,7 +31,7 @@ pub use workflow::write_scope_conflicts;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -131,26 +131,68 @@ const INPUT_OUTPUT_BOOTSTRAP: &str = r#"  requireInput: (schema) => {
   },
   output: (value) => {
     if (__flowdexOutputWritten) throw new TypeError("flowdex.output may only be called once");
-    const seen = new WeakSet();
-    const checkJson = (item, label) => {
-      if (item === null || typeof item === "string" || typeof item === "boolean") return;
-      if (typeof item === "number") { if (!Number.isFinite(item)) throw new TypeError(`${label} must be JSON-compatible`); return; }
-      if (typeof item !== "object" || item === undefined || typeof item === "function" || typeof item === "symbol" || typeof item === "bigint") throw new TypeError(`${label} must be JSON-compatible`);
-      if (seen.has(item)) throw new TypeError(`${label} contains a cycle`); seen.add(item);
-      if (Array.isArray(item)) item.forEach((child, index) => checkJson(child, `${label}[${index}]`));
-      else { if (Object.getPrototypeOf(item) !== Object.prototype || Object.getOwnPropertySymbols(item).length) throw new TypeError(`${label} must be a plain object`); Object.keys(item).forEach((key) => checkJson(item[key], `${label}.${key}`)); }
-      seen.delete(item);
-    };
-    checkJson(value, "output");
+    if (__flowdexRawOutputWritten) throw new TypeError("flowdex.output cannot be mixed with raw text output");
+    __flowdexCheckJson(value, "output");
     const serialized = JSON.stringify(value); if (serialized === undefined) throw new TypeError("output must be JSON-compatible");
-    __flowdexOutputWritten = true; text(serialized);
+    __flowdexOutputWritten = true; __flowdexOutputText(serialized);
   },
   runWorkflow: async (workflow, input = {}) => {
     if (typeof workflow !== "string" || workflow.length === 0) throw new TypeError("runWorkflow.workflow must be a non-empty string");
     if (input === null || typeof input !== "object" || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype) throw new TypeError("runWorkflow.input must be a plain object");
-    try { const serialized = JSON.stringify(input); if (serialized === undefined) throw new Error(); } catch (_) { throw new TypeError("runWorkflow.input must be JSON-compatible"); }
+    __flowdexCheckJson(input, "runWorkflow.input");
+    JSON.stringify(input);
     return tools.flowdex_run_workflow({ workflow, input });
   },
+"#;
+const OUTPUT_TRACKING_BOOTSTRAP: &str = r#"let __flowdexOutputWritten = false;
+let __flowdexRawOutputWritten = false;
+const __flowdexCheckJson = (value, label, seen = new WeakSet()) => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError(`${label} must be JSON-compatible`);
+    return;
+  }
+  if (value === undefined || typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+    throw new TypeError(`${label} must be JSON-compatible`);
+  }
+  if (typeof value !== "object") throw new TypeError(`${label} must be JSON-compatible`);
+  if (seen.has(value)) throw new TypeError(`${label} contains a cycle`);
+  seen.add(value);
+  if (Object.getOwnPropertySymbols(value).length > 0) throw new TypeError(`${label} must not contain symbol properties`);
+  if (Array.isArray(value)) {
+    const keys = Object.getOwnPropertyNames(value).filter((key) => key !== "length");
+    if (keys.length !== value.length || keys.some((key) => !/^\d+$/.test(key) || Number(key) >= value.length || String(Number(key)) !== key)) {
+      throw new TypeError(`${label} must not be sparse or have extra properties`);
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !("value" in descriptor)) throw new TypeError(`${label}[${index}] must be a data property`);
+      __flowdexCheckJson(descriptor.value, `${label}[${index}]`, seen);
+    }
+  } else {
+    if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError(`${label} must be a plain object`);
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) throw new TypeError(`${label}.${key} must be a data property`);
+      __flowdexCheckJson(descriptor.value, `${label}.${key}`, seen);
+    }
+  }
+  seen.delete(value);
+};
+const __flowdexOutputText = typeof globalThis.text === "function" ? globalThis.text.bind(globalThis) : ((value) => text(value));
+const __flowdexWrapRawOutput = (name) => {
+  const original = globalThis[name];
+  if (typeof original !== "function") return;
+  try {
+    globalThis[name] = (...args) => {
+      if (__flowdexOutputWritten) throw new Error("raw text output cannot follow flowdex.output");
+      __flowdexRawOutputWritten = true;
+      return original.apply(globalThis, args);
+    };
+  } catch (_) {}
+};
+__flowdexWrapRawOutput("text");
+__flowdexWrapRawOutput("emit");
 "#;
 const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     const isPlainObject = (value) =>
@@ -377,6 +419,12 @@ impl WorkflowRef {
     }
 
     pub fn resolve_under(&self, eligible_root: &Path) -> Result<PathBuf, WorkflowResolutionError> {
+        reject_link_path(eligible_root).map_err(|_| WorkflowResolutionError::LinkTarget)?;
+        let root_candidate = eligible_root.join(match self.scope {
+            WorkflowScope::Repo => Path::new(".flowdex/workflows"),
+            WorkflowScope::Global => Path::new("flowdex/workflows"),
+        });
+        reject_link_path(&root_candidate).map_err(|_| WorkflowResolutionError::LinkTarget)?;
         let root = eligible_root
             .canonicalize()
             .map_err(WorkflowResolutionError::RootUnavailable)?;
@@ -414,11 +462,11 @@ pub enum WorkflowRefError {
 #[derive(Debug, Error)]
 pub enum WorkflowResolutionError {
     #[error("workflow root is unavailable")]
-    RootUnavailable(std::io::Error),
+    RootUnavailable(#[source] std::io::Error),
     #[error("workflow is outside its root")]
     OutsideWorkflowRoot,
     #[error("workflow was not found")]
-    WorkflowNotFound(std::io::Error),
+    WorkflowNotFound(#[source] std::io::Error),
     #[error("workflow target is not a regular file")]
     NotRegularFile,
     #[error("workflow target uses a link or reparse point")]
@@ -426,7 +474,7 @@ pub enum WorkflowResolutionError {
     #[error("workflow source exceeds the size limit")]
     SourceTooLarge,
     #[error("unable to read workflow source")]
-    Read(std::io::Error),
+    Read(#[source] std::io::Error),
     #[error("workflow source must be non-empty")]
     EmptySource,
 }
@@ -448,6 +496,16 @@ impl WorkflowLoader {
         input: Option<&Value>,
     ) -> Result<LoadedWorkflow, WorkflowLoadError> {
         let relative_path = normalize_workflow_path(workflow_path)?;
+        reject_link_path(self.repository_root.as_path())
+            .map_err(|_| WorkflowLoadError::OutsideWorkflowRoot)?;
+        reject_link_path(
+            &self
+                .repository_root
+                .as_path()
+                .join(WORKFLOW_DIRECTORY[0])
+                .join(WORKFLOW_DIRECTORY[1]),
+        )
+        .map_err(|_| WorkflowLoadError::OutsideWorkflowRoot)?;
         let repository_root = self
             .repository_root
             .canonicalize()
@@ -500,7 +558,7 @@ impl WorkflowLoader {
 
         Ok(LoadedWorkflow {
             source: format!(
-                "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+                "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
             ),
         })
     }
@@ -511,6 +569,12 @@ impl WorkflowLoader {
         eligible_root: &Path,
         input: Option<&Value>,
     ) -> Result<LoadedWorkflow, WorkflowLoadError> {
+        reject_link_path(eligible_root).map_err(|_| WorkflowLoadError::OutsideWorkflowRoot)?;
+        let root_candidate = eligible_root.join(match workflow.scope() {
+            WorkflowScope::Repo => Path::new(".flowdex/workflows"),
+            WorkflowScope::Global => Path::new("flowdex/workflows"),
+        });
+        reject_link_path(&root_candidate).map_err(|_| WorkflowLoadError::OutsideWorkflowRoot)?;
         let root = eligible_root
             .canonicalize()
             .map_err(WorkflowLoadError::repository_root)?;
@@ -566,7 +630,7 @@ fn build_loaded_workflow(
         serde_json::to_string(workflow_path).map_err(WorkflowLoadError::serialize_bootstrap)?;
     Ok(LoadedWorkflow {
         source: format!(
-            "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+            "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
         ),
     })
 }
@@ -703,6 +767,34 @@ fn open_workflow_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn reject_link_path(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if let Ok(metadata) = fs::symlink_metadata(&current) {
+            if is_link_or_reparse(&metadata) {
+                return Err(std::io::Error::other("link or reparse point"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_link_components(root: &Path, target: &Path) -> std::io::Result<()> {
     let relative = target.strip_prefix(root).unwrap_or(target);
     let mut current = root.to_path_buf();
@@ -710,7 +802,7 @@ fn reject_link_components(root: &Path, target: &Path) -> std::io::Result<()> {
         if let Component::Normal(part) = component {
             current.push(part);
             if let Ok(metadata) = fs::symlink_metadata(&current) {
-                if metadata.file_type().is_symlink() {
+                if is_link_or_reparse(&metadata) {
                     return Err(std::io::Error::other("link target"));
                 }
             }
@@ -750,6 +842,7 @@ pub fn save_workflow(
     if source.len() as u64 > MAX_WORKFLOW_SOURCE_BYTES {
         return Err(WorkflowSaveError::SourceTooLarge);
     }
+    reject_link_path(eligible_root).map_err(|_| WorkflowSaveError::LinkTarget)?;
     let root = eligible_root
         .canonicalize()
         .map_err(|_| WorkflowSaveError::RootUnavailable)?;
@@ -759,6 +852,7 @@ pub fn save_workflow(
             .join(GLOBAL_WORKFLOW_DIRECTORY[0])
             .join(GLOBAL_WORKFLOW_DIRECTORY[1]),
     };
+    reject_link_path(&directory).map_err(|_| WorkflowSaveError::LinkTarget)?;
     create_safe_directories(&root, &directory).map_err(WorkflowSaveError::Io)?;
     let directory = directory
         .canonicalize()
@@ -767,23 +861,145 @@ pub fn save_workflow(
         return Err(WorkflowSaveError::OutsideWorkflowRoot);
     }
     let target = directory.join(workflow.workflow_path());
-    reject_link_components(&directory, &target).map_err(|_| WorkflowSaveError::LinkTarget)?;
-    if let Ok(metadata) = fs::symlink_metadata(&target) {
-        if metadata.file_type().is_symlink() {
-            return Err(WorkflowSaveError::LinkTarget);
+    replace_workflow_target(&directory, &target, source)?;
+    Ok(workflow.clone())
+}
+
+fn replace_workflow_target(
+    directory: &Path,
+    target: &Path,
+    source: &str,
+) -> Result<(), WorkflowSaveError> {
+    reject_link_components(directory, target).map_err(|_| WorkflowSaveError::LinkTarget)?;
+    let previous = match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata) {
+                return Err(WorkflowSaveError::LinkTarget);
+            }
+            if !metadata.is_file() {
+                return Err(WorkflowSaveError::NotRegularFile);
+            }
+            Some(metadata)
         }
-        if !metadata.is_file() {
-            return Err(WorkflowSaveError::NotRegularFile);
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(WorkflowSaveError::Io(error)),
+    };
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        target.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(source.as_bytes())?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(std::io::Error::other("temporary target is not regular"));
+        }
+        Ok::<(), std::io::Error>(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(WorkflowSaveError::Io(error));
+    }
+    let current = match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            if is_link_or_reparse(&metadata) {
+                let _ = fs::remove_file(&temporary);
+                return Err(WorkflowSaveError::LinkTarget);
+            }
+            if !metadata.is_file() {
+                let _ = fs::remove_file(&temporary);
+                return Err(WorkflowSaveError::NotRegularFile);
+            }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(WorkflowSaveError::Io(error));
+        }
+    };
+    if !same_target_metadata(previous.as_ref(), current.as_ref()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(WorkflowSaveError::LinkTarget);
+    }
+    atomic_replace(&temporary, target).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        WorkflowSaveError::Io(error)
+    })
+}
+
+fn same_target_metadata(
+    previous: Option<&std::fs::Metadata>,
+    current: Option<&std::fs::Metadata>,
+) -> bool {
+    match (previous, current) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return left.dev() == right.dev() && left.ino() == right.ino();
+            }
+            #[cfg(not(unix))]
+            {
+                left.len() == right.len()
+                    && left.permissions().readonly() == right.permissions().readonly()
+            }
+        }
+        _ => false,
+    }
+}
+
+fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::rename(temporary, target)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let from: Vec<u16> = temporary
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to: Vec<u16> = target
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
-    OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&target)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, source.as_bytes()))
-        .map_err(WorkflowSaveError::Io)?;
-    Ok(workflow.clone())
 }
 
 fn create_safe_directories(root: &Path, directory: &Path) -> std::io::Result<()> {
@@ -793,7 +1009,7 @@ fn create_safe_directories(root: &Path, directory: &Path) -> std::io::Result<()>
         if let Component::Normal(part) = component {
             current.push(part);
             match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+                Ok(metadata) if is_link_or_reparse(&metadata) => {
                     return Err(std::io::Error::other("link"));
                 }
                 Ok(metadata) if !metadata.is_dir() => {
@@ -848,11 +1064,7 @@ mod tests {
                 Some(&json!({"quote": "line\nnext"})),
             )
             .expect("workflow should load");
-        assert!(
-            loaded.source.starts_with(
-                "let __flowdexOutputWritten = false;\nconst flowdex = Object.freeze({"
-            )
-        );
+        assert!(loaded.source.starts_with(OUTPUT_TRACKING_BOOTSTRAP));
         assert!(loaded.source.contains("spawnAgent: async"));
         assert!(loaded.source.contains("sendMessage: async"));
         assert!(loaded.source.contains("waitAgent: async"));
@@ -964,6 +1176,52 @@ mod tests {
             loaded
                 .source
                 .contains("workflowPath: \"global:checks/lint\"")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_linked_workflow_roots_before_canonicalization() {
+        let temp_dir = tempdir().expect("repository");
+        let outside = tempdir().expect("outside");
+        fs::create_dir_all(outside.path().join("workflows")).expect("outside workflows");
+        fs::write(outside.path().join("workflows/hello.js"), "emit('secret');")
+            .expect("outside source");
+        fs::create_dir_all(temp_dir.path().join(".flowdex")).expect("flowdex directory");
+        std::os::unix::fs::symlink(
+            outside.path().join("workflows"),
+            temp_dir.path().join(".flowdex/workflows"),
+        )
+        .expect("workflow symlink");
+        let loader = WorkflowLoader::new(
+            AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute repository"),
+        );
+        assert!(matches!(
+            loader.load(Path::new(".flowdex/workflows/hello.js"), None),
+            Err(WorkflowLoadError::OutsideWorkflowRoot)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlink_target_without_touching_destination() {
+        let temp_dir = tempdir().expect("repository");
+        let outside = tempdir().expect("outside");
+        let workflow_dir = temp_dir.path().join(".flowdex/workflows");
+        fs::create_dir_all(&workflow_dir).expect("workflow directory");
+        let outside_file = outside.path().join("target.js");
+        fs::write(&outside_file, "original").expect("outside source");
+        std::os::unix::fs::symlink(&outside_file, workflow_dir.join("target.js"))
+            .expect("target symlink");
+        let root = temp_dir.path().canonicalize().expect("absolute repository");
+        let workflow = WorkflowRef::parse("repo:target").expect("workflow reference");
+        assert!(matches!(
+            save_workflow(&workflow, &root, "replacement"),
+            Err(WorkflowSaveError::LinkTarget)
+        ));
+        assert_eq!(
+            fs::read_to_string(outside_file).expect("outside source"),
+            "original"
         );
     }
 }
