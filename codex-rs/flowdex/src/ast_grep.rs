@@ -74,6 +74,80 @@ struct LoadedRule {
     rule: RuleConfig<SupportLang>,
 }
 
+/// Returns the exact native IDs declared by approved repository YAML rules.
+pub fn discover_approved_rule_ids(
+    trusted_repository_root: &Path,
+) -> Result<BTreeSet<String>, AstGrepError> {
+    let repository_root = trusted_repository_root
+        .canonicalize()
+        .map_err(AstGrepError::RepositoryRoot)?;
+    let rules_root = repository_root
+        .join(".flowdex")
+        .join("ast-grep")
+        .join("rules");
+    let rules_root = rules_root
+        .canonicalize()
+        .map_err(|_| AstGrepError::RulesDirectory {
+            path: rules_root.clone(),
+        })?;
+    if !rules_root.starts_with(&repository_root) {
+        return Err(AstGrepError::RuleOutsideDirectory { path: rules_root });
+    }
+    let mut ids = BTreeSet::new();
+    let entries = fs::read_dir(&rules_root).map_err(|_| AstGrepError::RulesDirectory {
+        path: rules_root.clone(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| AstGrepError::RuleRead {
+            path: rules_root.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yml") {
+            continue;
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|source| AstGrepError::RuleRead {
+                path: path.clone(),
+                source,
+            })?;
+        if !canonical.starts_with(&rules_root) {
+            return Err(AstGrepError::RuleOutsideDirectory { path });
+        }
+        let source = fs::read_to_string(&canonical).map_err(|source| AstGrepError::RuleRead {
+            path: canonical.clone(),
+            source,
+        })?;
+        let registration = GlobalRules::default();
+        let parsed = from_yaml_string::<SupportLang>(&source, &registration).map_err(|error| {
+            AstGrepError::RuleParse {
+                path: canonical.clone(),
+                message: bounded_error_text(&error.to_string()),
+            }
+        })?;
+        for rule in parsed {
+            if rule.id.trim().is_empty() {
+                return Err(AstGrepError::EmptyRuleId {
+                    path: canonical.clone(),
+                });
+            }
+            if rule.fix.is_some() || rule.rewriters.is_some() {
+                return Err(AstGrepError::RuleRewrite {
+                    path: canonical.clone(),
+                });
+            }
+            if !ids.insert(rule.id.clone()) {
+                return Err(AstGrepError::DuplicateRuleId {
+                    id: rule.id.clone(),
+                    path: canonical.clone(),
+                });
+            }
+        }
+    }
+    Ok(ids)
+}
+
 /// Executes the exact native AST-grep rules selected by Flowdex configuration.
 pub fn run_ast_grep_rules(
     trusted_repository_root: &Path,
@@ -392,5 +466,24 @@ mod tests {
             run_ast_grep_rules(temp.path(), temp.path(), &duplicate),
             Err(AstGrepError::DuplicateRequestedRule { .. })
         ));
+    }
+
+    #[test]
+    fn discovers_exact_native_ids_from_all_approved_yaml() {
+        let temp = tempdir().expect("temp dir");
+        let rules = temp.path().join(".flowdex/ast-grep/rules");
+        fs::create_dir_all(&rules).expect("rules dir");
+        fs::write(
+            rules.join("selected.yml"),
+            "id: selected\nlanguage: JavaScript\nrule:\n  pattern: console.log($$$ARGS)\nmessage: selected\n",
+        )
+        .expect("rule");
+        fs::write(
+            rules.join("always.yml"),
+            "id: always\nlanguage: JavaScript\nrule:\n  pattern: console.error($$$ARGS)\nmessage: always\n",
+        )
+        .expect("rule");
+        let ids = discover_approved_rule_ids(temp.path()).expect("discover IDs");
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), ["always", "selected"]);
     }
 }

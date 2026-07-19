@@ -7,12 +7,14 @@ use crate::workflow::{
     TaskDefinition, WorkflowDefinition, WorkflowValidationError, validate_task_definition,
     write_scope_conflicts,
 };
+use crate::{RuleCandidate, RuleCandidateEvidence, RuleCandidateScanResult};
 use sha2::Digest;
 use sha2::Sha256;
 use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::mem::ManuallyDrop;
@@ -1001,6 +1003,79 @@ impl FlowdexStore {
                 integrated_commit: row.get(3),
             })
             .collect())
+    }
+
+    /// Derives bounded rule candidates from durable, resolved review history.
+    pub fn rule_candidates(
+        &self,
+        threshold: u64,
+        approved_rule_ids: &BTreeSet<String>,
+    ) -> Result<RuleCandidateScanResult, FlowdexStoreError> {
+        if threshold == 0 {
+            return Err(FlowdexStoreError::Integration(
+                "candidate threshold must be positive".into(),
+            ));
+        }
+        let rows = self.runtime.block_on(sqlx::query(
+            "WITH ranked AS (
+                SELECT f.finding_id,f.file,f.line_start,f.line_end,f.reason,f.rule_key,
+                       r.source_commit,
+                       COALESCE(r.integrated_commit,c.integrated_commit) AS integrated_commit,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.finding_id
+                           ORDER BY COALESCE(c.sequence, -1) DESC,
+                                    r.source_commit DESC,
+                                    r.repair_operation_id DESC
+                       ) AS representative
+                FROM review_findings f
+                JOIN review_resolutions r ON r.finding_id=f.finding_id
+                LEFT JOIN task_commits c
+                  ON c.operation_id=r.repair_operation_id
+                 AND c.source_commit=r.source_commit
+                WHERE f.ast_grep_suitable=1
+                  AND TRIM(COALESCE(f.rule_key,'')) <> ''
+                  AND COALESCE(r.integrated_commit,c.integrated_commit) IS NOT NULL
+            )
+            SELECT finding_id,file,line_start,line_end,reason,rule_key,source_commit,integrated_commit
+            FROM ranked
+            WHERE representative=1
+            ORDER BY rule_key,finding_id,file,line_start,line_end,source_commit,integrated_commit",
+        ).fetch_all(&self.pool))?;
+
+        let mut grouped: BTreeMap<String, Vec<RuleCandidateEvidence>> = BTreeMap::new();
+        for row in rows {
+            let rule_key: String = row.get(5);
+            if approved_rule_ids.contains(&rule_key) {
+                continue;
+            }
+            grouped
+                .entry(rule_key)
+                .or_default()
+                .push(RuleCandidateEvidence {
+                    file: row.get(1),
+                    line_start: row.get(2),
+                    line_end: row.get(3),
+                    reason: row.get(4),
+                    source_commit: row.get(6),
+                    integrated_commit: row.get(7),
+                });
+        }
+
+        let threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
+        let candidates = grouped
+            .into_iter()
+            .filter(|(_, examples)| examples.len() >= threshold)
+            .take(50)
+            .map(|(rule_key, mut examples)| RuleCandidate {
+                rule_key,
+                resolved_occurrences: examples.len() as u64,
+                examples: {
+                    examples.truncate(3);
+                    examples
+                },
+            })
+            .collect();
+        Ok(RuleCandidateScanResult { candidates })
     }
 
     /// Returns bounded patches for the supplied task commits. No HEAD or range is inferred.
@@ -2057,6 +2132,64 @@ mod tests {
             integration_worktree: repo.path().into(),
         };
         (repo, home, store, run)
+    }
+
+    #[test]
+    fn derives_rule_candidates_from_resolved_history() {
+        let (_repo, _home, store, _run) = store();
+        for index in 0..4 {
+            let finding_id = format!("finding-{index}");
+            store.runtime.block_on(sqlx::query("INSERT INTO review_findings(finding_id,operation_id,finding_order,file,line_start,line_end,reason,rule_key,ast_grep_suitable) VALUES (?,?,?,?,?,?,?,?,?)")
+                .bind(&finding_id).bind("review").bind(index).bind(format!("src/{index}.rs")).bind(10 + index).bind(10 + index).bind("reason").bind("avoid-cast").bind(1_i64).execute(&store.pool)).unwrap();
+            store.runtime.block_on(sqlx::query("INSERT INTO task_commits(task_id,source_commit,integrated_commit,operation_id,agent_id,model,sequence,summary) VALUES (?,?,?,?,?,?,?,?)")
+                .bind(format!("task-{index}")).bind(format!("source-{index}")).bind(format!("integrated-{index}")).bind(format!("repair-{index}")).bind("agent").bind("model").bind(index).bind("summary").execute(&store.pool)).unwrap();
+            store.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES (?,?,?,NULL)")
+                .bind(&finding_id).bind(format!("repair-{index}")).bind(format!("source-{index}")).execute(&store.pool)).unwrap();
+        }
+        let candidates = store
+            .rule_candidates(3, &std::collections::BTreeSet::new())
+            .expect("candidate scan");
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(candidates.candidates[0].resolved_occurrences, 4);
+        assert_eq!(candidates.candidates[0].examples.len(), 3);
+    }
+
+    #[test]
+    fn candidate_scan_uses_final_repair_and_excludes_ineligible_rows() {
+        let (_repo, _home, store, _run) = store();
+        for (finding_id, suitable, rule_key) in [
+            ("final", 1_i64, Some("stable")),
+            ("unsuitable", 0, Some("stable")),
+            ("blank", 1, Some(" ")),
+            ("unresolved", 1, Some("stable")),
+        ] {
+            store.runtime.block_on(sqlx::query("INSERT INTO review_findings(finding_id,operation_id,finding_order,file,line_start,line_end,reason,rule_key,ast_grep_suitable) VALUES (?,?,?,?,?,?,?,?,?)")
+                .bind(finding_id).bind("review").bind(0_i64).bind(format!("{finding_id}.rs")).bind(1_i64).bind(1_i64).bind("reason").bind(rule_key).bind(suitable).execute(&store.pool)).unwrap();
+        }
+        for (source, integrated, operation, sequence) in [
+            ("old-source", "old-integrated", "repair-old", 1_i64),
+            ("new-source", "new-integrated", "repair-new", 2_i64),
+        ] {
+            store.runtime.block_on(sqlx::query("INSERT INTO task_commits(task_id,source_commit,integrated_commit,operation_id,agent_id,model,sequence,summary) VALUES (?,?,?,?,?,?,?,?)")
+                .bind(operation).bind(source).bind(integrated).bind(operation).bind("agent").bind("model").bind(sequence).bind("summary").execute(&store.pool)).unwrap();
+            store.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES ('final',?,?,NULL)")
+                .bind(operation).bind(source).execute(&store.pool)).unwrap();
+        }
+        // A mismatched source commit must not inherit a task commit's integration.
+        store.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES ('unresolved','repair-old','wrong-source',NULL)").execute(&store.pool)).unwrap();
+        let candidates = store
+            .rule_candidates(1, &std::collections::BTreeSet::new())
+            .expect("candidate scan");
+        assert_eq!(candidates.candidates.len(), 1);
+        assert_eq!(candidates.candidates[0].resolved_occurrences, 1);
+        assert_eq!(
+            candidates.candidates[0].examples[0].source_commit,
+            "new-source"
+        );
+        assert_eq!(
+            candidates.candidates[0].examples[0].integrated_commit,
+            "new-integrated"
+        );
     }
     #[test]
     fn lifecycle_create_commit_integrate() {

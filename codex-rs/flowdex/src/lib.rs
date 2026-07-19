@@ -34,7 +34,9 @@ pub struct RuleCandidateScanResult {
     pub candidates: Vec<RuleCandidate>,
 }
 
-pub use ast_grep::{AstGrepError, AstGrepFinding, AstGrepResult, run_ast_grep_rules};
+pub use ast_grep::{
+    AstGrepError, AstGrepFinding, AstGrepResult, discover_approved_rule_ids, run_ast_grep_rules,
+};
 pub use config::DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
