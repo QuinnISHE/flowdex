@@ -154,9 +154,9 @@ Messages go directly to the target thread without passing through the orchestrat
 - Use these files for defaults, tool profiles, context-gathering agents, round limits, compaction threshold, and AST-grep behavior.
 - Keep one per-repository SQLite database under `$CODEX_HOME/flowdex/`.
 - Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-chunk versions, review history, and rule candidates.
-- Add `codex flowdex install --binary <absolute-path>` on Windows:
+- Add `codex flowdex install --binary <absolute-path>` on Windows and macOS:
   - Validate the compiled Flowdex executable.
-  - Configure the current user’s Codex Windows app backend override.
+  - Configure the current user’s Codex desktop app backend override.
   - Tell the user to restart the app.
 - Determine the app-owned backend environment-variable name during installer implementation because it is outside this CLI repository.
 
