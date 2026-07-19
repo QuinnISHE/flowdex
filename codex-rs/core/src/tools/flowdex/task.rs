@@ -706,6 +706,7 @@ pub(crate) async fn run_task_agent(
                 "name": agent.name,
                 "instructions": agent.instructions,
                 "profile": agent.profile,
+                "tool_profile": agent.tool_profile,
                 "model": agent.model,
                 "reasoning_effort": agent.reasoning_effort,
             }
@@ -728,6 +729,7 @@ pub(crate) async fn run_task_agent_with_review(
                 "name": agent.name,
                 "instructions": agent.instructions,
                 "profile": agent.profile,
+                "tool_profile": agent.tool_profile,
                 "model": agent.model,
                 "reasoning_effort": agent.reasoning_effort,
             }

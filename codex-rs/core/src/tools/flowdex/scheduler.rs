@@ -1992,6 +1992,7 @@ async fn run_task_handler(
                 "name": agent.name,
                 "instructions": agent.instructions,
                 "profile": agent.profile,
+                "tool_profile": agent.tool_profile,
                 "model": agent.model,
                 "reasoning_effort": agent.reasoning_effort,
             }

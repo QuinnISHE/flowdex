@@ -585,6 +585,21 @@ impl WaitFlowdexWorkflowHandler {
                     tokio::task::spawn_blocking(move || store.consume_signal(&run_id, signal_id))
                         .await.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
                         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                    let pending_steer = match turn_state.as_deref() {
+                        Some(turn_state) => session.input_queue.has_pending_user_input_for_turn_state(turn_state).await,
+                        None => false,
+                    };
+                    if pending_steer {
+                        let store = signal_store(&args.run_id).await.ok_or_else(|| FunctionCallError::RespondToModel("Flowdex workflow is not active".into()))?;
+                        let signal_id = pending.id;
+                        let run_id = args.run_id.clone();
+                        let signal = pending.signal.clone();
+                        tokio::task::spawn_blocking(move || store.restore_signal(&run_id, signal_id, &signal))
+                            .await.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                            serde_json::json!({"runId": args.run_id, "status": "steered"}).to_string(), Some(true))));
+                    }
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(
                         serde_json::json!({"runId": args.run_id, "status": "signal", "signal": pending.signal}).to_string(), Some(true))));
                 }

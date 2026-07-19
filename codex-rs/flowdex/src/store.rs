@@ -780,6 +780,22 @@ impl FlowdexStore {
         Ok(())
     }
 
+    pub fn restore_signal(
+        &self,
+        run_id: &str,
+        signal_id: i64,
+        signal: &str,
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(
+            sqlx::query("INSERT INTO pending_signals(signal_id,run_id,signal) VALUES(?,?,?)")
+                .bind(signal_id)
+                .bind(run_id)
+                .bind(signal)
+                .execute(&self.pool),
+        )?;
+        Ok(())
+    }
+
     pub fn run_metadata(&self, run_id: &str) -> Result<RunMetadata, FlowdexStoreError> {
         let row = self
             .runtime
@@ -2378,6 +2394,12 @@ mod tests {
         let first_id = first.id;
         assert_eq!(first.signal, "build-complete");
         store.consume_signal("run", first.id).unwrap();
+        store
+            .restore_signal("run", first.id, &first.signal)
+            .unwrap();
+        let restored = store.oldest_pending_signal("run").unwrap().unwrap();
+        assert_eq!(restored.id, first_id);
+        store.consume_signal("run", restored.id).unwrap();
         let second = store.oldest_pending_signal("run").unwrap().unwrap();
         assert_ne!(second.id, first_id);
         assert_eq!(second.signal, "build-complete");

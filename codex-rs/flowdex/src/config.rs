@@ -22,9 +22,11 @@ pub struct FlowdexConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolProfileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsToml>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
@@ -254,6 +256,8 @@ web_search = "disabled"
             Some(WebSearchMode::Disabled)
         );
         assert_eq!(profiles["docs"].web_search, Some(WebSearchMode::Cached));
+        let serialized = toml::Value::try_from(profiles["docs"].clone()).unwrap();
+        assert_eq!(serialized["web_search"].as_str(), Some("cached"));
     }
 
     #[test]
