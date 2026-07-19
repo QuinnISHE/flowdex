@@ -4,11 +4,11 @@ pub mod context;
 pub mod store;
 pub mod workflow;
 
-pub use ast_grep::{run_ast_grep_rules, AstGrepError, AstGrepFinding, AstGrepResult};
-pub use config::load_config;
+pub use ast_grep::{AstGrepError, AstGrepFinding, AstGrepResult, run_ast_grep_rules};
+pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
-pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+pub use config::load_config;
 pub use context::ContextError;
 pub use context::ContextFragment;
 pub use context::ContextPackDeclaration;
@@ -32,12 +32,12 @@ pub use store::TaskCommit;
 pub use store::TaskDeclaration;
 pub use store::TaskOperation;
 pub use store::TaskRecord;
-pub use workflow::write_scope_conflicts;
 pub use workflow::AgentDefinition;
 pub use workflow::PhaseDefinition;
 pub use workflow::TaskDefinition;
 pub use workflow::WorkflowDefinition;
 pub use workflow::WorkflowValidationError;
+pub use workflow::write_scope_conflicts;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
@@ -1026,7 +1026,7 @@ fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
         };
         let from: Vec<u16> = temporary
             .as_os_str()
@@ -1135,14 +1135,18 @@ mod tests {
         assert!(loaded.source.contains("key !== \"contextMode\""));
         assert!(loaded.source.contains("createTask unknown field"));
         assert!(loaded.source.contains("runAgent unknown field"));
-        assert!(loaded
-            .source
-            .contains("reasoning_effort: agentSpec.reasoningEffort"));
+        assert!(
+            loaded
+                .source
+                .contains("reasoning_effort: agentSpec.reasoningEffort")
+        );
         assert!(!loaded.source.contains("progress: async"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
-        assert!(loaded
-            .source
-            .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#));
+        assert!(
+            loaded
+                .source
+                .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#)
+        );
         assert!(loaded.source.ends_with("emit('hello');"));
     }
 
@@ -1164,9 +1168,11 @@ mod tests {
 
         fs::create_dir(_temp_dir.path().join(".flowdex/workflows/directory.js"))
             .expect("directory workflow");
-        assert!(loader
-            .load(Path::new(".flowdex/workflows/directory.js"), None)
-            .is_err());
+        assert!(
+            loader
+                .load(Path::new(".flowdex/workflows/directory.js"), None)
+                .is_err()
+        );
 
         #[cfg(unix)]
         {
@@ -1217,9 +1223,11 @@ mod tests {
                 None,
             )
             .expect("global workflow");
-        assert!(loaded
-            .source
-            .contains("workflowPath: \"global:checks/lint\""));
+        assert!(
+            loaded
+                .source
+                .contains("workflowPath: \"global:checks/lint\"")
+        );
     }
 
     #[cfg(unix)]

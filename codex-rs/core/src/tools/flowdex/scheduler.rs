@@ -1,7 +1,7 @@
 use super::task::{self, AgentSpec};
 use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::{boxed_tool_output, ToolInvocation, ToolOutput, ToolPayload};
+use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output};
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::{
     FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
@@ -23,7 +23,7 @@ use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 const START: &str = "flowdex_start_run";
@@ -1015,10 +1015,14 @@ async fn collect_context(
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
     };
-    tokio::spawn(run_task_handler(controller.invocation.clone(), task_id, agent))
-        .await
-        .map_err(|e| format!("context collector task panicked for {pack}: {e}"))?
-        .map_err(|e| format!("context collector failed for {pack}: {e}"))?;
+    tokio::spawn(run_task_handler(
+        controller.invocation.clone(),
+        task_id,
+        agent,
+    ))
+    .await
+    .map_err(|e| format!("context collector task panicked for {pack}: {e}"))?
+    .map_err(|e| format!("context collector failed for {pack}: {e}"))?;
     Ok(())
 }
 

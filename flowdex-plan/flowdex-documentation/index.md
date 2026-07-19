@@ -3,6 +3,7 @@
 - [Groundwork](groundwork.md)
 - [Agent workflows](agents.md)
 - [Executable workflows](workflows.md)
+- [Context packs](context-packs.md)
 - [Reusable and nested workflows](reusable-workflows.md)
 - [Silent verification](verification.md)
 - [Progress summaries](progress.md)

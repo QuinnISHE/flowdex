@@ -1,6 +1,6 @@
 use super::task;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::{boxed_tool_output, FunctionToolOutput, ToolInvocation, ToolPayload};
+use crate::tools::context::{FunctionToolOutput, ToolInvocation, ToolPayload, boxed_tool_output};
 use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
 use codex_flowdex::context::{ContextPackStatus, ContextPublication, ContextPublisher};
 use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};

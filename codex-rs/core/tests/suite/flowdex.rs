@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_features::Feature;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -9,7 +10,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
-use codex_protocol::ThreadId;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -25,16 +25,16 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use wiremock::matchers::method;
-use wiremock::matchers::path_regex;
 use wiremock::Mock;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -239,7 +239,27 @@ impl Respond for NestedWorkflowResponder {
 
 impl Respond for SchedulerAgentResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if has_function_call_output(request, "call-scheduler-wait") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-scheduler-parent-2"),
+                ev_completed("resp-scheduler-parent-2"),
+            ]));
+        }
         if has_function_call_output(request, "call-scheduler-outer") {
+            let output: Value = function_call_output_text(request, "call-scheduler-outer")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            if output["status"] == "yielded" {
+                return sse_response(sse(vec![
+                    ev_response_created("resp-scheduler-parent-wait"),
+                    ev_function_call(
+                        "call-scheduler-wait",
+                        "wait_flowdex_workflow",
+                        &serde_json::json!({ "run_id": output["runId"] }).to_string(),
+                    ),
+                    ev_completed("resp-scheduler-parent-wait"),
+                ]));
+            }
             return sse_response(sse(vec![
                 ev_response_created("resp-scheduler-parent-2"),
                 ev_completed("resp-scheduler-parent-2"),
@@ -688,12 +708,14 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
     assert_eq!(replacement_request.body_json()["model"], "gpt-5.4");
     let follow_up_request = follow_up.single_request();
     assert!(!follow_up_request.body_contains_text("completed work: initial"));
-    assert!(server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .all(|request| !body_contains(request, "must not dispatch")));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|request| !body_contains(request, "must not dispatch"))
+    );
     Ok(())
 }
 
@@ -1166,12 +1188,20 @@ text(JSON.stringify(await run.wait()));"#,
     );
 
     let requests = server.received_requests().await.unwrap_or_default();
+    let output_call = if requests
+        .iter()
+        .any(|request| has_function_call_output(request, "call-scheduler-wait"))
+    {
+        "call-scheduler-wait"
+    } else {
+        "call-scheduler-outer"
+    };
     let follow_up_request = requests
         .iter()
-        .find(|request| has_function_call_output(request, "call-scheduler-outer"))
+        .find(|request| has_function_call_output(request, output_call))
         .expect("scheduler output should be returned");
     let output: Value = serde_json::from_str(
-        &function_call_output_text(follow_up_request, "call-scheduler-outer")
+        &function_call_output_text(follow_up_request, output_call)
             .expect("scheduler output should be text"),
     )?;
     assert_eq!(output["status"], "completed", "scheduler output: {output}");

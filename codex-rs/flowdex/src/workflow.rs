@@ -419,9 +419,11 @@ mod tests {
     fn dynamic_requires_existing_open_phase() {
         let mut definition = workflow(vec![]);
         definition.phases[0].open = true;
-        assert!(definition
-            .validate_dynamic_task("phase", &task("new", &[]))
-            .is_ok());
+        assert!(
+            definition
+                .validate_dynamic_task("phase", &task("new", &[]))
+                .is_ok()
+        );
     }
     #[test]
     fn scope_conflict_uses_normalized_roots() {
