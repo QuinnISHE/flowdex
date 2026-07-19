@@ -1452,12 +1452,22 @@ impl FlowdexStore {
     }
 
     pub fn integrate(&self, task_id: &str) -> Result<IntegrationResult, FlowdexStoreError> {
+        self.integrate_inner(task_id, true)
+    }
+
+    pub fn integrate_retained(
+        &self,
+        task_id: &str,
+    ) -> Result<IntegrationResult, FlowdexStoreError> {
+        self.integrate_inner(task_id, false)
+    }
+
+    fn integrate_inner(
+        &self,
+        task_id: &str,
+        cleanup: bool,
+    ) -> Result<IntegrationResult, FlowdexStoreError> {
         let task = self.task(task_id)?;
-        if task.state == "integrated" {
-            return Err(FlowdexStoreError::Integration(
-                "task is already integrated".to_string(),
-            ));
-        }
         if !worktree_clean(&task.worktree_path)? {
             return Err(FlowdexStoreError::Integration(
                 "task worktree has uncommitted changes".to_string(),
@@ -1474,13 +1484,15 @@ impl FlowdexStore {
                 ));
             }
         }
-        self.runtime.block_on(self.integrate_locked(task_id, task))
+        self.runtime
+            .block_on(self.integrate_locked(task_id, task, cleanup))
     }
 
     async fn integrate_locked(
         &self,
         task_id: &str,
         task: TaskRecord,
+        cleanup: bool,
     ) -> Result<IntegrationResult, FlowdexStoreError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE integration_lock SET generation=generation+1 WHERE id=1")
@@ -1513,15 +1525,15 @@ impl FlowdexStore {
                 "task has commits from an incomplete operation".to_string(),
             ));
         }
-        let rows = sqlx::query("SELECT source_commit,agent_id,model,summary FROM task_commits WHERE task_id=? ORDER BY sequence").bind(task_id).fetch_all(&mut *tx).await?;
+        let rows = sqlx::query("SELECT source_commit,integrated_commit,agent_id,model,summary FROM task_commits WHERE task_id=? ORDER BY sequence").bind(task_id).fetch_all(&mut *tx).await?;
         let source: Vec<TaskCommit> = rows
             .into_iter()
             .map(|row| TaskCommit {
                 source_commit: row.get(0),
-                integrated_commit: None,
-                agent_id: row.get(1),
-                model: row.get(2),
-                summary: row.get(3),
+                integrated_commit: row.get(1),
+                agent_id: row.get(2),
+                model: row.get(3),
+                summary: row.get(4),
             })
             .collect();
         let task_head = git_stdout(&task.worktree_path, ["rev-parse", "HEAD"])?;
@@ -1538,7 +1550,10 @@ impl FlowdexStore {
         }
         let pre_head = git_stdout(&self.integration_worktree, ["rev-parse", "HEAD"])?;
         let mut result_commits = Vec::with_capacity(source.len());
-        for commit in &source {
+        for commit in source
+            .iter()
+            .filter(|commit| commit.integrated_commit.is_none())
+        {
             if let Err(error) = git_status(
                 &self.integration_worktree,
                 [
@@ -1574,6 +1589,16 @@ impl FlowdexStore {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
+        if cleanup {
+            if let Err(error) = remove_task_worktree(
+                &self.integration_worktree,
+                &self.worktree_root,
+                &task.worktree_path,
+            ) {
+                rollback_integration(&self.integration_worktree, &pre_head)?;
+                return Err(error);
+            }
+        }
         tx.commit().await?;
         Ok(IntegrationResult {
             task_id: task_id.to_string(),
@@ -1588,6 +1613,27 @@ impl FlowdexStore {
             &self.worktree_root,
             &task.worktree_path,
         )
+    }
+
+    pub fn task_commit_operation(
+        &self,
+        task_id: &str,
+        source_commit: &str,
+    ) -> Result<String, FlowdexStoreError> {
+        self.runtime
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT operation_id FROM task_commits WHERE task_id=? AND source_commit=?",
+                )
+                .bind(task_id)
+                .bind(source_commit)
+                .fetch_optional(&self.pool),
+            )?
+            .ok_or_else(|| {
+                FlowdexStoreError::Integration(format!(
+                    "task commit not found: {task_id}:{source_commit}"
+                ))
+            })
     }
 }
 

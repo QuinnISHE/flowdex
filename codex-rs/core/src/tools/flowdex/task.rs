@@ -825,6 +825,13 @@ pub(crate) async fn verify_task(
 }
 
 async fn handle_integrate(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {
+    handle_integrate_with_cleanup(invocation, true).await
+}
+
+async fn handle_integrate_with_cleanup(
+    invocation: ToolInvocation,
+    cleanup: bool,
+) -> Result<JsonOutput, FunctionCallError> {
     let args: TaskIdArgs = serde_json::from_str(&parse(
         invocation.payload.clone(),
         "flowdex task.integrate expects JSON arguments",
@@ -832,10 +839,16 @@ async fn handle_integrate(invocation: ToolInvocation) -> Result<JsonOutput, Func
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let _gate = task_gate(&args.task_id).await;
     let (store, _, _) = task_store(&invocation).await?;
-    let result = tokio::task::spawn_blocking(move || store.integrate(&args.task_id))
-        .await
-        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-        .map_err(task_error)?;
+    let result = tokio::task::spawn_blocking(move || {
+        if cleanup {
+            store.integrate(&args.task_id)
+        } else {
+            store.integrate_retained(&args.task_id)
+        }
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)?;
     let commits = result.commits.into_iter().map(|commit| serde_json::json!({"sourceCommit": commit.source_commit, "integratedCommit": commit.integrated_commit.unwrap_or_default(), "agentId": commit.agent_id, "model": commit.model, "summary": truncate_message(&commit.summary)})).collect::<Vec<_>>();
     Ok(JsonOutput(
         serde_json::json!({"taskId": result.task_id, "commits": commits}),
@@ -851,6 +864,16 @@ pub(crate) async fn integrate_task(
         arguments: serde_json::json!({"task_id": task_id}).to_string(),
     };
     handle_integrate(invocation).await
+}
+
+pub(crate) async fn integrate_task_retained(
+    mut invocation: ToolInvocation,
+    task_id: String,
+) -> Result<JsonOutput, FunctionCallError> {
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({"task_id": task_id}).to_string(),
+    };
+    handle_integrate_with_cleanup(invocation, false).await
 }
 
 pub(crate) fn task_associated_agent(id: ThreadId) -> Option<String> {

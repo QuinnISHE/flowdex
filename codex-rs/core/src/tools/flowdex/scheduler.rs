@@ -11,8 +11,8 @@ use codex_flowdex::context::{
     ContextPackDeclaration, ContextPackStatus, ContextStaleSource, ResolvedContextPack,
 };
 use codex_flowdex::store::{
-    FlowdexStore, FlowdexStoreError, PendingBoundary, RunInfo, RunState, SchedulerTaskState,
-    TaskDeclaration,
+    FlowdexStore, FlowdexStoreError, PendingBoundary, ReviewFinding, ReviewResolution, RunInfo,
+    RunState, SchedulerTaskState, TaskDeclaration,
 };
 use codex_flowdex::workflow::ContextPackDefinition;
 use codex_flowdex::{
@@ -726,36 +726,7 @@ async fn run_phase(
                 }
             }
             if let Some(review) = phase.review.as_ref() {
-                let first = all
-                    .first()
-                    .ok_or_else(|| "phase review requires a task".to_string())?;
-                let details = {
-                    let store = Arc::clone(&controller.store);
-                    let task_id = first.task_id.clone();
-                    tokio::task::spawn_blocking(move || store.scheduler_task(&task_id))
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?
-                };
-                let task_def = controller
-                    .definition
-                    .lock()
-                    .await
-                    .phases
-                    .get(index)
-                    .and_then(|p| p.tasks.iter().find(|task| task.name == details.name))
-                    .cloned()
-                    .ok_or_else(|| "phase review task definition missing".to_string())?;
-                review_task(
-                    controller,
-                    &first.task_id,
-                    &task_def,
-                    review,
-                    Some(controller.info.integration_worktree.clone()),
-                    "phase",
-                    &phase.name,
-                )
-                .await?;
+                run_phase_review(controller, &phase, review, &all).await?;
                 for task in &all {
                     let store = Arc::clone(&controller.store);
                     let task_id = task.task_id.clone();
@@ -886,8 +857,13 @@ async fn run_phase(
                 }
                 continue;
             }
-            if let Err((stage, error)) =
-                complete_task(controller, &scheduled.task_id, &task_def).await
+            if let Err((stage, error)) = complete_task(
+                controller,
+                &scheduled.task_id,
+                &task_def,
+                phase.review.is_some(),
+            )
+            .await
             {
                 let store = Arc::clone(&controller.store);
                 let task_id = scheduled.task_id.clone();
@@ -898,13 +874,6 @@ async fn run_phase(
                 )
                 .await;
                 first_error.get_or_insert(error);
-            } else if phase.review.is_none() {
-                let store = Arc::clone(&controller.store);
-                let task_id = scheduled.task_id.clone();
-                tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())?;
             }
         }
         if let Some(error) = first_error {
@@ -1147,6 +1116,7 @@ async fn complete_task(
     controller: &Arc<RunController>,
     task_id: &str,
     task_def: &TaskDefinition,
+    retain_worktree: bool,
 ) -> Result<(), (String, String)> {
     if !task_def.verification.is_empty() {
         let mut repairs = 0usize;
@@ -1240,9 +1210,13 @@ async fn complete_task(
         format!("Integrating task: {}", task_def.name),
     )
     .await;
-    run_integrate_handler(controller.invocation.clone(), task_id.to_string())
-        .await
-        .map_err(|error| ("integration".to_string(), error.to_string()))?;
+    run_integrate_handler(
+        controller.invocation.clone(),
+        task_id.to_string(),
+        retain_worktree,
+    )
+    .await
+    .map_err(|error| ("integration".to_string(), error.to_string()))?;
     let store = Arc::clone(&controller.store);
     let id = task_id.to_string();
     tokio::task::spawn_blocking(move || store.mark_task_integrated(&id))
@@ -1307,6 +1281,373 @@ async fn await_boundary(
     )
     .await;
     Ok(())
+}
+
+async fn run_phase_review(
+    controller: &Arc<RunController>,
+    phase: &PhaseDefinition,
+    review: &ReviewDefinition,
+    tasks: &[codex_flowdex::store::ScheduledTask],
+) -> Result<(), String> {
+    let first = tasks
+        .first()
+        .ok_or_else(|| "phase review requires a task".to_string())?;
+    let reviewer = controller
+        .definition
+        .lock()
+        .await
+        .agents
+        .get(&review.agent)
+        .cloned()
+        .ok_or_else(|| format!("review agent {} is missing", review.agent))?;
+
+    for round in 1..=review.max_rounds {
+        progress(
+            &controller.invocation,
+            format!(
+                "Reviewing phase: {} (round {round}/{})",
+                phase.name, review.max_rounds
+            ),
+        )
+        .await;
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let phase_name = phase.name.clone();
+        tokio::task::spawn_blocking(move || {
+            store.increment_phase_review_rounds(&run_id, &phase_name)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+        let base_commit = {
+            let store = Arc::clone(&controller.store);
+            let task_id = first.task_id.clone();
+            tokio::task::spawn_blocking(move || store.task(&task_id))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+                .base_commit
+        };
+        let diff = phase_diff(controller, &base_commit).await?;
+        let operation = codex_flowdex::store::ReviewOperation {
+            operation_id: Uuid::new_v4().to_string(),
+            run_id: controller.id.clone(),
+            scope_kind: "phase".into(),
+            scope_id: phase.name.clone(),
+            round: round as i64,
+            reviewer_thread_id: String::new(),
+            state: "pending".into(),
+        };
+        let operation_id = operation.operation_id.clone();
+        let store = Arc::clone(&controller.store);
+        let operation_for_store = operation.clone();
+        tokio::task::spawn_blocking(move || store.record_review_operation(&operation_for_store))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let reviewer_agent = AgentSpec {
+            name: format!("review-{}-{}", phase.name, round),
+            instructions: format!(
+                "{}\n\nReview the integrated phase diff below against the phase requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nPhase requirements:\n{}\n\nIntegrated diff:\n{}",
+                review.instructions, phase.instructions, diff
+            ),
+            profile: reviewer.profile.clone(),
+            model: reviewer.model.clone(),
+            reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
+        };
+        let reviewer_result = task::run_task_agent_with_review(
+            controller.invocation.clone(),
+            first.task_id.clone(),
+            reviewer_agent,
+            task::ReviewDispatch {
+                operation: operation.clone(),
+                store: Arc::clone(&controller.store),
+                worktree: Some(controller.info.integration_worktree.clone()),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let reviewer_thread_id = reviewer_result
+            .code_mode_result(&ToolPayload::Function {
+                arguments: serde_json::json!({"task_id": first.task_id}).to_string(),
+            })
+            .get("agentId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !reviewer_thread_id.is_empty() {
+            let store = Arc::clone(&controller.store);
+            let mut accepted = operation.clone();
+            accepted.reviewer_thread_id = reviewer_thread_id;
+            accepted.state = "accepted".into();
+            tokio::task::spawn_blocking(move || store.record_review_operation(&accepted))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+        let store = Arc::clone(&controller.store);
+        let accepted = tokio::task::spawn_blocking({
+            let id = operation_id.clone();
+            move || store.review_operation(&id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        if accepted.state != "accepted" {
+            return Err("review agent completed without a report".into());
+        }
+        let store = Arc::clone(&controller.store);
+        let findings = tokio::task::spawn_blocking({
+            let id = operation_id.clone();
+            move || store.review_findings(&id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let mut attributed = Vec::with_capacity(findings.len());
+        for finding in findings {
+            let head = integration_head(&controller.info.integration_worktree).await?;
+            let store = Arc::clone(&controller.store);
+            let finding_id = finding.finding_id.clone();
+            let integration = controller.info.integration_worktree.clone();
+            let attribution = tokio::task::spawn_blocking(move || {
+                store.attribute_review_finding(&finding_id, &integration, &head)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            let Some(attribution) = attribution else {
+                return phase_review_boundary(
+                    controller,
+                    phase,
+                    format!("Unattributed phase review finding: {}", finding.reason),
+                )
+                .await;
+            };
+            attributed.push((finding, attribution));
+        }
+        let grouped = group_phase_findings(attributed);
+        if round == review.max_rounds {
+            return phase_review_boundary(
+                controller,
+                phase,
+                format!("Phase review exhausted after {} rounds", review.max_rounds),
+            )
+            .await;
+        }
+        let repairs = join_all(grouped.into_iter().map(|(task_id, task_findings)| {
+            let controller = Arc::clone(controller);
+            let phase = phase.clone();
+            async move { repair_phase_task(&controller, &phase, &task_id, &task_findings).await }
+        }))
+        .await;
+        if let Some(error) = repairs.into_iter().find_map(Result::err) {
+            return Err(error);
+        }
+        if !phase.verification.is_empty() {
+            verify_commands(controller, &phase.verification).await?;
+        }
+    }
+    Ok(())
+}
+
+fn group_phase_findings(
+    findings: Vec<(ReviewFinding, codex_flowdex::store::ReviewAttribution)>,
+) -> HashMap<String, Vec<(ReviewFinding, codex_flowdex::store::ReviewAttribution)>> {
+    let mut grouped = HashMap::new();
+    for (finding, attribution) in findings {
+        grouped
+            .entry(attribution.task_id.clone())
+            .or_insert_with(Vec::new)
+            .push((finding, attribution));
+    }
+    grouped
+}
+
+async fn repair_phase_task(
+    controller: &Arc<RunController>,
+    phase: &PhaseDefinition,
+    task_id: &str,
+    findings: &[(ReviewFinding, codex_flowdex::store::ReviewAttribution)],
+) -> Result<(), String> {
+    progress(
+        &controller.invocation,
+        format!("Repairing phase review: {}", task_id),
+    )
+    .await;
+    let details = {
+        let store = Arc::clone(&controller.store);
+        let id = task_id.to_string();
+        tokio::task::spawn_blocking(move || store.scheduler_task(&id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+    };
+    let task_def = controller
+        .definition
+        .lock()
+        .await
+        .phases
+        .iter()
+        .find(|candidate| candidate.name == phase.name)
+        .and_then(|candidate| {
+            candidate
+                .tasks
+                .iter()
+                .find(|task| task.name == details.name)
+        })
+        .cloned()
+        .ok_or_else(|| "phase repair task definition missing".to_string())?;
+    let repair = findings
+        .iter()
+        .map(|(finding, _)| {
+            format!(
+                "{}:{}-{}: {}",
+                finding.file, finding.line_start, finding.line_end, finding.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let agent_def = controller
+        .definition
+        .lock()
+        .await
+        .agents
+        .get(&task_def.agent)
+        .cloned()
+        .ok_or_else(|| "phase repair agent missing".to_string())?;
+    run_task_handler(
+        controller.invocation.clone(),
+        task_id.to_string(),
+        AgentSpec {
+            name: task_def.name.clone(),
+            instructions: format!(
+                "Repair these phase review findings, rerun verification, and commit:\n{repair}\n\n{}",
+                task_def.instructions
+            ),
+            profile: agent_def.profile,
+            model: agent_def.model,
+            reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !task_def.verification.is_empty() {
+        let output = run_verify_handler(controller.invocation.clone(), task_id.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+        if output
+            .code_mode_result(&ToolPayload::Function {
+                arguments: serde_json::json!({"task_id": task_id}).to_string(),
+            })
+            .get("passed")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Err(format!(
+                "phase repair failed verification for {}",
+                task_def.name
+            ));
+        }
+    }
+    let integrated =
+        run_integrate_handler(controller.invocation.clone(), task_id.to_string(), true)
+            .await
+            .map_err(|e| e.to_string())?;
+    let commits = integrated
+        .code_mode_result(&ToolPayload::Function {
+            arguments: serde_json::json!({"task_id": task_id}).to_string(),
+        })
+        .get("commits")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| "phase repair integration omitted commits".to_string())?;
+    for (finding, _) in findings {
+        for commit in &commits {
+            let source_commit = commit
+                .get("sourceCommit")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "phase repair commit omitted sourceCommit".to_string())?;
+            let integrated_commit = commit
+                .get("integratedCommit")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let store = Arc::clone(&controller.store);
+            let task_id = task_id.to_string();
+            let source = source_commit.to_string();
+            let operation_id =
+                tokio::task::spawn_blocking(move || store.task_commit_operation(&task_id, &source))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+            let resolution = ReviewResolution {
+                finding_id: finding.finding_id.clone(),
+                repair_operation_id: operation_id,
+                source_commit: source_commit.to_string(),
+                integrated_commit,
+            };
+            let store = Arc::clone(&controller.store);
+            tokio::task::spawn_blocking(move || store.record_review_resolution(&resolution))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+async fn phase_review_boundary(
+    controller: &Arc<RunController>,
+    phase: &PhaseDefinition,
+    reason: String,
+) -> Result<(), String> {
+    let boundary = if phase.boundary == Boundary::Human {
+        Boundary::Human
+    } else {
+        Boundary::Orchestrator
+    };
+    await_boundary(controller, "phase", &phase.name, boundary, reason).await
+}
+
+async fn integration_head(path: &std::path::Path) -> Result<String, String> {
+    tokio::task::spawn_blocking({
+        let path = path.to_path_buf();
+        move || {
+            Command::new("git")
+                .current_dir(path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn phase_diff(controller: &Arc<RunController>, base_commit: &str) -> Result<String, String> {
+    let path = controller.info.integration_worktree.clone();
+    let base = base_commit.to_string();
+    tokio::task::spawn_blocking(move || {
+        Command::new("git")
+            .current_dir(path)
+            .args(["diff", &base, "HEAD"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .chars()
+                    .take(64 * 1024)
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn review_task(
@@ -1571,7 +1912,13 @@ async fn run_verify_handler(
 async fn run_integrate_handler(
     mut invocation: ToolInvocation,
     task_id: String,
+    retain_worktree: bool,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    if retain_worktree {
+        return task::integrate_task_retained(invocation, task_id)
+            .await
+            .map(|output| Box::new(output) as Box<dyn ToolOutput>);
+    }
     invocation.payload = ToolPayload::Function {
         arguments: serde_json::json!({"task_id": task_id}).to_string(),
     };
@@ -1622,4 +1969,74 @@ async fn progress(invocation: &ToolInvocation, text: String) {
         .session
         .emit_flowdex_progress(&invocation.turn, item)
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(id: &str, order: i64) -> ReviewFinding {
+        ReviewFinding {
+            finding_id: id.into(),
+            operation_id: "review".into(),
+            finding_order: order,
+            file: "src/lib.rs".into(),
+            line_start: order,
+            line_end: order,
+            reason: "repair".into(),
+            rule_key: None,
+            ast_grep_suitable: false,
+            attributed_task_id: None,
+            attributed_operation_id: None,
+            attributed_agent_id: None,
+        }
+    }
+
+    fn attribution(
+        finding_id: &str,
+        task_id: &str,
+        operation_id: &str,
+    ) -> codex_flowdex::store::ReviewAttribution {
+        codex_flowdex::store::ReviewAttribution {
+            finding_id: finding_id.into(),
+            task_id: task_id.into(),
+            operation_id: operation_id.into(),
+            agent_id: format!("agent-{task_id}"),
+            source_commit: format!("source-{task_id}"),
+            integrated_commit: format!("integrated-{task_id}"),
+        }
+    }
+
+    #[test]
+    fn phase_review_groups_findings_by_attributed_task() {
+        let grouped = group_phase_findings(vec![
+            (
+                finding("f-alpha", 1),
+                attribution("f-alpha", "task-alpha", "op-alpha"),
+            ),
+            (
+                finding("f-beta", 2),
+                attribution("f-beta", "task-beta", "op-beta"),
+            ),
+            (
+                finding("f-beta-2", 3),
+                attribution("f-beta-2", "task-beta", "op-beta-2"),
+            ),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped["task-alpha"]
+                .iter()
+                .map(|(finding, _)| finding.finding_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f-alpha"]
+        );
+        assert_eq!(
+            grouped["task-beta"]
+                .iter()
+                .map(|(finding, _)| finding.finding_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f-beta", "f-beta-2"]
+        );
+    }
 }
