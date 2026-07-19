@@ -40,16 +40,15 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **Desktop app-backend installer (Batch 014):** `codex flowdex install --binary <path>` validates a compiled Codex executable and persistently selects it through `CODEX_CLI_PATH` for the current Windows or macOS user. Windows uses the user environment registry; macOS maintains an idempotent marked block in the supported login-shell profile. Other platforms and unsupported shells fail without mutation.
 - **Context packs (Batch 013):** workflows declare named packs and task requirements; immutable fragments are persisted with source hashes and supersession, missing or stale packs dispatch one ordinary collector, unrelated ready tasks continue concurrently, and only dependent task prompts receive bounded fresh context.
 - **Review, repair, and boundaries (Batch 015):** task verification can repair through the declared task agent, task and phase reviews use any declared agent plus a review-only structured reporting tool, findings route through exact commit attribution, verification and review budgets remain independent, and orchestrator/human boundaries suspend event-driven without consuming steering. Generic multi-agent rounds remain ordinary role-neutral JavaScript loops over messaging and resume primitives.
+- **Agent tool profiles and named signals (Batch 016):** strict global/repository tool-only profiles compose with normal `.codex/agents` profiles and explicit model/reasoning overrides, while persisted FIFO signals wake workflow waits without a model call or loss during steering.
 
 ### Partial or correction needed
 
-- **Workflow authoring API:** run/phase/task scheduling, reusable nested workflows, context requirements, review/repair, and boundaries are settled. Tool profiles remain the final additive language slice.
-- **Workflow event wait:** V8-cell completion, scheduler completion/escalation/boundaries, and user steering are event-driven. Explicit named workflow signals remain.
-- **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles remain; agent selectors and round budgets stay explicit workflow data rather than unused global defaults.
+- No known contract correction remains. The next batch completes the final requested backend feature before the cohesive completion pass.
 
 ### In progress
 
-- **Agent tool profiles and named signals (Batch 016):** add tool-only global/repository profiles that compose with normal `.codex/agents` profiles, correct Flowdex-specific model/reasoning override precedence, and add a persisted FIFO signal that wakes the existing event-driven workflow wait without a model call at publication time.
+- **Review-history rule promotion (Batch 017):** derive repository AST-grep candidates from repeated resolved review findings, expose them through a user-started read-only scan, and document the individually approved rule-writing flow over the accepted Batch 011 rule format.
 
 ## Remaining durable feature slices
 
@@ -136,19 +135,21 @@ Add versioned, immutable context fragments grouped into named packs. A newer fra
 
 If required context is absent or stale, queue a bounded context-gathering task, suspend only dependent tasks, and resume them when the fragment is published. Escalate only when collection fails. Keep fragments and injected packs bounded.
 
-### 8. Agent and tool profiles
+### 8. Agent and tool profiles — complete (Batch 016)
 
 Complete workflow-level reusable agent declarations using model, reasoning effort, existing `.codex/agents` profiles, and optional Flowdex tool profiles. Agent roles remain instructions and tool access, never worker/reviewer/explorer runtime enums.
 
 Expand global and trusted-repository configuration for named tool profiles, alongside the already consumed compaction and AST-grep settings. Do not add unused configuration defaults for values already explicit in a workflow.
 
-Batch 016 completes the remaining tool-profile composition. Existing `.codex/agents` profiles stay authoritative for reusable agent defaults, while selectors and operation budgets remain explicit in workflow definitions.
+Batch 016 completed tool-profile composition and named workflow signals. Existing `.codex/agents` profiles remain reusable agent defaults, Flowdex tool profiles remain tool-only overlays, and explicit model/reasoning values remain final overrides. Selectors and operation budgets stay explicit in workflow definitions.
 
-### 9. Review history and AST-grep rule promotion
+### 9. Review history and AST-grep rule promotion — in progress (Batch 017)
 
 Persist findings and the commits that resolve them. Group repeated resolved findings by the reviewer-provided stable rule key and expose candidates after the configured repetition count. Do not add model-based background clustering.
 
 A user-started action may dispatch the future rule-writing agent or skill. Each repository rule requires individual human approval and is then configured as always-on verification or explicitly requested by a workflow.
+
+Batch 017 derives candidates from the durable finding/resolution source of truth rather than duplicating candidate state. The read-only scan never writes rules or starts a model in the background; after a user approves an exact proposal, ordinary repository editing writes the accepted Batch 011 YAML/config format.
 
 ### 10. Cohesive completion pass
 
@@ -197,6 +198,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted Batch 016 and fast-forwarded `codex/flowdex` to `fc6a8f03b1`. Tool-profile precedence and propagation are complete, and persisted FIFO named signals now wake event-driven waits without model/history output while preserving steering. Started Batch 017 for the remaining AST-grep candidate-promotion backend.
 - **2026-07-19:** Started Batch 016 from authoritative commit `e360b5fe6c`. It combines the final agent tool-profile composition with named workflow signals. The config/profile and signal/wait paths can proceed in parallel after one shared contract; process-restart controller recovery remains optional, out-of-scope machinery.
 - **2026-07-19:** Accepted Batch 015 and fast-forwarded `codex/flowdex` to `e360b5fe6c`. Verification repair, generic task/phase reviews, exact attribution routing, independent budgets, retained reviewed worktrees, and event-driven orchestrator/human boundaries are complete. Review-specific behavior is limited to the structured report tool; arbitrary agent rounds remain workflow-authored JavaScript.
 - **2026-07-19:** Started Batch 015 from authoritative commit `59a9acbf90`. The batch combines verification repair, structured task/phase review attribution, direct repair routing, independent budgets, and event-driven boundaries. Generic multi-agent rounds remain workflow-defined JavaScript control flow over role-neutral messaging and resume primitives.

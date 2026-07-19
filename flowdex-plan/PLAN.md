@@ -2,7 +2,7 @@
 
 ## Summary
 
-Flowdex adds model-authored JavaScript workflows to the Codex backend. The planner saves a workflow under `.flowdex/workflows/` and starts it through a model tool. The runtime then manages agents, task queues, verification, reviews, context, and event-driven suspension without repeatedly waking the orchestrator.
+Flowdex adds model-authored JavaScript workflows to the Codex backend. The planner can save a repository workflow under `.flowdex/workflows/` or a reusable global workflow under `$CODEX_HOME/flowdex/workflows/`, then start it through a model tool. The runtime manages agents, task queues, verification, reviews, context, nested workflows, and event-driven suspension without repeatedly waking the orchestrator.
 
 Plain JavaScript runs through Codex's existing native V8 code-mode runtime. Rust owns durable orchestration, Git worktrees, events, attribution, and SQLite state.
 
@@ -31,6 +31,37 @@ Plain JavaScript runs through Codex's existing native V8 code-mode runtime. Rust
 - Agents may also reference a Flowdex tool profile. Named agent profiles provide defaults; explicit workflow settings override only the fields they specify.
 - No worker, reviewer, or explorer role is encoded in the runtime. Any agent may implement, inspect, gather context, or review when given the corresponding instructions and tools.
 
+### Saved and nested workflows
+
+- Entry workflows and reusable workflows use the same saved JavaScript format. An implementation plan is one workflow shape, not a separate runtime type.
+- Repository workflows live under `.flowdex/workflows/`. Global workflows live under `$CODEX_HOME/flowdex/workflows/` and are available across trusted repositories.
+- References identify their scope explicitly, such as `repo:documentation/check` or `global:documentation/check`, so repository files never silently shadow global files.
+- A saved workflow may declare a strict JSON-compatible input object schema using the same small object/property/required vocabulary used by Codex tool schemas. Flowdex validates input before starting the workflow and exposes only the validated value to its JavaScript.
+- A workflow may conditionally invoke another saved workflow, pass validated input, await it without a model turn, and receive a JSON-compatible result.
+- Nested runs retain their workflow identity and parent run relationship. They reuse normal scheduler state, automatic progress, app-visible agent events, cancellation, and event-driven waiting.
+- Parent cancellation propagates to active nested runs. User steering still wakes the orchestrator without implicitly cancelling either run.
+- Reject an active-chain workflow cycle rather than allowing accidental recursive execution. Do not add a second JavaScript runtime or a generic import/package system.
+- Provide one scoped model authoring operation for saving or updating named workflows. It may write only beneath the selected repository or global workflow root; repository workflow authoring and execution remain trust-gated.
+
+### JavaScript authoring model
+
+The language stays ordinary asynchronous JavaScript with a small Flowdex API. A saved file declares its input contract and workflow body; the body may construct one implementation run, invoke reusable child workflows, or do both conditionally.
+
+The intended durable vocabulary is:
+
+- **Workflow definition:** name, strict input schema, and asynchronous body.
+- **Run definition:** reusable agents, run verification, and ordered phase definitions.
+- **Phase definition:** inherited instructions, tasks, verification, review, boundary behavior, and whether its dynamic queue is open.
+- **Task definition:** name, selected agent, instructions, dependencies, advisory scopes, verification, review, context requirements, and boundary behavior.
+- **Nested workflow invocation:** scoped workflow name plus input, returning a structured result.
+- **Dynamic control:** queue a task into an open phase, seal the phase, and await the run.
+- **Agent control:** spawn or resume an agent and send direct agent-to-agent messages when the high-level task scheduler is not the right abstraction.
+- **Verification and review:** execute structured verification and route structured findings without hard-coding worker or reviewer roles.
+- **Context:** request a context pack and publish or supersede a fragment.
+- **Suspension:** await scheduler state, agent completion, signals, messages, or steering without polling.
+
+Common implementation workflows should mostly use run, phase, and task declarations. The lower-level agent and verification primitives remain available for generic workflows that do not fit the implementation-task lifecycle. Automatic progress is runtime-owned and intentionally absent from this vocabulary.
+
 ### Generic primitives
 
 - Spawn or resume an agent.
@@ -40,8 +71,10 @@ Plain JavaScript runs through Codex's existing native V8 code-mode runtime. Rust
 - Run an agent with a selected tool profile.
 - Route structured findings through commit attribution.
 - Await workflow, agent, command, message, signal, or user-steering events.
-  - Publish or supersede a context chunk.
-- Emit a workflow progress summary.
+- Invoke a saved repository or global workflow with validated input and receive its structured result.
+- Publish or supersede a context fragment.
+
+Workflow progress is automatic runtime behavior attached to scheduler transitions. It is not a model-callable or workflow-callable primitive.
 
 Messages go directly to the target thread without passing through the orchestrator. A busy agent receives the message at its next safe boundary; an idle reusable agent is resumed. Delivery does not create an orchestrator turn.
 
@@ -82,24 +115,24 @@ Messages go directly to the target thread without passing through the orchestrat
 
 ## Context Packs
 
-- Flowdex context chunks are immutable and versioned.
-- Each chunk records:
-  - Pack and chunk key.
+- Context fragments are immutable and versioned.
+- Each fragment records:
+  - Pack and fragment key.
   - Captured content.
   - Source file and line range.
   - Source commit.
-  - The chunk version it supersedes, when applicable.
-- Agents update context by publishing a new chunk that supersedes the previous version. Historical runs retain the exact version they consumed.
-- When an integrated commit changes lines covered by a chunk, mark that chunk stale.
-- Pack resolution selects the newest non-stale chunk for each key.
-- Existing agent prompts remain stable; updated chunks apply to later task dispatches.
-- If a required chunk is missing or stale:
+  - The fragment version it supersedes, when applicable.
+- Agents update context by publishing a new fragment that supersedes the previous version. Historical runs retain the exact version they consumed.
+- When an integrated commit changes lines covered by a fragment, mark that fragment stale.
+- Pack resolution selects the newest non-stale fragment for each key.
+- Existing agent prompts remain stable; updated fragments apply to later task dispatches.
+- If a required fragment is missing or stale:
   - Automatically queue a context-gathering task using the configured agent and tool profile.
   - Suspend only the dependent task while collection runs.
   - Resume the task when refreshed context is published.
   - Escalate to the orchestrator only if the bounded collection attempt fails.
 - Context is injected directly into the consuming agent’s prompt and never routed through the orchestrator.
-- Keep individual chunks and total injected packs within the existing bounded-context requirements. Codex's existing context-fragment/context-fragment-update protocol naming remains unchanged where referenced.
+- Keep individual fragments and total injected packs within the existing bounded-context requirements.
 
 ## Events, Steering, and Progress
 
@@ -151,12 +184,12 @@ Messages go directly to the target thread without passing through the orchestrat
 - Save this plan as `Flowdex Plan.md` when implementation begins.
 - Load global settings from `$CODEX_HOME/flowdex.toml`.
 - Overlay repository settings from `.flowdex/config.toml`.
-- Use these files for defaults, tool profiles, context-gathering agents, round limits, compaction threshold, and AST-grep behavior.
+- Use these files for tool profiles, compaction threshold, AST-grep behavior, and other defaults only when a completed feature consumes them. Keep agent selection and round budgets explicit in workflow definitions.
 - Keep one per-repository SQLite database under `$CODEX_HOME/flowdex/`.
-- Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-chunk versions, review history, and rule candidates.
-- Add `codex flowdex install --binary <absolute-path>` on Windows and macOS:
+- Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-fragment versions, and review history. Derive rule candidates from that durable history instead of duplicating candidate state.
+- Add `codex flowdex install --binary <absolute-path>` on Windows:
   - Validate the compiled Flowdex executable.
-  - Configure the current user’s Codex desktop app backend override.
+  - Configure the current user’s Codex Windows app backend override.
   - Tell the user to restart the app.
 - Determine the app-owned backend environment-variable name during installer implementation because it is outside this CLI repository.
 
@@ -166,7 +199,7 @@ Messages go directly to the target thread without passing through the orchestrat
 - Verify passing commands cause no additional model turn and failed commands return to the selected repair agent.
 - Verify verification and review consume independent budgets.
 - Verify structured findings route through commit attribution without a hard-coded reviewer role.
-- Verify stale chunks are superseded and missing context queues a context-gathering task.
+- Verify stale fragments are superseded and missing context queues a context-gathering task.
 - Verify a pending event wait wakes immediately on user steering.
 - Verify progress summaries reach app-server clients but never appear in the next model request.
 - Verify human approval/revision and the three context-reuse modes.
@@ -174,7 +207,7 @@ Messages go directly to the target thread without passing through the orchestrat
 
 ## Defaults and Boundaries
 
-- Flowdex uses the existing native V8 code-mode runtime; Node is not required for workflow execution.
+- Flowdex JavaScript runs in Codex's existing native V8 code-mode runtime; Node is not a prerequisite.
 - The model starts workflows; no manual workflow-run CLI is added initially.
 - The older workflow example and repair/review loop are behavioral examples, not API compatibility requirements.
 - File scopes remain advisory.
