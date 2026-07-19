@@ -134,8 +134,13 @@ async fn publish_call(invocation: ToolInvocation) -> Result<FunctionToolOutput, 
     let args: PublishArgs = serde_json::from_str(&arguments(invocation.clone(), PUBLISH)?)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     let task_record = associated_context(&invocation).await?;
-    let (store, _cwd, identity) = task::task_store(&invocation).await?;
-    let trusted_root = PathBuf::from(identity);
+    let (store_for_info, _cwd, _identity) = task::task_store(&invocation).await?;
+    let run_id = task_record.run_id.clone();
+    let run_info = tokio::task::spawn_blocking(move || store_for_info.run_info(&run_id))
+        .await
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let (store, _cwd, _identity) = task::task_store(&invocation).await?;
     let publication = ContextPublication {
         pack: args.pack,
         key: args.key,
@@ -156,7 +161,7 @@ async fn publish_call(invocation: ToolInvocation) -> Result<FunctionToolOutput, 
         store.publish_context_fragment(
             &task_record.run_id,
             &task_record.worktree_path,
-            &trusted_root,
+            &run_info.integration_worktree,
             &publisher,
             &publication,
         )
