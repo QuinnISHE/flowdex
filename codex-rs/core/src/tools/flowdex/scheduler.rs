@@ -1,15 +1,19 @@
 use super::task::{self, AgentSpec};
 use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output};
+use crate::tools::context::{boxed_tool_output, ToolInvocation, ToolOutput, ToolPayload};
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::{
     FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
 };
 use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
+use codex_flowdex::context::{
+    ContextPackDeclaration, ContextPackStatus, ContextStaleSource, ResolvedContextPack,
+};
 use codex_flowdex::store::{
     FlowdexStore, FlowdexStoreError, RunInfo, RunState, SchedulerTaskState, TaskDeclaration,
 };
+use codex_flowdex::workflow::ContextPackDefinition;
 use codex_flowdex::{PhaseDefinition, TaskDefinition, WorkflowDefinition};
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
@@ -19,7 +23,7 @@ use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
 const START: &str = "flowdex_start_run";
@@ -62,6 +66,14 @@ struct RawWorkflow {
     phases: Vec<RawPhase>,
     #[serde(default)]
     verification: Vec<String>,
+    #[serde(default)]
+    context_packs: std::collections::BTreeMap<String, RawContextPack>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextPack {
+    agent: String,
+    instructions: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +110,8 @@ struct RawTask {
     write_scope: Vec<String>,
     #[serde(default)]
     verification: Vec<String>,
+    #[serde(default)]
+    context: Vec<String>,
 }
 impl From<RawTask> for TaskDefinition {
     fn from(t: RawTask) -> Self {
@@ -109,6 +123,7 @@ impl From<RawTask> for TaskDefinition {
             read_scope: t.read_scope,
             write_scope: t.write_scope,
             verification: t.verification,
+            context: t.context,
         }
     }
 }
@@ -142,6 +157,19 @@ impl From<RawWorkflow> for WorkflowDefinition {
                 })
                 .collect(),
             verification: w.verification,
+            context_packs: w
+                .context_packs
+                .into_iter()
+                .map(|(name, pack)| {
+                    (
+                        name,
+                        ContextPackDefinition {
+                            agent: pack.agent,
+                            instructions: pack.instructions,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -334,6 +362,29 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
     .await
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
     .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let declarations = definition
+        .context_packs
+        .iter()
+        .map(|(name, pack)| {
+            (
+                name.clone(),
+                ContextPackDeclaration {
+                    agent: pack.agent.clone(),
+                    instructions: pack.instructions.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !declarations.is_empty() {
+        let store_for_context = Arc::clone(&store);
+        let run_id_for_context = run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            store_for_context.declare_context_packs(&run_id_for_context, &declarations)
+        })
+        .await
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    }
     let (status, status_rx) = watch::channel(RunStatus::Running);
     let (activity, activity_rx) = watch::channel(0u64);
     let controller = Arc::new(RunController {
@@ -370,6 +421,12 @@ async fn queue_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         .cloned()
         .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex run not found".into()))?;
     let task: TaskDefinition = args.task.into();
+    {
+        let definition = controller.definition.lock().await;
+        definition
+            .validate_dynamic_task(&args.phase, &task)
+            .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    }
     let task_id = Uuid::new_v4().to_string();
     let store = Arc::clone(&controller.store);
     let run_id = args.run_id.clone();
@@ -403,7 +460,8 @@ async fn queue_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
     };
     let store = Arc::clone(&controller.store);
     let info = controller.info.clone();
-    tokio::task::spawn_blocking(move || store.create_task(&info, &declaration))
+    let declaration_for_store = declaration.clone();
+    tokio::task::spawn_blocking(move || store.create_task(&info, &declaration_for_store))
         .await
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
@@ -675,13 +733,14 @@ async fn run_phase(
                 .and_then(|phase| phase.tasks.iter().find(|task| task.name == details.name))
                 .cloned()
                 .ok_or_else(|| "scheduled task missing definition".to_string())?;
-            let task_instructions = details.instructions.clone();
+            let task_instructions =
+                prepare_task_instructions(controller, &details.instructions, &task_def).await?;
             ensure_task_record(
                 controller,
                 TaskDeclaration {
                     id: details.task_id.clone(),
                     name: details.name.clone(),
-                    instructions: details.instructions.clone(),
+                    instructions: task_instructions.clone(),
                     read_scope: details.read_scope.clone(),
                     write_scope: details.write_scope.clone(),
                     verification: details.verification.clone(),
@@ -804,6 +863,160 @@ async fn ensure_task_records(
         ensure_task_record(controller, declaration).await?;
     }
     Ok(())
+}
+
+const MAX_RENDERED_CONTEXT: usize = 64 * 1024;
+
+async fn prepare_task_instructions(
+    controller: &Arc<RunController>,
+    base_instructions: &str,
+    task: &TaskDefinition,
+) -> Result<String, String> {
+    let mut rendered = String::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for pack in &task.context {
+        if !seen.insert(pack) {
+            continue;
+        }
+        let resolved = resolve_or_collect_context(controller, pack).await?;
+        if resolved.status != ContextPackStatus::Fresh {
+            return Err(format!("context pack {pack} is not fresh after collection"));
+        }
+        if rendered.is_empty() {
+            rendered.push_str("\n\n--- Flowdex context (bounded) ---\n");
+        }
+        for fragment in resolved.fragments {
+            let entry = format!(
+                "[{}/{} lines {}-{}]\n{}\n",
+                pack, fragment.key, fragment.line_start, fragment.line_end, fragment.content
+            );
+            if rendered.len() + entry.len() > MAX_RENDERED_CONTEXT {
+                rendered.push_str("[context truncated; additional fragments omitted]\n");
+                rendered.push_str("--- End Flowdex context ---");
+                return Ok(format!("{}{}", base_instructions, rendered));
+            }
+            rendered.push_str(&entry);
+        }
+    }
+    if !rendered.is_empty() {
+        rendered.push_str("--- End Flowdex context ---");
+    }
+    Ok(format!("{}{}", base_instructions, rendered))
+}
+
+async fn resolve_or_collect_context(
+    controller: &Arc<RunController>,
+    pack: &str,
+) -> Result<ResolvedContextPack, String> {
+    let store = Arc::clone(&controller.store);
+    let run_id = controller.id.clone();
+    let pack = pack.to_string();
+    let pack_for_resolve = pack.clone();
+    let integration = controller.info.integration_worktree.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        store.resolve_context_pack(&run_id, &pack_for_resolve, &integration)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if resolved.status == ContextPackStatus::Fresh {
+        return Ok(resolved);
+    }
+    progress(
+        &controller.invocation,
+        format!("Collecting context: {pack}"),
+    )
+    .await;
+    collect_context(controller, &pack, &resolved).await?;
+    let store = Arc::clone(&controller.store);
+    let run_id = controller.id.clone();
+    let pack_for_resolve = pack.clone();
+    let integration = controller.info.integration_worktree.clone();
+    let refreshed = tokio::task::spawn_blocking(move || {
+        store.resolve_context_pack(&run_id, &pack_for_resolve, &integration)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if refreshed.status != ContextPackStatus::Fresh {
+        return Err(format!(
+            "context collector completed without fresh pack {pack}"
+        ));
+    }
+    progress(&controller.invocation, format!("Context ready: {pack}")).await;
+    Ok(refreshed)
+}
+
+async fn collect_context(
+    controller: &Arc<RunController>,
+    pack: &str,
+    resolved: &ResolvedContextPack,
+) -> Result<(), String> {
+    let definition = controller.definition.lock().await.clone();
+    let pack_definition = definition
+        .context_packs
+        .get(pack)
+        .cloned()
+        .ok_or_else(|| format!("context pack {pack} is not declared"))?;
+    let stale = if resolved.stale_sources.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nStale sources:\n{}",
+            resolved
+                .stale_sources
+                .iter()
+                .map(format_stale_source)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let instructions = format!(
+        "Collect context pack `{pack}`.\n\n{}{}\n\nPublish fresh source-backed fragments with publish_flowdex_context({{pack,key,path,line_start,line_end,summary?}}). Do not return source context through the orchestrator.",
+        pack_definition.instructions, stale
+    );
+    let task_id = format!("context-{}", Uuid::new_v4());
+    let declaration = TaskDeclaration {
+        id: task_id.clone(),
+        name: format!("collect context {pack}"),
+        instructions,
+        read_scope: vec![],
+        write_scope: vec![],
+        verification: vec![],
+    };
+    let store = Arc::clone(&controller.store);
+    let info = controller.info.clone();
+    let declaration_for_store = declaration.clone();
+    tokio::task::spawn_blocking(move || store.create_task(&info, &declaration_for_store))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let agent_definition = definition
+        .agents
+        .get(&pack_definition.agent)
+        .cloned()
+        .ok_or_else(|| format!("context pack agent {} is missing", pack_definition.agent))?;
+    let collector_instructions = declaration.instructions.clone();
+    let agent = AgentSpec {
+        name: format!("collect context {pack}"),
+        instructions: collector_instructions,
+        profile: agent_definition.profile,
+        model: agent_definition.model,
+        reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
+    };
+    run_task_handler(controller.invocation.clone(), task_id, agent)
+        .await
+        .map_err(|e| format!("context collector failed for {pack}: {e}"))?;
+    Ok(())
+}
+
+fn format_stale_source(source: &ContextStaleSource) -> String {
+    format!(
+        "{} ({}-{})",
+        source.path.display(),
+        source.line_start,
+        source.line_end
+    )
 }
 
 async fn ensure_task_record(

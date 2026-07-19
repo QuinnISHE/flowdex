@@ -64,6 +64,9 @@ fn gates() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
 fn task_for_agent(id: ThreadId) -> Option<String> {
     associations().lock().ok()?.get(&id).cloned()
 }
+pub(crate) fn associated_task(id: ThreadId) -> Option<String> {
+    task_for_agent(id)
+}
 fn associate(id: ThreadId, task: &str) {
     if let Ok(mut map) = associations().lock() {
         map.insert(id, task.to_string());

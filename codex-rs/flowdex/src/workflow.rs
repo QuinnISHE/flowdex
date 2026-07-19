@@ -16,8 +16,17 @@ pub struct WorkflowDefinition {
     pub name: String,
     pub agents: BTreeMap<String, AgentDefinition>,
     #[serde(default)]
+    pub context_packs: BTreeMap<String, ContextPackDefinition>,
+    #[serde(default)]
     pub verification: Vec<String>,
     pub phases: Vec<PhaseDefinition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextPackDefinition {
+    pub agent: String,
+    pub instructions: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +55,8 @@ pub struct TaskDefinition {
     pub write_scope: Vec<String>,
     #[serde(default)]
     pub verification: Vec<String>,
+    #[serde(default)]
+    pub context: Vec<String>,
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -58,6 +69,14 @@ pub enum WorkflowValidationError {
     NoPhases,
     #[error("agent {0} must specify profile, model, or reasoning_effort")]
     AgentWithoutSelector(String),
+    #[error("context pack {0} must define an agent and instructions")]
+    InvalidContextPack(String),
+    #[error("context pack {pack} references unknown agent {agent}")]
+    UnknownContextAgent { pack: String, agent: String },
+    #[error("task {task} references unknown context pack {pack}")]
+    UnknownContextPack { task: String, pack: String },
+    #[error("task {task} references duplicate context pack {pack}")]
+    DuplicateTaskContext { task: String, pack: String },
     #[error("duplicate agent: {0}")]
     DuplicateAgent(String),
     #[error("duplicate phase: {0}")]
@@ -128,6 +147,19 @@ impl WorkflowDefinition {
             }
         }
         validate_commands(&self.verification)?;
+        for (name, pack) in &self.context_packs {
+            non_empty("context pack name", name)?;
+            non_empty("context pack agent", &pack.agent)
+                .map_err(|_| WorkflowValidationError::InvalidContextPack(name.clone()))?;
+            non_empty("context pack instructions", &pack.instructions)
+                .map_err(|_| WorkflowValidationError::InvalidContextPack(name.clone()))?;
+            if !self.agents.contains_key(&pack.agent) {
+                return Err(WorkflowValidationError::UnknownContextAgent {
+                    pack: name.clone(),
+                    agent: pack.agent.clone(),
+                });
+            }
+        }
         let mut phases = BTreeSet::new();
         for phase in &self.phases {
             non_empty("phase name", &phase.name)?;
@@ -176,6 +208,7 @@ impl WorkflowDefinition {
                     });
                 }
             }
+            self.validate_task_context(task)?;
         }
         detect_cycle(&phase.name, &phase.tasks)
     }
@@ -216,6 +249,7 @@ impl WorkflowDefinition {
                 agent: task.agent.clone(),
             });
         }
+        self.validate_task_context(task)?;
         for dependency in &task.dependencies {
             if !phase
                 .tasks
@@ -232,6 +266,25 @@ impl WorkflowDefinition {
         let mut tasks = phase.tasks.clone();
         tasks.push(task.clone());
         detect_cycle(phase_name, &tasks)
+    }
+
+    fn validate_task_context(&self, task: &TaskDefinition) -> Result<(), WorkflowValidationError> {
+        let mut names = BTreeSet::new();
+        for pack in &task.context {
+            if !names.insert(pack) {
+                return Err(WorkflowValidationError::DuplicateTaskContext {
+                    task: task.name.clone(),
+                    pack: pack.clone(),
+                });
+            }
+            if !self.context_packs.contains_key(pack) {
+                return Err(WorkflowValidationError::UnknownContextPack {
+                    task: task.name.clone(),
+                    pack: pack.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -318,6 +371,7 @@ mod tests {
             read_scope: vec![],
             write_scope: vec![],
             verification: vec![],
+            context: vec![],
         }
     }
     fn workflow(tasks: Vec<TaskDefinition>) -> WorkflowDefinition {
@@ -334,6 +388,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
                 instructions: "phase".into(),
@@ -364,11 +419,9 @@ mod tests {
     fn dynamic_requires_existing_open_phase() {
         let mut definition = workflow(vec![]);
         definition.phases[0].open = true;
-        assert!(
-            definition
-                .validate_dynamic_task("phase", &task("new", &[]))
-                .is_ok()
-        );
+        assert!(definition
+            .validate_dynamic_task("phase", &task("new", &[]))
+            .is_ok());
     }
     #[test]
     fn scope_conflict_uses_normalized_roots() {
