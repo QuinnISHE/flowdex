@@ -10,6 +10,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::ffi::OsStr;
 use std::fs;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -216,7 +217,7 @@ pub struct PhaseMetadata {
 
 pub struct FlowdexStore {
     pool: SqlitePool,
-    runtime: tokio::runtime::Runtime,
+    runtime: ManuallyDrop<tokio::runtime::Runtime>,
     worktree_root: PathBuf,
     repository_identity: String,
     integration_worktree: PathBuf,
@@ -267,7 +268,7 @@ impl FlowdexStore {
         }
         Ok(Self {
             pool,
-            runtime,
+            runtime: ManuallyDrop::new(runtime),
             worktree_root,
             repository_identity,
             integration_worktree: integration_worktree.to_path_buf(),
@@ -904,6 +905,18 @@ impl FlowdexStore {
             task_id: task_id.to_string(),
             commits: result_commits,
         })
+    }
+}
+
+impl Drop for FlowdexStore {
+    fn drop(&mut self) {
+        // Tokio runtimes must not perform their blocking shutdown inside async code.
+        let runtime = unsafe { ManuallyDrop::take(&mut self.runtime) };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(move || drop(runtime));
+        } else {
+            drop(runtime);
+        }
     }
 }
 

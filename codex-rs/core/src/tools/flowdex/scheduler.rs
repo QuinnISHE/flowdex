@@ -464,16 +464,22 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
                     .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
             }
             RunStatus::Completed => {
-                runs().lock().await.remove(&args.run_id);
+                remove_run_controller(&args.run_id).await;
                 return Ok(task::JsonOutput(
                     serde_json::json!({"runId": args.run_id, "status": "completed"}),
                 ));
             }
             RunStatus::Failed(error) => {
-                runs().lock().await.remove(&args.run_id);
+                remove_run_controller(&args.run_id).await;
                 return Err(FunctionCallError::RespondToModel(error));
             }
         }
+    }
+}
+
+async fn remove_run_controller(run_id: &str) {
+    if let Some(controller) = runs().lock().await.remove(run_id) {
+        let _ = tokio::task::spawn_blocking(move || drop(controller)).await;
     }
 }
 
