@@ -969,6 +969,9 @@ async fn cli_main(
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
+    if flowdex_cmd::invoked_as_flowdex() {
+        return flowdex_cmd::run_standalone().await;
+    }
     let MultitoolCli {
         config_overrides: mut root_config_overrides,
         feature_toggles,

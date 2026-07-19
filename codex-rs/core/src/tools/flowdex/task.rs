@@ -742,30 +742,6 @@ pub(crate) async fn handle_run_with_review(
     Ok(JsonOutput(status_value(id, status)))
 }
 
-/// Runs a durable task through the Batch 009 agent lifecycle without going through the
-/// JavaScript/code-mode bridge. The scheduler uses this entry point for each ready task.
-pub(crate) async fn run_task_agent(
-    mut invocation: ToolInvocation,
-    task_id: String,
-    agent: AgentSpec,
-) -> Result<JsonOutput, FunctionCallError> {
-    invocation.payload = ToolPayload::Function {
-        arguments: serde_json::json!({
-            "task_id": task_id,
-            "agent": {
-                "name": agent.name,
-                "instructions": agent.instructions,
-                "profile": agent.profile,
-                "tool_profile": agent.tool_profile,
-                "model": agent.model,
-                "reasoning_effort": agent.reasoning_effort,
-            }
-        })
-        .to_string(),
-    };
-    handle_run(invocation).await
-}
-
 pub(crate) async fn run_task_agent_with_review(
     mut invocation: ToolInvocation,
     task_id: String,
@@ -881,17 +857,6 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             .map_err(task_error)?;
     }
     Ok(JsonOutput(result))
-}
-
-/// Verifies a durable task directly from Rust scheduler code.
-pub(crate) async fn verify_task(
-    mut invocation: ToolInvocation,
-    task_id: String,
-) -> Result<JsonOutput, FunctionCallError> {
-    invocation.payload = ToolPayload::Function {
-        arguments: serde_json::json!({"task_id": task_id}).to_string(),
-    };
-    handle_verify(invocation).await
 }
 
 async fn handle_integrate(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {

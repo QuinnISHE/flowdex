@@ -1,7 +1,10 @@
 use anyhow::Context;
 use anyhow::Result;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use clap::Parser;
+use codex_core::config::find_codex_home;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
 pub struct FlowdexCli {
@@ -11,58 +14,115 @@ pub struct FlowdexCli {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum FlowdexSubcommand {
-    /// Configure the Codex desktop app to use a local Codex binary.
+    /// Install this Flowdex binary as the Codex desktop app backend.
     Install(InstallArgs),
+    /// Remove the Flowdex desktop backend override and installed binary.
+    Uninstall,
 }
 
 #[derive(Debug, clap::Args)]
-pub struct InstallArgs {
-    /// Absolute path to the Codex executable.
-    #[arg(long, value_parser = parse_absolute_binary_path)]
-    pub binary: AbsolutePathBuf,
-}
+pub struct InstallArgs {}
 
-fn parse_absolute_binary_path(raw: &str) -> std::result::Result<AbsolutePathBuf, String> {
-    let path = Path::new(raw);
-    if !path.is_absolute() {
-        return Err("--binary must be an absolute path".to_string());
-    }
-    AbsolutePathBuf::from_absolute_path_checked(path)
-        .map_err(|error| format!("invalid --binary path: {error}"))
+#[derive(Debug, Parser)]
+#[command(name = "flowdex", bin_name = "flowdex")]
+struct StandaloneFlowdexCli {
+    #[command(subcommand)]
+    subcommand: FlowdexSubcommand,
 }
 
 pub async fn run(cli: FlowdexCli) -> Result<()> {
     match cli.subcommand {
-        FlowdexSubcommand::Install(args) => run_install(args).await,
+        FlowdexSubcommand::Install(_) => run_install().await,
+        FlowdexSubcommand::Uninstall => run_uninstall().await,
     }
 }
 
-async fn run_install(args: InstallArgs) -> Result<()> {
+pub fn invoked_as_flowdex() -> bool {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .is_some_and(is_flowdex_executable)
+}
+
+fn is_flowdex_executable(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("flowdex"))
+}
+
+pub async fn run_standalone() -> Result<()> {
+    run(FlowdexCli {
+        subcommand: StandaloneFlowdexCli::parse().subcommand,
+    })
+    .await
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn installed_binary_path() -> Result<PathBuf> {
+    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
+    let name = if cfg!(target_os = "windows") {
+        "codex.exe"
+    } else {
+        "codex"
+    };
+    Ok(codex_home
+        .join("flowdex")
+        .join("bin")
+        .join(name)
+        .to_path_buf())
+}
+
+async fn run_install() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return macos::run(args).await;
+        let target = install_current_binary(BinaryValidation::Macos)?;
+        macos::install(&target)?;
+        println!(
+            "Flowdex installed at {}. Fully quit and restart the Codex app.",
+            target.display()
+        );
+        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
+        let target = install_current_binary(BinaryValidation::Windows)?;
         let mut writer = RegistryEnvironmentWriter;
-        let canonical = install_with_writer(
-            args.binary,
-            run_version_check,
-            &mut writer,
-            BinaryValidation::Windows,
-        )?;
+        writer.set_codex_cli_path(&target)?;
         println!(
-            "Configured CODEX_CLI_PATH={} for the current Windows user. Restart the Codex app to apply it.",
-            canonical.display()
+            "Flowdex installed at {}. Fully quit and restart the Codex app.",
+            target.display()
         );
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = args;
-        anyhow::bail!("`codex flowdex install` is only supported on Windows and macOS");
+        anyhow::bail!("`flowdex install` is only supported on Windows and macOS");
+    }
+}
+
+async fn run_uninstall() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::uninstall()?;
+        remove_installed_binary()?;
+        println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut writer = RegistryEnvironmentWriter;
+        writer.remove_codex_cli_path()?;
+        remove_installed_binary()?;
+        println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        anyhow::bail!("`flowdex uninstall` is only supported on Windows and macOS");
     }
 }
 
@@ -73,53 +133,88 @@ enum BinaryValidation {
     Macos,
 }
 
+#[cfg(windows)]
 trait EnvironmentWriter {
     fn set_codex_cli_path(&mut self, path: &Path) -> Result<()>;
+    fn remove_codex_cli_path(&mut self) -> Result<()>;
 }
 
-fn install_with_writer<W, V>(
-    binary: AbsolutePathBuf,
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn install_current_binary(validation: BinaryValidation) -> Result<PathBuf> {
+    let source = std::env::current_exe().context("cannot locate the running Flowdex binary")?;
+    let target = installed_binary_path()?;
+    install_binary(&source, &target, run_version_check, validation)
+}
+
+fn install_binary<V>(
+    source: &Path,
+    target: &Path,
     version_check: V,
-    writer: &mut W,
     validation: BinaryValidation,
-) -> Result<AbsolutePathBuf>
+) -> Result<PathBuf>
 where
-    W: EnvironmentWriter,
     V: FnOnce(&Path) -> Result<()>,
 {
-    let canonical = validate_binary(binary, version_check, validation)?;
-    writer.set_codex_cli_path(canonical.as_path())?;
-    Ok(canonical)
+    let canonical = validate_binary(source, version_check, validation)?;
+    if canonical == target {
+        return Ok(target.to_path_buf());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed binary path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".flowdex-install-{}", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    let result = (|| {
+        fs::copy(&canonical, &temp).with_context(|| {
+            format!(
+                "cannot copy Flowdex from {} to {}",
+                canonical.display(),
+                temp.display()
+            )
+        })?;
+        if target.exists() {
+            fs::remove_file(target).with_context(|| {
+                format!("cannot replace installed Flowdex at {}", target.display())
+            })?;
+        }
+        fs::rename(&temp, target)
+            .with_context(|| format!("cannot install Flowdex at {}", target.display()))?;
+        Ok(target.to_path_buf())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn validate_binary<V>(
-    binary: AbsolutePathBuf,
+    binary: &Path,
     version_check: V,
     validation: BinaryValidation,
-) -> Result<AbsolutePathBuf>
+) -> Result<PathBuf>
 where
     V: FnOnce(&Path) -> Result<()>,
 {
     let canonical = binary
         .canonicalize()
-        .with_context(|| format!("cannot canonicalize --binary path: {}", binary.display()))?;
-    let metadata = std::fs::metadata(canonical.as_path())
-        .with_context(|| format!("cannot inspect --binary path: {}", canonical.display()))?;
+        .with_context(|| format!("cannot locate Flowdex package: {}", binary.display()))?;
+    let metadata = std::fs::metadata(&canonical)
+        .with_context(|| format!("cannot inspect Flowdex package: {}", canonical.display()))?;
     if !metadata.is_file() {
         anyhow::bail!(
-            "--binary must point to a regular file: {}",
+            "Flowdex package must be a regular file: {}",
             canonical.display()
         );
     }
     if matches!(validation, BinaryValidation::Windows) {
         let is_exe = canonical
-            .as_path()
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
         if !is_exe {
             anyhow::bail!(
-                "--binary must point to a .exe file: {}",
+                "Flowdex package must be a .exe file: {}",
                 canonical.display()
             );
         }
@@ -128,14 +223,27 @@ where
         #[cfg(target_family = "unix")]
         {
             use std::os::unix::fs::PermissionsExt;
-            if canonical.as_path().metadata()?.permissions().mode() & 0o111 == 0 {
-                anyhow::bail!("--binary must be executable: {}", canonical.display());
+            if canonical.metadata()?.permissions().mode() & 0o111 == 0 {
+                anyhow::bail!(
+                    "Flowdex package must be executable: {}",
+                    canonical.display()
+                );
             }
         }
     }
 
-    version_check(canonical.as_path())?;
+    version_check(&canonical)?;
     Ok(canonical)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn remove_installed_binary() -> Result<()> {
+    let path = installed_binary_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -255,6 +363,9 @@ mod macos {
             anyhow::bail!("profile contains malformed Flowdex CODEX_CLI_PATH markers");
         }
         if starts.is_empty() {
+            if block.is_empty() {
+                return Ok(contents.to_vec());
+            }
             let mut result = contents.to_vec();
             if !result.is_empty() && !result.ends_with(b"\n") {
                 result.push(b'\n');
@@ -279,11 +390,15 @@ mod macos {
         let mut result = Vec::with_capacity(contents.len() + block.len());
         result.extend_from_slice(&contents[..start_line]);
         result.extend_from_slice(block);
-        if end_line > end + END_MARKER.len() {
+        if !block.is_empty() && end_line > end + END_MARKER.len() {
             result.push(b'\n');
         }
         result.extend_from_slice(&contents[end_line..]);
         Ok(result)
+    }
+
+    pub fn remove_managed_block(contents: &[u8]) -> Result<Vec<u8>> {
+        replace_managed_block(contents, b"")
     }
 
     pub fn install_profile_with_writer<F>(
@@ -361,17 +476,12 @@ mod macos {
     }
 
     #[cfg(target_os = "macos")]
-    pub async fn run(args: super::InstallArgs) -> Result<()> {
+    pub fn install(canonical: &Path) -> Result<()> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate the login profile"))?;
         let shell = std::env::var("SHELL").map_err(|_| anyhow::anyhow!("SHELL is not set"))?;
         let (shell, profile) = shell_and_profile(&shell, &home)?;
-        let canonical = super::validate_binary(
-            args.binary,
-            super::run_version_check,
-            super::BinaryValidation::Macos,
-        )?;
         let existing = match fs::read(&profile) {
             Ok(contents) => contents,
             Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
@@ -379,18 +489,33 @@ mod macos {
                 return Err(error).with_context(|| format!("cannot read {}", profile.display()));
             }
         };
-        install_profile_with_writer(
-            shell,
-            &profile,
-            canonical.as_path(),
-            &existing,
-            write_profile_atomic,
-        )?;
-        println!(
-            "Configured CODEX_CLI_PATH={} in {}. Fully quit and restart the Codex app to apply it.",
-            canonical.display(),
-            profile.display()
-        );
+        install_profile_with_writer(shell, &profile, canonical, &existing, write_profile_atomic)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn uninstall() -> Result<()> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate the login profile"))?;
+        let shell_name = std::env::var("SHELL").map_err(|_| anyhow::anyhow!("SHELL is not set"))?;
+        let (shell, profile) = shell_and_profile(&shell_name, &home)?;
+        let existing = match fs::read(&profile) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot read {}", profile.display()));
+            }
+        };
+        let contents = remove_managed_block(&existing)?;
+        if contents == existing {
+            return Ok(());
+        }
+        if shell == Shell::Fish && contents.is_empty() {
+            fs::remove_file(&profile)?;
+        } else {
+            write_profile_atomic(&profile, &contents)?;
+        }
         Ok(())
     }
 
@@ -436,6 +561,7 @@ mod macos {
             .unwrap();
             assert!(replaced.starts_with(original));
             assert!(String::from_utf8(replaced).unwrap().contains("/tmp/new"));
+            assert_eq!(remove_managed_block(&inserted).unwrap(), original);
         }
 
         #[test]
@@ -544,6 +670,42 @@ impl EnvironmentWriter for RegistryEnvironmentWriter {
         }
         Ok(())
     }
+
+    fn remove_codex_cli_path(&mut self) -> Result<()> {
+        use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
+        use windows_sys::Win32::System::Registry::KEY_SET_VALUE;
+        use windows_sys::Win32::System::Registry::RegCloseKey;
+        use windows_sys::Win32::System::Registry::RegDeleteValueW;
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
+
+        let key_name: Vec<u16> = "Environment".encode_utf16().chain([0]).collect();
+        let value_name: Vec<u16> = "CODEX_CLI_PATH".encode_utf16().chain([0]).collect();
+        let mut key = 0;
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                key_name.as_ptr(),
+                0,
+                KEY_SET_VALUE,
+                &mut key,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        if status != 0 {
+            anyhow::bail!("RegOpenKeyExW failed with Windows error {status}");
+        }
+        let status = unsafe { RegDeleteValueW(key, value_name.as_ptr()) };
+        unsafe {
+            RegCloseKey(key);
+        }
+        if status != 0 && status != ERROR_FILE_NOT_FOUND {
+            anyhow::bail!("RegDeleteValueW failed with Windows error {status}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -552,25 +714,11 @@ mod tests {
     use std::cell::Cell;
     use tempfile::tempdir;
 
-    struct TestWriter<'a> {
-        writes: &'a Cell<usize>,
-    }
-
-    impl EnvironmentWriter for TestWriter<'_> {
-        fn set_codex_cli_path(&mut self, _path: &Path) -> Result<()> {
-            self.writes.set(self.writes.get() + 1);
-            Ok(())
-        }
-    }
-
-    fn binary_path(name: &str) -> (tempfile::TempDir, AbsolutePathBuf) {
+    fn binary_path(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(name);
         std::fs::write(&path, b"binary").expect("binary");
-        (
-            dir,
-            AbsolutePathBuf::from_absolute_path(path).expect("absolute path"),
-        )
+        (dir, path)
     }
 
     #[test]
@@ -578,7 +726,7 @@ mod tests {
         let (dir, non_exe) = binary_path("codex");
         let called = Cell::new(false);
         let error = validate_binary(
-            non_exe,
+            &non_exe,
             |_| {
                 called.set(true);
                 Ok(())
@@ -589,23 +737,20 @@ mod tests {
         assert!(error.to_string().contains(".exe"));
         assert!(!called.get());
 
-        let directory = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute path");
-        let error = validate_binary(directory, |_| Ok(()), BinaryValidation::Windows)
+        let error = validate_binary(dir.path(), |_| Ok(()), BinaryValidation::Windows)
             .expect_err("directory should fail");
         assert!(error.to_string().contains("regular file"));
     }
 
     #[test]
-    fn missing_binary_fails_without_writer_mutation() {
+    fn missing_binary_fails_without_installing() {
         let dir = tempdir().expect("tempdir");
-        let path = AbsolutePathBuf::from_absolute_path(dir.path().join("missing.exe"))
-            .expect("absolute path");
-        let writes = Cell::new(0);
-        let mut writer = TestWriter { writes: &writes };
-        let error = install_with_writer(path, |_| Ok(()), &mut writer, BinaryValidation::Windows)
+        let path = dir.path().join("missing.exe");
+        let target = dir.path().join("installed").join("codex.exe");
+        let error = install_binary(&path, &target, |_| Ok(()), BinaryValidation::Windows)
             .expect_err("missing");
-        assert!(error.to_string().contains("canonicalize"));
-        assert_eq!(writes.get(), 0);
+        assert!(error.to_string().contains("cannot locate Flowdex package"));
+        assert!(!target.exists());
     }
 
     #[test]
@@ -619,21 +764,34 @@ mod tests {
     }
 
     #[test]
-    fn successful_install_writes_only_after_validation() {
+    fn successful_install_copies_only_after_validation() {
         let (_dir, path) = binary_path("codex.exe");
-        let writes = Cell::new(0);
-        let mut writer = TestWriter { writes: &writes };
-        let canonical = install_with_writer(
-            path,
+        let target_dir = tempdir().expect("target dir");
+        let target = target_dir.path().join("bin").join("codex.exe");
+        let installed = install_binary(
+            &path,
+            &target,
             |validated| {
                 assert!(validated.is_absolute());
                 Ok(())
             },
-            &mut writer,
             BinaryValidation::Windows,
         )
         .expect("install");
-        assert!(canonical.as_path().is_absolute());
-        assert_eq!(writes.get(), 1);
+        assert_eq!(installed, target);
+        assert_eq!(std::fs::read(installed).unwrap(), b"binary");
+    }
+
+    #[test]
+    fn standalone_name_and_commands_are_exact() {
+        assert!(is_flowdex_executable(Path::new("flowdex.exe")));
+        assert!(is_flowdex_executable(Path::new("/tmp/Flowdex")));
+        assert!(!is_flowdex_executable(Path::new("codex.exe")));
+        assert!(StandaloneFlowdexCli::try_parse_from(["flowdex", "install"]).is_ok());
+        assert!(StandaloneFlowdexCli::try_parse_from(["flowdex", "uninstall"]).is_ok());
+        assert!(
+            StandaloneFlowdexCli::try_parse_from(["flowdex", "install", "--binary", "old.exe"])
+                .is_err()
+        );
     }
 }

@@ -23,14 +23,14 @@ Install the normal Codex build prerequisites, then build the modified CLI from t
 
 ```shell
 cd codex-rs
-cargo build -p codex-cli --bin codex
+cargo build --release -p codex-cli --bin codex
 ```
 
-The executable is written to `codex-rs/target/debug/codex` on macOS and Linux or `codex-rs/target/debug/codex.exe` on Windows.
+The executable is written to `codex-rs/target/release/codex` on macOS or `codex-rs/target/release/codex.exe` on Windows. Copy it into [`flowdex-package`](flowdex-package/README.md) as `flowdex` or `flowdex.exe`.
 
-To use it as the Codex desktop app backend, pass its absolute path to the installer and restart the app:
+Run the packaged binary and restart the Codex app:
 
 ```shell
-codex flowdex install --binary /absolute/path/to/codex
-# Windows: codex flowdex install --binary C:\absolute\path\to\codex.exe
+flowdex install
+flowdex uninstall
 ```

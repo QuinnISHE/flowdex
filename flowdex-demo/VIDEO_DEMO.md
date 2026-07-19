@@ -7,7 +7,7 @@ Ask Flowdex to finish a small incident-digest crate. The workflow researches the
 ## Prepare
 
 1. Build the modified `codex` binary.
-2. Run `codex flowdex install --binary <absolute-binary-path>` and fully restart the Codex app.
+2. Copy the release binary into `flowdex-package` as `flowdex.exe` or `flowdex`, run `flowdex install`, and fully restart the Codex app.
 3. Record from a clean worktree on the `codex/flowdex` branch so the intentionally incomplete demo crate is visible.
 
 ## Start prompt

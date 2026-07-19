@@ -1,26 +1,23 @@
 # Flowdex desktop app installer
 
-Configure the Codex desktop app to use a local Codex executable:
+Place the release binary in the Flowdex package as `flowdex.exe` on Windows or `flowdex` on macOS, then run:
 
 ```text
-codex flowdex install --binary C:\absolute\path\to\codex.exe
+flowdex install
+flowdex uninstall
 ```
 
-On macOS, use a native executable path:
-
-```text
-codex flowdex install --binary /absolute/path/to/codex
-```
-
-The command requires an absolute path to an existing regular executable,
-canonicalizes it, and runs the binary with `--version`. Only a successful
-Codex-identifying response allows persistent configuration. On Windows the
-canonical path replaces the current user's `CODEX_CLI_PATH` environment value.
-On macOS it replaces one managed block in the login-shell profile: zsh uses
+Install validates the running package with `--version`, copies it to
+`$CODEX_HOME/flowdex/bin/codex[.exe]`, and configures the platform automatically.
+It does not overwrite the Codex app or its bundled backend. On Windows the copied
+path becomes the current user's `CODEX_CLI_PATH` environment value. On macOS it
+is written in one managed login-profile block: zsh uses
 `~/.zprofile`, bash uses `~/.bash_profile`, and fish uses
-`~/.config/fish/conf.d/flowdex.fish`. Running it again replaces only that
-managed value. Fully quit and restart the Codex app after installation.
+`~/.config/fish/conf.d/flowdex.fish`. Running install again replaces the managed
+binary and value. Uninstall removes both. Fully quit and restart the Codex app
+after either command.
 
 The installer does not modify `PATH`, machine-wide environment state, launchd,
-or compatibility variables. Unsupported shells and platforms fail without
-mutation.
+the Codex application bundle, or compatibility variables. It does not create a
+Flowdex config file; global and repository configuration remain optional.
+Uninstall leaves workflows, optional configuration, and runtime history intact.

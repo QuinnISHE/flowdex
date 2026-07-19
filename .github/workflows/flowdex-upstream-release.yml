@@ -1,0 +1,150 @@
+name: Flowdex upstream release
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: flowdex-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository != 'openai/codex'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      branch: ${{ steps.sync.outputs.branch }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - id: sync
+        name: Merge the latest official Codex release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_tag="$(gh api repos/openai/codex/releases/latest --jq .tag_name)"
+          release_tag="flowdex-${upstream_tag}"
+          branch="automation/flowdex-${upstream_tag//[^A-Za-z0-9._-]/-}"
+          echo "upstream_tag=${upstream_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch https://github.com/openai/codex.git "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
+          git fetch origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
+          git switch -C "$branch" "$GITHUB_SHA"
+          if ! git merge --no-edit "$upstream_tag"; then
+            git merge --abort
+            title="Flowdex upstream merge needs attention: ${upstream_tag}"
+            if [[ -z "$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')" ]]; then
+              gh issue create --title "$title" --body "The automatic merge of official Codex release \`${upstream_tag}\` conflicted with Flowdex. Resolve it on branch \`${branch}\`, then rerun this workflow."
+            fi
+            exit 1
+          fi
+          git push --force-with-lease origin "HEAD:refs/heads/${branch}"
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+          if [[ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')" ]]; then
+            gh pr create --base "${{ github.event.repository.default_branch }}" --head "$branch" --title "Sync Flowdex with ${upstream_tag}" --body "Automated clean merge of official Codex release \`${upstream_tag}\`. The matching Flowdex binaries are built and released by this workflow." || true
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: codex.exe
+            package: flowdex-windows-x64.zip
+          - name: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: codex
+            package: flowdex-macos-arm64.tar.gz
+          - name: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: codex
+            package: flowdex-macos-x64.tar.gz
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+      - name: Build release binary
+        working-directory: codex-rs
+        shell: bash
+        run: cargo build --release --target "${{ matrix.target }}" -p codex-cli --bin codex
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex.exe
+          Compress-Archive -Path dist/flowdex.exe -DestinationPath "${{ matrix.package }}"
+      - name: Package macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex
+          chmod +x dist/flowdex
+          tar -C dist -czf "../${{ matrix.package }}" flowdex
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.package }}
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish Flowdex release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BRANCH" \
+            --title "Flowdex for ${UPSTREAM_TAG}" \
+            --notes "Flowdex rebuilt from the official Codex ${UPSTREAM_TAG} release. Download the archive for your platform, extract the single Flowdex binary, and run \`flowdex install\`."

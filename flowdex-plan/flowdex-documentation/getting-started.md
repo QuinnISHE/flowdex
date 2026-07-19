@@ -8,17 +8,16 @@ From the repository root, build the modified CLI from the Rust workspace:
 
 ```text
 cd codex-rs
-cargo build -p codex-cli --bin codex
+cargo build --release -p codex-cli --bin codex
 ```
 
-Install that executable as the desktop backend on Windows or macOS:
+Copy the release executable to `flowdex-package/flowdex.exe` on Windows or `flowdex-package/flowdex` on macOS. Then run:
 
 ```text
-codex flowdex install --binary C:\absolute\path\to\codex.exe
-codex flowdex install --binary /absolute/path/to/codex
+flowdex install
 ```
 
-The path must be absolute and point to a working Codex executable. Restart the desktop app after installation. See [the installer contract](windows-app-installer.md).
+Flowdex detects the platform, validates and copies itself to `$CODEX_HOME/flowdex/bin`, and configures the desktop backend. No config file is required. Fully quit and restart the desktop app after installation. Use `flowdex uninstall` to remove the override and copied backend. See [the installer contract](windows-app-installer.md).
 
 ## Save a workflow
 
