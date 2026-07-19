@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 use wiremock::Mock;
@@ -37,6 +38,13 @@ use wiremock::ResponseTemplate;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
+}
+
+fn input_contains(request: &wiremock::Request, text: &str) -> bool {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|body| body.get("input").cloned())
+        .is_some_and(|input| input.to_string().contains(text))
 }
 
 fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool {
@@ -83,7 +91,10 @@ struct ContextPackResponder {
 impl Respond for ContextPackResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
         if body_contains(request, "Collect context pack") {
-            self.collector_requests.fetch_add(1, Ordering::SeqCst);
+            let publish_output = has_function_call_output(request, "publish-context");
+            if !publish_output {
+                self.collector_requests.fetch_add(1, Ordering::SeqCst);
+            }
             if has_function_call_output(request, "publish-context") {
                 return sse_response(sse(vec![
                     ev_response_created("resp-context-collector-done"),
@@ -125,6 +136,32 @@ impl Respond for ContextPackResponder {
                 ev_completed("resp-context-second"),
             ]));
         }
+        if has_function_call_output(request, "call-context-wait") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-parent-done"),
+                ev_completed("resp-context-parent-done"),
+            ]));
+        }
+        if has_function_call_output(request, "call-context-outer") {
+            let output: Value = function_call_output_text(request, "call-context-outer")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            if output["status"] == "yielded" {
+                return sse_response(sse(vec![
+                    ev_response_created("resp-context-parent-wait"),
+                    ev_function_call(
+                        "call-context-wait",
+                        "wait_flowdex_workflow",
+                        &serde_json::json!({ "run_id": output["runId"] }).to_string(),
+                    ),
+                    ev_completed("resp-context-parent-wait"),
+                ]));
+            }
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-parent-done"),
+                ev_completed("resp-context-parent-done"),
+            ]));
+        }
         if body_contains(request, "run the context workflow") {
             return sse_response(sse(vec![
                 ev_response_created("resp-context-parent"),
@@ -134,12 +171,6 @@ impl Respond for ContextPackResponder {
                     &serde_json::json!({"path": ".flowdex/workflows/context.js"}).to_string(),
                 ),
                 ev_completed("resp-context-parent"),
-            ]));
-        }
-        if has_function_call_output(request, "call-context-outer") {
-            return sse_response(sse(vec![
-                ev_response_created("resp-context-parent-done"),
-                ev_completed("resp-context-parent-done"),
             ]));
         }
         sse_response(sse(vec![
@@ -1233,7 +1264,9 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
                 if !output.status.success() { anyhow::bail!("git {args:?} failed"); }
                 Ok(())
             };
-            git(&["init"])?; git(&["config", "user.name", "Flowdex Test"])?;
+            git(&["init"])?;
+            git(&["config", "core.autocrlf", "false"])?;
+            git(&["config", "user.name", "Flowdex Test"])?;
             git(&["config", "user.email", "flowdex-test@example.com"])?;
             git(&["add", "."])?; git(&["commit", "-m", "fixture baseline"])?;
             Ok::<(), anyhow::Error>(())
@@ -1258,9 +1291,16 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
         })
         .await?;
     let mut modified = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let event =
-            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for Flowdex context workflow");
+        }
+        let event = match tokio::time::timeout(remaining, test.codex.next_event()).await {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("timed out waiting for Flowdex context workflow"),
+        };
         if responder.first_requests.load(Ordering::SeqCst) > 0 && !modified {
             fs::write(test.workspace_path("context.txt"), "NEW\n")?;
             let output = Command::new("git")
@@ -1293,8 +1333,8 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
         .iter()
         .filter(|request| body_contains(request, "run the context workflow"));
     for request in parent_requests {
-        assert!(!body_contains(request, "OLD"));
-        assert!(!body_contains(request, "NEW"));
+        assert!(!input_contains(request, "OLD"));
+        assert!(!input_contains(request, "NEW"));
     }
     Ok(())
 }

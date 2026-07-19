@@ -985,7 +985,8 @@ async fn collect_context(
         "Collect context pack `{pack}`.\n\n{}{}\n\nPublish fresh source-backed fragments with publish_flowdex_context({{pack,key,path,line_start,line_end,summary?}}). Do not return source context through the orchestrator.",
         pack_definition.instructions, stale
     );
-    let task_id = format!("context-{}", Uuid::new_v4());
+    let collector_suffix = Uuid::new_v4().simple().to_string();
+    let task_id = format!("context-{collector_suffix}");
     let declaration = TaskDeclaration {
         id: task_id.clone(),
         name: format!("collect context {pack}"),
@@ -1008,14 +1009,15 @@ async fn collect_context(
         .ok_or_else(|| format!("context pack agent {} is missing", pack_definition.agent))?;
     let collector_instructions = declaration.instructions.clone();
     let agent = AgentSpec {
-        name: format!("collect context {pack}"),
+        name: format!("context_collector_{collector_suffix}"),
         instructions: collector_instructions,
         profile: agent_definition.profile,
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
     };
-    run_task_handler(controller.invocation.clone(), task_id, agent)
+    tokio::spawn(run_task_handler(controller.invocation.clone(), task_id, agent))
         .await
+        .map_err(|e| format!("context collector task panicked for {pack}: {e}"))?
         .map_err(|e| format!("context collector failed for {pack}: {e}"))?;
     Ok(())
 }

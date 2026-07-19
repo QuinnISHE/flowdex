@@ -1,13 +1,22 @@
 pub mod ast_grep;
 pub mod config;
+pub mod context;
 pub mod store;
 pub mod workflow;
 
-pub use ast_grep::{AstGrepError, AstGrepFinding, AstGrepResult, run_ast_grep_rules};
-pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+pub use ast_grep::{run_ast_grep_rules, AstGrepError, AstGrepFinding, AstGrepResult};
+pub use config::load_config;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
-pub use config::load_config;
+pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+pub use context::ContextError;
+pub use context::ContextFragment;
+pub use context::ContextPackDeclaration;
+pub use context::ContextPackStatus;
+pub use context::ContextPublication;
+pub use context::ContextPublisher;
+pub use context::ContextStaleSource;
+pub use context::ResolvedContextPack;
 pub use store::FlowdexStore;
 pub use store::FlowdexStoreError;
 pub use store::IntegrationResult;
@@ -23,12 +32,12 @@ pub use store::TaskCommit;
 pub use store::TaskDeclaration;
 pub use store::TaskOperation;
 pub use store::TaskRecord;
+pub use workflow::write_scope_conflicts;
 pub use workflow::AgentDefinition;
 pub use workflow::PhaseDefinition;
 pub use workflow::TaskDefinition;
 pub use workflow::WorkflowDefinition;
 pub use workflow::WorkflowValidationError;
-pub use workflow::write_scope_conflicts;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value;
@@ -235,14 +244,23 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     };
     const selector = (value, label) =>
       value === undefined ? undefined : requireString(value, label);
-    const taskDefinition = (task, knownAgents, label = "task") => {
+    const taskDefinition = (task, knownAgents, knownContextPacks, label = "task") => {
       requireObject(task, `${label} definition`);
-      requireKeys(task, new Set(["name", "agent", "instructions", "dependencies", "readScope", "writeScope", "verification"]), label);
+      requireKeys(task, new Set(["name", "agent", "instructions", "dependencies", "readScope", "writeScope", "verification", "context"]), label);
       const name = requireString(task.name, `${label}.name`);
       const agent = requireString(task.agent, `${label}.agent`);
       if (!knownAgents.has(agent)) throw new TypeError(`${label}.agent is unknown`);
       const dependencies = task.dependencies === undefined ? [] : task.dependencies;
       if (!Array.isArray(dependencies)) throw new TypeError(`${label}.dependencies must be an array`);
+      const context = task.context === undefined ? [] : task.context;
+      if (!Array.isArray(context)) throw new TypeError(`${label}.context must be an array`);
+      const contextNames = new Set();
+      const normalizedContext = context.map((pack, index) => {
+        const name = requireString(pack, `${label}.context[${index}]`);
+        if (!knownContextPacks.has(name)) throw new TypeError(`${label}.context is unknown pack: ${name}`);
+        if (!contextNames.add(name)) throw new TypeError(`${label}.context contains duplicate pack: ${name}`);
+        return name;
+      });
       return {
         name,
         agent,
@@ -252,11 +270,12 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
         read_scope: commandArray(task.readScope, `${label}.readScope`),
         write_scope: commandArray(task.writeScope, `${label}.writeScope`),
         verification: commandArray(task.verification, `${label}.verification`),
+        context: normalizedContext,
       };
     };
 
     requireObject(definition, "startRun definition");
-    requireKeys(definition, new Set(["name", "agents", "phases", "verification"]), "startRun");
+    requireKeys(definition, new Set(["name", "agents", "phases", "verification", "contextPacks"]), "startRun");
     const runName = requireString(definition.name, "startRun.name");
     const agents = requireObject(definition.agents, "startRun.agents");
     const agentNames = new Set(Object.keys(agents));
@@ -278,6 +297,21 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       if (reasoningEffort !== undefined) normalizedAgents[agentName].reasoning_effort = reasoningEffort;
     }
 
+    const contextPacks = definition.contextPacks === undefined ? {} : requireObject(definition.contextPacks, "startRun.contextPacks");
+    const contextPackNames = new Set(Object.keys(contextPacks));
+    const normalizedContextPacks = {};
+    for (const packName of contextPackNames) {
+      requireString(packName, "startRun context pack name");
+      const pack = requireObject(contextPacks[packName], `startRun.contextPacks.${packName}`);
+      requireKeys(pack, new Set(["agent", "instructions"]), `startRun.contextPacks.${packName}`);
+      const agent = requireString(pack.agent, `startRun.contextPacks.${packName}.agent`);
+      if (!agentNames.has(agent)) throw new TypeError(`startRun.contextPacks.${packName}.agent is unknown`);
+      normalizedContextPacks[packName] = {
+        agent,
+        instructions: requireString(pack.instructions, `startRun.contextPacks.${packName}.instructions`),
+      };
+    }
+
     if (!Array.isArray(definition.phases) || definition.phases.length === 0) {
       throw new TypeError("startRun.phases must be a non-empty array");
     }
@@ -294,7 +328,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       if (!open && phase.tasks.length === 0) throw new TypeError(`closed phase ${name} must have tasks`);
       const names = new Set();
       const tasks = phase.tasks.map((task, taskIndex) => {
-        const normalized = taskDefinition(task, agentNames, `startRun.phases[${phaseIndex}].tasks[${taskIndex}]`);
+        const normalized = taskDefinition(task, agentNames, contextPackNames, `startRun.phases[${phaseIndex}].tasks[${taskIndex}]`);
         if (names.has(normalized.name)) throw new TypeError(`duplicate task name in phase ${name}: ${normalized.name}`);
         names.add(normalized.name);
         return normalized;
@@ -327,6 +361,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     const normalized = {
       name: runName,
       agents: normalizedAgents,
+      context_packs: normalizedContextPacks,
       phases,
       verification: commandArray(definition.verification, "startRun.verification"),
     };
@@ -339,7 +374,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       id,
       queueTask: async (phaseName, task) => {
         requireString(phaseName, "queueTask.phase");
-        const normalizedTask = taskDefinition(task, agentNames, "queueTask.task");
+        const normalizedTask = taskDefinition(task, agentNames, contextPackNames, "queueTask.task");
         const queued = await tools.flowdex_queue_task({
           run_id: id,
           phase: phaseName,
@@ -991,7 +1026,7 @@ fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
         let from: Vec<u16> = temporary
             .as_os_str()
@@ -1100,18 +1135,14 @@ mod tests {
         assert!(loaded.source.contains("key !== \"contextMode\""));
         assert!(loaded.source.contains("createTask unknown field"));
         assert!(loaded.source.contains("runAgent unknown field"));
-        assert!(
-            loaded
-                .source
-                .contains("reasoning_effort: agentSpec.reasoningEffort")
-        );
+        assert!(loaded
+            .source
+            .contains("reasoning_effort: agentSpec.reasoningEffort"));
         assert!(!loaded.source.contains("progress: async"));
         assert!(loaded.source.contains(r#"input: {"quote":"line\nnext"}"#));
-        assert!(
-            loaded
-                .source
-                .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#)
-        );
+        assert!(loaded
+            .source
+            .contains(r#"workflowPath: ".flowdex/workflows/hello.js""#));
         assert!(loaded.source.ends_with("emit('hello');"));
     }
 
@@ -1133,11 +1164,9 @@ mod tests {
 
         fs::create_dir(_temp_dir.path().join(".flowdex/workflows/directory.js"))
             .expect("directory workflow");
-        assert!(
-            loader
-                .load(Path::new(".flowdex/workflows/directory.js"), None)
-                .is_err()
-        );
+        assert!(loader
+            .load(Path::new(".flowdex/workflows/directory.js"), None)
+            .is_err());
 
         #[cfg(unix)]
         {
@@ -1188,11 +1217,9 @@ mod tests {
                 None,
             )
             .expect("global workflow");
-        assert!(
-            loaded
-                .source
-                .contains("workflowPath: \"global:checks/lint\"")
-        );
+        assert!(loaded
+            .source
+            .contains("workflowPath: \"global:checks/lint\""));
     }
 
     #[cfg(unix)]
