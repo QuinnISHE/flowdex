@@ -36,7 +36,7 @@ const run = await flowdex.startRun({
   boundary: "human",
   agents: {
     editor: { model: "gpt-5.6-luna", reasoningEffort: "high" },
-    reviewer: { profile: "implementation_worker_fast" },
+    reviewer: { model: "gpt-5.6-luna", reasoningEffort: "high" },
   },
   contextPacks: {
     conventions: { agent: "editor", instructions: "Collect repository documentation conventions." },
@@ -79,6 +79,7 @@ For a small role-neutral conversation, ordinary JavaScript is enough:
 ```js
 const a = await flowdex.spawnAgent({ name: "a", instructions: "Investigate one angle.", model: "gpt-5.6-luna" });
 const b = await flowdex.spawnAgent({ name: "b", instructions: "Investigate another angle.", model: "gpt-5.6-luna" });
+await Promise.all([flowdex.waitAgent(a), flowdex.waitAgent(b)]);
 const note = await flowdex.resumeAgent(a, "Share your findings.");
 await flowdex.sendMessage(b, JSON.stringify(note), { delivery: "turn" });
 await flowdex.waitAgent(b);
