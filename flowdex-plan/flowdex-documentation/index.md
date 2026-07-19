@@ -1,6 +1,7 @@
 # Flowdex documentation
 
 - [Getting started](getting-started.md)
+- [Video demo](../../flowdex-demo/VIDEO_DEMO.md)
 
 - [Groundwork](groundwork.md)
 - [Agent workflows](agents.md)
