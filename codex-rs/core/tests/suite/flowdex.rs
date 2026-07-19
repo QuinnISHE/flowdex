@@ -1327,6 +1327,28 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
         .respond_with(responder.clone())
         .mount(&server)
         .await;
+    let first_requests = Arc::clone(&responder.first_requests);
+    let context_path = test.workspace_path("context.txt");
+    let workspace_path = test.workspace_path(".");
+    let modifier = tokio::spawn(async move {
+        while first_requests.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        fs::write(context_path, "NEW\n")?;
+        for args in [
+            &["add", "context.txt"][..],
+            &["commit", "-m", "refresh context"][..],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&workspace_path)
+                .args(args)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!("git {args:?} failed");
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
     test.codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
@@ -1339,7 +1361,14 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
             thread_settings: Default::default(),
         })
         .await?;
-    let mut modified = false;
+    let turn_id = loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        if let EventMsg::TurnStarted(event) = event.msg {
+            break event.turn_id;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), modifier).await???;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1350,29 +1379,20 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
             Ok(result) => result?,
             Err(_) => anyhow::bail!("timed out waiting for Flowdex context workflow"),
         };
-        if responder.first_requests.load(Ordering::SeqCst) > 0 && !modified {
-            fs::write(test.workspace_path("context.txt"), "NEW\n")?;
-            let output = Command::new("git")
-                .current_dir(test.workspace_path("."))
-                .args(["add", "context.txt"])
-                .output()?;
-            if !output.status.success() {
-                anyhow::bail!("git add failed");
-            }
-            let output = Command::new("git")
-                .current_dir(test.workspace_path("."))
-                .args(["commit", "-m", "refresh context"])
-                .output()?;
-            if !output.status.success() {
-                anyhow::bail!("git commit failed");
-            }
-            modified = true;
-        }
-        if matches!(event.msg, EventMsg::TurnComplete(_)) && modified {
+        if let EventMsg::TurnComplete(event) = event.msg
+            && event.turn_id == turn_id
+        {
             break;
         }
     }
-    assert_eq!(responder.collector_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        responder.collector_requests.load(Ordering::SeqCst),
+        2,
+        "requests: independent={}, first={}, second={}",
+        responder.independent_requests.load(Ordering::SeqCst),
+        responder.first_requests.load(Ordering::SeqCst),
+        responder.second_requests.load(Ordering::SeqCst),
+    );
     assert_eq!(responder.independent_requests.load(Ordering::SeqCst), 1);
     assert!(
         responder
