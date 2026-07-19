@@ -38,16 +38,17 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **Reusable and nested workflows (Batch 012):** repository/global workflow references, strict declared JSON input, exact JSON output, event-driven nested V8 execution, durable parent/child identity, cancellation, and rooted atomic saving are complete.
 - **AST-grep rule runtime (Batch 011, integrated after Batch 012):** approved repository rules, strict global/repository configuration, explicit workflow checks, automatic post-command verification, bounded findings, and trusted-root/task-worktree separation are complete on the authoritative scheduler line.
 - **Desktop app-backend installer (Batch 014):** `codex flowdex install --binary <path>` validates a compiled Codex executable and persistently selects it through `CODEX_CLI_PATH` for the current Windows or macOS user. Windows uses the user environment registry; macOS maintains an idempotent marked block in the supported login-shell profile. Other platforms and unsupported shells fail without mutation.
+- **Context packs (Batch 013):** workflows declare named packs and task requirements; immutable fragments are persisted with source hashes and supersession, missing or stale packs dispatch one ordinary collector, unrelated ready tasks continue concurrently, and only dependent task prompts receive bounded fresh context.
 
 ### Partial or correction needed
 
-- **Workflow authoring API:** run/phase/task scheduling and reusable nested workflows are settled. Review/repair composition, context requirements, boundaries, and tool profiles remain additive final-language slices.
+- **Workflow authoring API:** run/phase/task scheduling, reusable nested workflows, and context requirements are settled. Review/repair composition, boundaries, and tool profiles remain additive final-language slices.
 - **Workflow event wait:** waiting for the V8 cell and user steering works. Waiting on durable workflow, phase, task, checkpoint, command, and explicit-signal events belongs to the scheduler that will own those states.
-- **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles, agent defaults, context collection, and round limits remain.
+- **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles, agent defaults, and round limits remain.
 
 ### In progress
 
-- **Context packs (Batch 013):** implement the complete persisted fragment lifecycle, stale detection, automatic collector dispatch, and task prompt injection on the settled scheduler.
+- **Review, repair, and boundaries (Batch 015):** add role-neutral task verification repair, structured task/phase review attribution, direct finding routing, independent budgets, and event-driven orchestrator/human boundaries. Generic multi-agent rounds remain ordinary JavaScript loops over the existing messaging/resume primitives rather than a reviewer-specific runtime abstraction.
 
 ## Remaining durable feature slices
 
@@ -126,7 +127,7 @@ Build the final task/phase orchestration around the existing verification primit
 
 The runtime supplies composition and routing primitives without hard-coding a worker/reviewer loop.
 
-### 7. Context packs
+### 7. Context packs — complete (Batch 013)
 
 Add versioned, immutable context fragments grouped into named packs. A newer fragment supersedes an older one; integrated commits that touch covered lines mark affected fragments stale. Later task dispatches resolve the newest non-stale fragment and inject it directly into the agent prompt without passing its content through the orchestrator.
 
@@ -191,6 +192,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted and integrated Batch 013 after Batch 014. Context packs now provide persisted immutable fragments, fresh/missing/stale resolution, automatic single collector dispatch, safe same-handle source reads, supersession, bounded task-only injection, and concurrent context preparation that does not block unrelated ready work.
 - **2026-07-19:** Accepted and integrated Batch 014 onto `codex/flowdex`. The installer now configures the current-user Codex desktop backend on Windows and macOS with strict executable identity checks and no scheduler/store coupling. The macOS path is statically and unit tested but still needs a real-host acceptance run when one is available.
 - **2026-07-19:** Anchored the accepted Batch 010/012 line plus integrated Batch 011 as the canonical `codex/flowdex` branch. Batch 012 reusable/nested workflows and Batch 011 AST-grep verification are complete. Prepared Batch 013 context packs and the disjoint Batch 014 Windows installer for parallel execution from that exact baseline.
 - **2026-07-18:** Accepted Batch 010: the final `startRun` scheduler now executes sequential phases, dependency-ready parallel tasks, dynamic queues, verification, integration, automatic progress, and app-visible StatusOnly agents. Started Batch 012 for reusable repository/global workflows and event-driven nesting on that settled API.
