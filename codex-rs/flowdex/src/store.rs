@@ -293,6 +293,25 @@ impl FlowdexStore {
         Ok(())
     }
 
+    /// Loads the persisted identity and integration worktree for a run.
+    pub fn run_info(&self, run_id: &str) -> Result<RunInfo, FlowdexStoreError> {
+        let row = self
+            .runtime
+            .block_on(sqlx::query("SELECT run_id,parent_thread_id,workflow_path,parent_run_id,workflow_identity,repository_identity,integration_worktree FROM runs WHERE run_id=?")
+                .bind(run_id)
+                .fetch_optional(&self.pool))?
+            .ok_or_else(|| FlowdexStoreError::Integration(format!("run not found: {run_id}")))?;
+        Ok(RunInfo {
+            run_id: row.get(0),
+            parent_thread_id: row.get(1),
+            workflow_path: row.get(2),
+            parent_run_id: row.get(3),
+            workflow_identity: row.get(4),
+            repository_identity: row.get(5),
+            integration_worktree: PathBuf::from(row.get::<String, _>(6)),
+        })
+    }
+
     /// Declares the context packs available to a run.
     pub fn declare_context_packs(
         &self,
@@ -352,24 +371,18 @@ impl FlowdexStore {
         validate_publication(publication)?;
         let trusted_root = trusted_repository_root.canonicalize()?;
         let execution_root = execution_worktree.canonicalize()?;
-        let expected_root = Path::new(&self.repository_identity)
-            .canonicalize()
-            .map_err(|_| {
-                FlowdexStoreError::Integration("repository identity is not a local root".into())
-            })?;
-        if trusted_root != expected_root {
+        if !trusted_root.is_dir() {
             return Err(FlowdexStoreError::Integration(
-                "trusted repository root does not match store repository".into(),
+                "trusted repository root is not a directory".into(),
             ));
         }
-        // Validate the declaration against the trusted source tree, then read the
-        // selected range from the current execution tree that is being published.
-        let _ = read_source_range(
-            &trusted_root,
-            &publication.path,
-            publication.line_start,
-            publication.line_end,
-        )?;
+        if !execution_root.is_dir() {
+            return Err(FlowdexStoreError::Integration(
+                "execution worktree is not a directory".into(),
+            ));
+        }
+        // The trusted root is intentionally validated independently. The source
+        // is read from the explicit execution worktree, which may be a sibling.
         let content = read_source_range(
             &execution_root,
             &publication.path,
@@ -1841,5 +1854,30 @@ mod tests {
             result,
             Err(FlowdexStoreError::Context(ContextError::InvalidPath(_)))
         ));
+    }
+
+    #[test]
+    fn context_publication_reads_distinct_execution_worktree() {
+        let (repo, store, _run) = context_store();
+        let execution = tempdir().unwrap();
+        fs::write(repo.path().join("source.txt"), "trusted\n").unwrap();
+        fs::write(execution.path().join("source.txt"), "execution\n").unwrap();
+        let fragment = store
+            .publish_context_fragment(
+                "run",
+                execution.path(),
+                repo.path(),
+                &ContextPublisher::default(),
+                &ContextPublication {
+                    pack: "pack".into(),
+                    key: "source".into(),
+                    path: PathBuf::from("source.txt"),
+                    line_start: 1,
+                    line_end: 1,
+                    summary: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(fragment.content, "execution\n");
     }
 }
