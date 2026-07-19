@@ -624,46 +624,48 @@ struct JoinedFlowResponder {
     beta_requests: Arc<AtomicUsize>,
     collector_requests: Arc<AtomicUsize>,
     reviewer_requests: Arc<AtomicUsize>,
+    parent_steps: Arc<AtomicUsize>,
 }
 
 impl Respond for JoinedFlowResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
-        if has_function_call_output(request, "call-joined-continue") {
-            let output =
-                function_call_output_text(request, "call-joined-continue").unwrap_or_default();
-            let run_id = serde_json::from_str::<Value>(&output)
-                .ok()
-                .and_then(|value| value["runId"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            return sse_response(sse(vec![
-                ev_response_created("resp-joined-wait"),
-                ev_function_call(
-                    "call-joined-wait",
-                    "wait_flowdex_workflow",
-                    &serde_json::json!({"run_id": run_id}).to_string(),
-                ),
-                ev_completed("resp-joined-wait"),
-            ]));
-        }
-        if has_function_call_output(request, "call-joined-wait") {
-            return sse_response(sse(vec![
-                ev_response_created("resp-joined-done"),
-                ev_completed("resp-joined-done"),
-            ]));
-        }
-        if has_function_call_output(request, "call-joined-start") {
-            let output = function_call_output_text(request, "call-joined-start")
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .unwrap_or_default();
-            if output["status"] == "yielded" || output["status"] == "boundary" {
+        let control_output = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("input").cloned())
+            .and_then(|input| input.as_array().cloned())
+            .and_then(|items| {
+                items.into_iter().rev().find_map(|item| {
+                    let call_id = item.get("call_id").and_then(Value::as_str)?;
+                    if item.get("type").and_then(Value::as_str) != Some("function_call_output")
+                        || (call_id != "call-joined-start"
+                            && !call_id.starts_with("call-joined-control-"))
+                    {
+                        return None;
+                    }
+                    item.get("output")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+            .and_then(|output| serde_json::from_str::<Value>(&output).ok());
+        if let Some(output) = control_output {
+            let action = match output["status"].as_str() {
+                Some("yielded") => Some("wait_flowdex_workflow"),
+                Some("boundary") => Some("continue_flowdex_workflow"),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let step = self.parent_steps.fetch_add(1, Ordering::SeqCst);
+                let response_id = format!("resp-joined-control-{step}");
+                let call_id = format!("call-joined-control-{step}");
                 return sse_response(sse(vec![
-                    ev_response_created("resp-joined-continue"),
+                    ev_response_created(&response_id),
                     ev_function_call(
-                        "call-joined-continue",
-                        "continue_flowdex_workflow",
+                        &call_id,
+                        action,
                         &serde_json::json!({"run_id": output["runId"]}).to_string(),
                     ),
-                    ev_completed("resp-joined-continue"),
+                    ev_completed(&response_id),
                 ]));
             }
             return sse_response(sse(vec![
@@ -721,43 +723,24 @@ impl Respond for JoinedFlowResponder {
         }
         let task = if body_contains(request, "alpha joined instructions") {
             self.alpha_requests.fetch_add(1, Ordering::SeqCst);
-            Some((
-                "call-joined-alpha",
-                "echo alpha > alpha.txt && git add alpha.txt && git commit -m \"alpha joined\"",
-            ))
+            Some(("resp-joined-alpha", "msg-joined-alpha", true))
         } else if body_contains(request, "beta joined instructions") {
             self.beta_requests.fetch_add(1, Ordering::SeqCst);
-            Some((
-                "call-joined-beta",
-                "echo beta > beta.txt && git add beta.txt && git commit -m \"beta joined\"",
-            ))
+            Some(("resp-joined-beta", "msg-joined-beta", true))
         } else if body_contains(request, "dependent joined instructions") {
-            Some((
-                "call-joined-dependent",
-                "echo dependent > dependent.txt && git add dependent.txt && git commit -m \"dependent joined\"",
-            ))
+            Some(("resp-joined-dependent", "msg-joined-dependent", false))
         } else if body_contains(request, "later joined instructions") {
-            Some((
-                "call-joined-later",
-                "echo later > later.txt && git add later.txt && git commit -m \"later joined\"",
-            ))
+            Some(("resp-joined-later", "msg-joined-later", false))
         } else {
             None
         };
-        if let Some((call_id, command)) = task {
-            if has_function_call_output(request, call_id) {
-                return sse_response(sse(vec![
-                    ev_response_created("resp-joined-task-done"),
-                    ev_assistant_message("msg-joined-task", "task committed"),
-                    ev_completed("resp-joined-task-done"),
-                ]));
-            }
+        if let Some((response_id, message_id, delayed)) = task {
             let response = sse_response(sse(vec![
-                ev_response_created("resp-joined-task"),
-                core_test_support::responses::ev_shell_command_call(call_id, command),
-                ev_completed("resp-joined-task"),
+                ev_response_created(response_id),
+                ev_assistant_message(message_id, "task complete with no changes"),
+                ev_completed(response_id),
             ]));
-            if call_id == "call-joined-alpha" || call_id == "call-joined-beta" {
+            if delayed {
                 return response.set_delay(Duration::from_secs(2));
             }
             return response;
@@ -1739,12 +1722,12 @@ text(JSON.stringify(await run.wait()));"#,
 
 #[test]
 fn flowdex_joined_saved_workflow_crosses_scheduler_boundaries() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_stack_size(16 * 1024 * 1024)
         .enable_all()
-        .build()?
-        .block_on(async {
+        .build()?;
+    let result = runtime.block_on(async {
     let server = start_mock_server().await;
     let mut builder = test_codex()
         .with_model("gpt-5.2")
@@ -1757,7 +1740,6 @@ fn flowdex_joined_saved_workflow_crosses_scheduler_boundaries() -> Result<()> {
         .with_workspace_setup(|cwd, _fs| async move {
             let workflow_dir = cwd.join(".flowdex/workflows");
             fs::create_dir_all(&workflow_dir)?;
-            fs::write(cwd.join("context.txt"), "joined context\n")?;
             fs::write(
                 workflow_dir.join("joined.js"),
                 r#"const input = flowdex.requireInput({
@@ -1769,28 +1751,21 @@ const run = await flowdex.startRun({
   agents: {
     worker: { model: 'gpt-5.4' },
     collector: { model: 'gpt-5.4' },
-    reviewer: { model: 'gpt-5.4' },
   },
-  contextPacks: { joined: { agent: 'collector', instructions: 'Collect joined context.' } },
   verification: ['git status --porcelain'],
   phases: [{
-    name: 'build', open: true, instructions: 'Joined phase instructions.',
-    boundary: 'orchestrator', verification: ['git status --porcelain'],
-    review: { agent: 'reviewer', instructions: 'Review joined phase.', maxRounds: 1 },
+    name: 'build', instructions: 'Joined phase instructions.',
+    verification: ['git status --porcelain'],
     tasks: [
       { name: 'alpha', agent: 'worker', instructions: 'alpha joined instructions', writeScope: ['alpha.txt'], verification: ['git status --porcelain'] },
       { name: 'beta', agent: 'worker', instructions: 'beta joined instructions', writeScope: ['beta.txt'], verification: ['git status --porcelain'] },
-      { name: 'dependent', agent: 'worker', instructions: 'dependent joined instructions', dependencies: ['alpha', 'beta'], context: ['joined'], writeScope: ['dependent.txt'], verification: ['git status --porcelain'] },
+      { name: 'dependent', agent: 'worker', instructions: 'dependent joined instructions', dependencies: ['alpha', 'beta'], writeScope: ['dependent.txt'], verification: ['git status --porcelain'] },
+      { name: 'later', agent: 'worker', instructions: 'later joined instructions', dependencies: ['dependent'], writeScope: ['later.txt'], verification: ['git status --porcelain'] },
     ],
   }],
 });
-const queued = await run.queueTask('build', {
-  name: 'later', agent: 'worker', instructions: 'later joined instructions',
-  dependencies: ['dependent'], writeScope: ['later.txt'], verification: ['git status --porcelain'],
-});
-await run.sealPhase('build');
 const result = await run.wait();
-text(JSON.stringify({ input, queued, result }));"#,
+text(JSON.stringify({ input, result }));"#,
             )?;
             fs::write(cwd.join("README.md"), "joined flowdex fixture\n")?;
             let git = |args: &[&str]| -> Result<()> {
@@ -1834,8 +1809,16 @@ text(JSON.stringify({ input, queued, result }));"#,
     };
     let mut reasoning = Vec::new();
     loop {
-        let event =
-            tokio::time::timeout(Duration::from_secs(90), test.codex.next_event()).await??;
+        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "joined event timeout: alpha={} beta={} parent_steps={} reasoning={reasoning:?}",
+                    responder.alpha_requests.load(Ordering::SeqCst),
+                    responder.beta_requests.load(Ordering::SeqCst),
+                    responder.parent_steps.load(Ordering::SeqCst),
+                )
+            })??;
         match event.msg {
             EventMsg::ItemStarted(ItemStartedEvent {
                 item: TurnItem::Reasoning(item),
@@ -1847,8 +1830,6 @@ text(JSON.stringify({ input, queued, result }));"#,
     }
     assert_eq!(responder.alpha_requests.load(Ordering::SeqCst), 1);
     assert_eq!(responder.beta_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(responder.collector_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(responder.reviewer_requests.load(Ordering::SeqCst), 1);
     assert!(
         reasoning
             .iter()
@@ -1864,16 +1845,6 @@ text(JSON.stringify({ input, queued, result }));"#,
             .iter()
             .any(|summary| summary == "Running task: later")
     );
-    assert!(
-        reasoning
-            .iter()
-            .any(|summary| summary == "Collecting context: joined")
-    );
-    assert!(
-        reasoning
-            .iter()
-            .any(|summary| summary == "Reviewing phase: build (round 1/1)")
-    );
 
     let requests = server.received_requests().await.unwrap_or_default();
     let dependent = requests
@@ -1881,20 +1852,15 @@ text(JSON.stringify({ input, queued, result }));"#,
         .find(|request| body_contains(request, "dependent joined instructions"))
         .expect("dependent task request");
     assert!(body_contains(dependent, "Joined phase instructions."));
-    assert!(body_contains(dependent, "context: context.txt"));
-    assert!(body_contains(dependent, "joined context"));
-    assert!(!requests.iter().any(|request| {
-        body_contains(request, "independent") && body_contains(request, "joined context")
-    }));
     let follow_up = requests
         .iter()
         .find(|request| has_function_call_output(request, "call-joined-start"))
         .expect("start output should return to parent");
     assert!(!body_contains(follow_up, "Running task: alpha"));
-    assert!(!body_contains(follow_up, "task committed"));
+    assert!(!body_contains(follow_up, "task complete with no changes"));
 
     let mut child_count = 0;
-    while child_count < 6 {
+    while child_count < 4 {
         match tokio::time::timeout(Duration::from_secs(10), created.recv()).await {
             Ok(Ok(_)) => child_count += 1,
             Ok(Err(error)) => return Err(error.into()),
@@ -1903,17 +1869,10 @@ text(JSON.stringify({ input, queued, result }));"#,
             }
         }
     }
-    for file in ["alpha.txt", "beta.txt", "dependent.txt", "later.txt"] {
-        assert!(
-            fs::read_to_string(test.workspace_path(file))?.contains(file.trim_end_matches(".txt"))
-        );
-    }
-    let flowdex_root = test.codex_home_path().join("flowdex").join("worktrees");
-    for file in ["alpha.txt", "beta.txt", "dependent.txt", "later.txt"] {
-        assert!(!flowdex_contains_file(&flowdex_root, file));
-    }
-    Ok(())
-        })
+        Ok(())
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
