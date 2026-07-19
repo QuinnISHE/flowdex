@@ -39,22 +39,19 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **AST-grep rule runtime (Batch 011, integrated after Batch 012):** approved repository rules, strict global/repository configuration, explicit workflow checks, automatic post-command verification, bounded findings, and trusted-root/task-worktree separation are complete on the authoritative scheduler line.
 - **Desktop app-backend installer (Batch 014):** `codex flowdex install --binary <path>` validates a compiled Codex executable and persistently selects it through `CODEX_CLI_PATH` for the current Windows or macOS user. Windows uses the user environment registry; macOS maintains an idempotent marked block in the supported login-shell profile. Other platforms and unsupported shells fail without mutation.
 - **Context packs (Batch 013):** workflows declare named packs and task requirements; immutable fragments are persisted with source hashes and supersession, missing or stale packs dispatch one ordinary collector, unrelated ready tasks continue concurrently, and only dependent task prompts receive bounded fresh context.
+- **Review, repair, and boundaries (Batch 015):** task verification can repair through the declared task agent, task and phase reviews use any declared agent plus a review-only structured reporting tool, findings route through exact commit attribution, verification and review budgets remain independent, and orchestrator/human boundaries suspend event-driven without consuming steering. Generic multi-agent rounds remain ordinary role-neutral JavaScript loops over messaging and resume primitives.
 
 ### Partial or correction needed
 
-- **Workflow authoring API:** run/phase/task scheduling, reusable nested workflows, and context requirements are settled. Review/repair composition, boundaries, and tool profiles remain additive final-language slices.
-- **Workflow event wait:** waiting for the V8 cell and user steering works. Waiting on durable workflow, phase, task, checkpoint, command, and explicit-signal events belongs to the scheduler that will own those states.
+- **Workflow authoring API:** run/phase/task scheduling, reusable nested workflows, context requirements, review/repair, and boundaries are settled. Tool profiles remain the final additive language slice.
+- **Workflow event wait:** V8-cell completion, scheduler completion/escalation/boundaries, and user steering are event-driven. Explicit named workflow signals remain.
 - **Configuration:** compaction and AST-grep settings use strict global/repository precedence. Tool profiles, agent defaults, and round limits remain.
-
-### In progress
-
-- **Review, repair, and boundaries (Batch 015):** add role-neutral task verification repair, structured task/phase review attribution, direct finding routing, independent budgets, and event-driven orchestrator/human boundaries. Generic multi-agent rounds remain ordinary JavaScript loops over the existing messaging/resume primitives rather than a reviewer-specific runtime abstraction.
 
 ## Remaining durable feature slices
 
 These are capability groups, not a mandatory batch order. Before implementing one, settle the part of its final public contract that its code owns. Do not create a temporary public API with a planned replacement.
 
-### 1. Final workflow definition contract
+### 1. Final workflow definition contract — complete through Batch 015
 
 Define the durable JavaScript authoring vocabulary for runs, reusable agents, phases, tasks, dependencies, verification, review, context requirements, boundaries, and strict workflow input schemas. It should support both initially declared work and later dynamic additions without exposing internal paths, database rows, operation IDs, or scheduler bookkeeping.
 
@@ -108,13 +105,15 @@ Requirements:
 
 The explicit progress API should be removed or made wholly internal as part of this correction; do not preserve it through a compatibility shim.
 
-### 5. Boundaries, suspension, and workflow events
+### 5. Boundaries and suspension — complete; explicit signals remain
 
 Implement task, phase, and run boundaries for automatic continuation, orchestrator escalation, and human approval/revision. Extend event-driven suspension to scheduler-owned completion, checkpoints, explicit workflow signals, and escalations.
 
 User steering must always interrupt an active wait. Steering does not implicitly cancel the run; it returns control to the orchestrator, which can decide what to do.
 
-### 6. Verification repair and review composition
+Batch 015 completed scheduler boundaries, escalation waits, and steering preservation. The remaining work in this slice is the small named-signal primitive used by workflow code and event-driven waits.
+
+### 6. Verification repair and review composition — complete (Batch 015)
 
 Build the final task/phase orchestration around the existing verification primitive:
 
@@ -192,6 +191,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted Batch 015 and fast-forwarded `codex/flowdex` to `e360b5fe6c`. Verification repair, generic task/phase reviews, exact attribution routing, independent budgets, retained reviewed worktrees, and event-driven orchestrator/human boundaries are complete. Review-specific behavior is limited to the structured report tool; arbitrary agent rounds remain workflow-authored JavaScript.
 - **2026-07-19:** Started Batch 015 from authoritative commit `59a9acbf90`. The batch combines verification repair, structured task/phase review attribution, direct repair routing, independent budgets, and event-driven boundaries. Generic multi-agent rounds remain workflow-defined JavaScript control flow over role-neutral messaging and resume primitives.
 - **2026-07-19:** Accepted and integrated Batch 013 after Batch 014. Context packs now provide persisted immutable fragments, fresh/missing/stale resolution, automatic single collector dispatch, safe same-handle source reads, supersession, bounded task-only injection, and concurrent context preparation that does not block unrelated ready work.
 - **2026-07-19:** Accepted and integrated Batch 014 onto `codex/flowdex`. The installer now configures the current-user Codex desktop backend on Windows and macOS with strict executable identity checks and no scheduler/store coupling. The macOS path is statically and unit tested but still needs a real-host acceptance run when one is available.
