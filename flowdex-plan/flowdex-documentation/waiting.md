@@ -20,7 +20,13 @@ reuse the start result shape and bounds:
 { "runId": "cell-1", "status": "yielded", "output": "..." }
 ```
 
-`status` is one of `yielded`, `completed`, `failed`, or `terminated`.
+`status` is one of `yielded`, `completed`, `failed`, or `terminated`. A
+boundary result is also possible:
+
+```json
+{ "runId": "run-1", "status": "boundary", "scopeKind": "task",
+  "scopeName": "parser", "target": "orchestrator", "reason": "review exhausted" }
+```
 `output` is bounded as in code mode. `error` is optional and appears only for a
 JavaScript failure.
 
@@ -48,6 +54,11 @@ The tool is invoked by the orchestrator model. It is not available in saved
 JavaScript's nested `tools` object, `functions.exec`, or the general code-mode
 nested tool set. Workflows use the existing `yield_control()` helper when they
 explicitly need to wake the orchestrator.
+
+For a boundary, call the direct model-only
+`continue_flowdex_workflow({ "run_id": "run-1" })` tool. It accepts exactly
+`run_id`, resumes that run's current boundary once, and rejects missing, stale,
+terminal, or already-consumed boundaries. Steering wakes do not consume it.
 
 ## Current limits
 

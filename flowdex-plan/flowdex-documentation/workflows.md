@@ -7,6 +7,7 @@ resolves to a frozen handle with exactly `id`, `queueTask`, `sealPhase`, and
 ```js
 const run = await flowdex.startRun({
   name: "update-record-layout",
+  boundary: "continue",
   agents: {
     implementer: { profile: "implementation_worker" },
     fastFix: { model: "gpt-5.6-luna", reasoningEffort: "high" },
@@ -15,6 +16,8 @@ const run = await flowdex.startRun({
     {
       name: "implementation",
       instructions: "Implement the record-layout changes and commit each task.",
+      boundary: "continue",
+      review: { agent: "fastFix", instructions: "Review the integrated phase changes.", maxRounds: 2 },
       verification: ["cargo test -p record-layout"],
       tasks: [
         {
@@ -24,6 +27,9 @@ const run = await flowdex.startRun({
           readScope: ["src/parser/**"],
           writeScope: ["src/parser/**"],
           verification: ["cargo test -p parser"],
+          verificationRepairLimit: 2,
+          review: { agent: "fastFix", instructions: "Review this task's committed diff.", maxRounds: 2 },
+          boundary: "continue",
         },
         {
           name: "serializer",
@@ -93,9 +99,50 @@ definition is validated atomically.
 
 The first task, phase, or run failure (including agent, verification, commit
 attribution, or integration failure) rejects `wait()` with the bounded tool
-error and preserves task/worktree evidence. There are no repair loops, review
-budgets, boundaries, signals, generic waits, profiles, configurable Flowdex
-concurrency controls, or scheduler restart recovery in this version.
+error and preserves task/worktree evidence.
+
+## Review, repair, and boundaries
+
+`boundary` is exactly `"continue"`, `"orchestrator"`, or `"human"`; omission
+means `"continue"`. `verificationRepairLimit` is a non-negative integer and
+defaults to zero. An optional `review` has exactly `agent`, `instructions`, and
+positive integer `maxRounds`; the agent must exist in `agents` and has no
+special role. Verification and review budgets are independent. Exhaustion or
+an unattributed finding pauses at the orchestrator (or human for a `"human"`
+boundary); unresolved findings never auto-continue.
+
+During a review, the declared agent can call only:
+
+```js
+report_flowdex_review({ findings: [{
+  file: "src/parser.rs", lineStart: 42, lineEnd: 48,
+  reason: "Field order is incorrect.", ruleKey: "parser.field-order",
+  astGrepSuitable: false,
+}] });
+```
+
+Findings require non-empty `file` and `reason`, positive inclusive lines with
+`lineEnd >= lineStart`, optional non-empty `ruleKey`, and required boolean
+`astGrepSuitable`; unknown fields are rejected. Exactly one accepted report is
+required per review operation. `findings: []` is an explicit pass; completion
+without a report is an error. Attribution follows finding lines to the
+integrated commit, source commit, task operation, and agent, then falls back to
+the most recent run commit touching the file. Unattributed findings pause.
+Repairs are sent directly to the attributed task agent, reverifed, and consume
+a review round only when the next report still has findings.
+
+Minimal non-review saved workflow (ordinary JavaScript and numeric budget):
+
+```js
+const a = await flowdex.spawnAgent({ name: "research-a", instructions: "Research the question.", model: "gpt-5.6-luna" });
+const b = await flowdex.spawnAgent({ name: "research-b", instructions: "Research the question independently.", model: "gpt-5.6-luna" });
+for (let round = 0; round < 2; round++) {
+  const result = await flowdex.resumeAgent(a, `Round ${round}: report findings.`);
+  await flowdex.sendMessage(b, JSON.stringify(result), { delivery: "turn" });
+  const reply = await flowdex.waitAgent(b);
+  if (reply.status !== "completed") break;
+}
+```
 
 Scheduler transitions emit concise automatic reasoning summaries through the
 live app UI. They are not callable progress methods, are not added to model
