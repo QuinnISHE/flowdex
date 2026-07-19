@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_features::Feature;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -9,7 +10,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
-use codex_protocol::ThreadId;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -25,17 +25,17 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use wiremock::matchers::method;
-use wiremock::matchers::path_regex;
 use wiremock::Mock;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -726,12 +726,14 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
     assert_eq!(replacement_request.body_json()["model"], "gpt-5.4");
     let follow_up_request = follow_up.single_request();
     assert!(!follow_up_request.body_contains_text("completed work: initial"));
-    assert!(server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .all(|request| !body_contains(request, "must not dispatch")));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|request| !body_contains(request, "must not dispatch"))
+    );
     Ok(())
 }
 
@@ -1372,17 +1374,21 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
     }
     assert_eq!(responder.collector_requests.load(Ordering::SeqCst), 2);
     assert_eq!(responder.independent_requests.load(Ordering::SeqCst), 1);
-    assert!(responder
-        .independent_started_before_collector
-        .load(Ordering::SeqCst));
+    assert!(
+        responder
+            .independent_started_before_collector
+            .load(Ordering::SeqCst)
+    );
     assert_eq!(responder.first_requests.load(Ordering::SeqCst), 1);
     assert_eq!(responder.second_requests.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.iter().any(|request| body_contains(request, "OLD")));
     assert!(requests.iter().any(|request| body_contains(request, "NEW")));
-    assert!(requests
-        .iter()
-        .any(|request| body_contains(request, "context: context.txt")));
+    assert!(
+        requests
+            .iter()
+            .any(|request| body_contains(request, "context: context.txt"))
+    );
     let flowdex_root = test.codex_home_path().join("flowdex").join("worktrees");
     assert!(!flowdex_contains_file(&flowdex_root, "context.txt"));
     let parent_requests = requests
