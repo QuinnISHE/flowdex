@@ -286,6 +286,12 @@ pub struct PendingBoundary {
     pub transition: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSignal {
+    pub id: i64,
+    pub signal: String,
+}
+
 pub struct FlowdexStore {
     pool: SqlitePool,
     runtime: ManuallyDrop<tokio::runtime::Runtime>,
@@ -587,8 +593,8 @@ impl FlowdexStore {
                 .bind(&definition.name).bind(encode(&definition.verification)).bind(RunState::Queued.as_str()).bind(boundary_name(definition.boundary)).bind(&info.run_id)
                 .execute(&mut *tx).await?;
             for (agent_name, agent) in &definition.agents {
-                sqlx::query("INSERT INTO workflow_agents(run_id,name,profile,model,reasoning_effort) VALUES (?,?,?,?,?)")
-                    .bind(&info.run_id).bind(agent_name).bind(agent.profile.as_deref()).bind(agent.model.as_deref()).bind(agent.reasoning_effort.as_deref()).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO workflow_agents(run_id,name,profile,model,reasoning_effort,tool_profile) VALUES (?,?,?,?,?,?)")
+                    .bind(&info.run_id).bind(agent_name).bind(agent.profile.as_deref()).bind(agent.model.as_deref()).bind(agent.reasoning_effort.as_deref()).bind(agent.tool_profile.as_deref()).execute(&mut *tx).await?;
             }
             for (index, phase) in definition.phases.iter().enumerate() {
                 sqlx::query("INSERT INTO workflow_phases(run_id,name,declaration_order,instructions,open,sealed,verification,state,boundary,review_agent,review_instructions,review_max_rounds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -723,12 +729,55 @@ impl FlowdexStore {
         run_id: &str,
         name: &str,
     ) -> Result<crate::workflow::AgentDefinition, FlowdexStoreError> {
-        let row = self.runtime.block_on(sqlx::query("SELECT profile,model,reasoning_effort FROM workflow_agents WHERE run_id=? AND name=?").bind(run_id).bind(name).fetch_optional(&self.pool))?.ok_or_else(|| FlowdexStoreError::Integration(format!("agent not found: {name}")))?;
+        let row = self.runtime.block_on(sqlx::query("SELECT profile,model,reasoning_effort,tool_profile FROM workflow_agents WHERE run_id=? AND name=?").bind(run_id).bind(name).fetch_optional(&self.pool))?.ok_or_else(|| FlowdexStoreError::Integration(format!("agent not found: {name}")))?;
         Ok(crate::workflow::AgentDefinition {
             profile: row.get(0),
             model: row.get(1),
             reasoning_effort: row.get(2),
+            tool_profile: row.get(3),
         })
+    }
+
+    pub fn enqueue_signal(&self, run_id: &str, signal: &str) -> Result<(), FlowdexStoreError> {
+        if signal.trim().is_empty() {
+            return Err(FlowdexStoreError::Operation(
+                "signal name must be non-empty".to_string(),
+            ));
+        }
+        self.runtime.block_on(
+            sqlx::query("INSERT INTO pending_signals(run_id,signal) VALUES (?,?)")
+                .bind(run_id)
+                .bind(signal)
+                .execute(&self.pool),
+        )?;
+        Ok(())
+    }
+
+    pub fn oldest_pending_signal(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PendingSignal>, FlowdexStoreError> {
+        let row = self.runtime.block_on(
+            sqlx::query(
+                "SELECT signal_id,signal FROM pending_signals WHERE run_id=? ORDER BY signal_id LIMIT 1",
+            )
+            .bind(run_id)
+            .fetch_optional(&self.pool),
+        )?;
+        Ok(row.map(|row| PendingSignal {
+            id: row.get(0),
+            signal: row.get(1),
+        }))
+    }
+
+    pub fn consume_signal(&self, run_id: &str, signal_id: i64) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(
+            sqlx::query("DELETE FROM pending_signals WHERE run_id=? AND signal_id=?")
+                .bind(run_id)
+                .bind(signal_id)
+                .execute(&self.pool),
+        )?;
+        Ok(())
     }
 
     pub fn run_metadata(&self, run_id: &str) -> Result<RunMetadata, FlowdexStoreError> {
@@ -1678,7 +1727,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
       CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued',verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue');
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
       CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue',review_agent TEXT,review_instructions TEXT,review_max_rounds INTEGER,PRIMARY KEY(run_id,name));
-      CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,PRIMARY KEY(run_id,name));
+      CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,tool_profile TEXT,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS workflow_tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,phase TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL DEFAULT '',declaration_order INTEGER NOT NULL,agent TEXT NOT NULL,dependencies TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,verification_repair_limit INTEGER NOT NULL DEFAULT 0,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue',review_agent TEXT,review_instructions TEXT,review_max_rounds INTEGER,UNIQUE(run_id,phase,name));
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
@@ -1689,6 +1738,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
       CREATE TABLE IF NOT EXISTS review_findings(finding_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,finding_order INTEGER NOT NULL,file TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,reason TEXT NOT NULL,rule_key TEXT,ast_grep_suitable INTEGER NOT NULL,attributed_task_id TEXT,attributed_operation_id TEXT,attributed_agent_id TEXT);
       CREATE TABLE IF NOT EXISTS review_resolutions(finding_id TEXT NOT NULL,repair_operation_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,PRIMARY KEY(finding_id,repair_operation_id,source_commit));
       CREATE TABLE IF NOT EXISTS pending_boundaries(run_id TEXT NOT NULL,scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,target TEXT NOT NULL,reason TEXT NOT NULL,transition TEXT NOT NULL,PRIMARY KEY(run_id,scope_kind,scope_id));
+      CREATE TABLE IF NOT EXISTS pending_signals(signal_id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,signal TEXT NOT NULL);
       INSERT OR IGNORE INTO integration_lock(id,generation) VALUES(1,0);";
     for statement in statements
         .split(';')
@@ -1720,6 +1770,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE workflow_tasks ADD COLUMN review_agent TEXT",
         "ALTER TABLE workflow_tasks ADD COLUMN review_instructions TEXT",
         "ALTER TABLE workflow_tasks ADD COLUMN review_max_rounds INTEGER",
+        "ALTER TABLE workflow_agents ADD COLUMN tool_profile TEXT",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
@@ -2234,6 +2285,7 @@ mod tests {
                     profile: Some("implementation_worker".into()),
                     model: None,
                     reasoning_effort: None,
+                    tool_profile: Some("research".into()),
                 },
             )]
             .into_iter()
@@ -2279,6 +2331,14 @@ mod tests {
             Some("implementation_worker")
         );
         assert_eq!(
+            store
+                .workflow_agent("run", "worker")
+                .unwrap()
+                .tool_profile
+                .as_deref(),
+            Some("research")
+        );
+        assert_eq!(
             store.run_metadata("run").unwrap().verification,
             vec!["git diff --check"]
         );
@@ -2307,6 +2367,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_signals_are_fifo_and_independently_consumed() {
+        let (_repo, _home, store, _run) = store();
+        assert!(store.enqueue_signal("run", "  ").is_err());
+        store.enqueue_signal("run", "build-complete").unwrap();
+        store.enqueue_signal("run", "build-complete").unwrap();
+        store.enqueue_signal("run", "deploy-complete").unwrap();
+
+        let first = store.oldest_pending_signal("run").unwrap().unwrap();
+        let first_id = first.id;
+        assert_eq!(first.signal, "build-complete");
+        store.consume_signal("run", first.id).unwrap();
+        let second = store.oldest_pending_signal("run").unwrap().unwrap();
+        assert_ne!(second.id, first_id);
+        assert_eq!(second.signal, "build-complete");
+        store.consume_signal("run", second.id).unwrap();
+        let third = store.oldest_pending_signal("run").unwrap().unwrap();
+        assert_eq!(third.signal, "deploy-complete");
+        store.consume_signal("run", third.id).unwrap();
+        assert!(store.oldest_pending_signal("run").unwrap().is_none());
+    }
+
+    #[test]
     fn scheduler_readiness_sealing_and_dynamic_additions_are_ordered() {
         let (_repo, _home, store, run) = store();
         let task = |name: &str, dependencies: &[&str], write_scope: &[&str]| TaskDefinition {
@@ -2330,6 +2412,7 @@ mod tests {
                     profile: Some("implementation_worker".into()),
                     model: None,
                     reasoning_effort: None,
+                    tool_profile: None,
                 },
             )]
             .into_iter()
@@ -2410,6 +2493,7 @@ mod tests {
                     profile: Some("implementation_worker".into()),
                     model: None,
                     reasoning_effort: None,
+                    tool_profile: None,
                 },
             )]
             .into_iter()
