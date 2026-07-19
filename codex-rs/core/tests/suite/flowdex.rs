@@ -619,6 +619,77 @@ impl Respond for SchedulerAgentResponder {
 }
 
 #[derive(Clone, Default)]
+struct OrchestratorBoundaryResponder;
+
+impl Respond for OrchestratorBoundaryResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if has_function_call_output(request, "call-boundary-final-wait") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-done"),
+                ev_completed("resp-boundary-done"),
+            ]));
+        }
+        if has_function_call_output(request, "call-boundary-continue") {
+            let start: Value = function_call_output_text(request, "call-boundary-start")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-final-wait"),
+                ev_function_call(
+                    "call-boundary-final-wait",
+                    "wait_flowdex_workflow",
+                    &serde_json::json!({ "run_id": start["runId"] }).to_string(),
+                ),
+                ev_completed("resp-boundary-final-wait"),
+            ]));
+        }
+        if has_function_call_output(request, "call-boundary-start") {
+            let start: Value = function_call_output_text(request, "call-boundary-start")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            let boundary: Value = start["output"]
+                .as_str()
+                .and_then(|text| serde_json::from_str(text).ok())
+                .unwrap_or_default();
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-continue"),
+                ev_function_call(
+                    "call-boundary-continue",
+                    "continue_flowdex_workflow",
+                    &serde_json::json!({ "run_id": boundary["runId"] }).to_string(),
+                ),
+                ev_completed("resp-boundary-continue"),
+            ]));
+        }
+        if body_contains(request, "boundary task instructions") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-task"),
+                ev_assistant_message("msg-boundary-task", "task complete with no changes"),
+                ev_completed("resp-boundary-task"),
+            ]));
+        }
+        if body_contains(request, "run the orchestrator boundary workflow") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-start"),
+                ev_function_call(
+                    "call-boundary-start",
+                    "start_flowdex_workflow",
+                    &serde_json::json!({
+                        "path": ".flowdex/workflows/orchestrator-boundary.js"
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-boundary-start"),
+            ]));
+        }
+        sse_response(sse(vec![
+            ev_response_created("resp-boundary-empty"),
+            ev_completed("resp-boundary-empty"),
+        ]))
+    }
+}
+
+#[derive(Clone, Default)]
 struct JoinedFlowResponder {
     alpha_requests: Arc<AtomicUsize>,
     beta_requests: Arc<AtomicUsize>,
@@ -1869,6 +1940,110 @@ text(JSON.stringify({ input, result }));"#,
             }
         }
     }
+        Ok(())
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result
+}
+
+#[test]
+fn flowdex_orchestrator_boundary_continues_to_terminal_result() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let server = start_mock_server().await;
+        let mut builder = test_codex()
+            .with_model("gpt-5.2")
+            .with_config(|config| {
+                config.features.enable(Feature::CodeMode).unwrap();
+                config.features.enable(Feature::Collab).unwrap();
+                config.agent_max_threads = Some(4);
+                config.active_project.trust_level = Some(TrustLevel::Trusted);
+            })
+            .with_workspace_setup(|cwd, _fs| async move {
+                let workflow_dir = cwd.join(".flowdex/workflows");
+                fs::create_dir_all(&workflow_dir)?;
+                fs::write(
+                    workflow_dir.join("orchestrator-boundary.js"),
+                    r#"const run = await flowdex.startRun({
+  name: 'orchestrator-boundary-fixture',
+  agents: { worker: { model: 'gpt-5.4' } },
+  phases: [{
+    name: 'build', instructions: 'Boundary phase instructions.', boundary: 'orchestrator',
+    tasks: [{ name: 'only', agent: 'worker', instructions: 'boundary task instructions' }],
+  }],
+});
+const boundary = await run.wait();
+text(JSON.stringify(boundary));
+await new Promise(resolve => setTimeout(resolve, 15000));
+text(JSON.stringify(await run.wait()));"#,
+                )?;
+                fs::write(cwd.join("README.md"), "orchestrator boundary fixture\n")?;
+                let git = |args: &[&str]| -> Result<()> {
+                    let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                    anyhow::ensure!(output.status.success(), "git {args:?} failed");
+                    Ok(())
+                };
+                git(&["init"])?;
+                git(&["config", "user.name", "Flowdex Test"])?;
+                git(&["config", "user.email", "flowdex-test@example.com"])?;
+                git(&["add", "."])?;
+                git(&["commit", "-m", "boundary fixture baseline"])?;
+                Ok::<(), anyhow::Error>(())
+            });
+        let test = builder.build(&server).await?;
+        Mock::given(method("POST"))
+            .and(path_regex(".*/responses$"))
+            .respond_with(OrchestratorBoundaryResponder)
+            .mount(&server)
+            .await;
+
+        test.submit_turn("run the orchestrator boundary workflow")
+            .await?;
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let start_request = requests
+            .iter()
+            .find(|request| has_function_call_output(request, "call-boundary-start"))
+            .expect("yielded workflow result");
+        let start: Value = serde_json::from_str(
+            &function_call_output_text(start_request, "call-boundary-start").unwrap(),
+        )?;
+        assert_eq!(start["status"], "yielded");
+        let boundary: Value = serde_json::from_str(start["output"].as_str().unwrap_or_default())?;
+        assert_eq!(boundary["status"], "boundary");
+        assert_eq!(boundary["target"], "orchestrator");
+
+        let continue_request = requests
+            .iter()
+            .find(|request| has_function_call_output(request, "call-boundary-continue"))
+            .expect("continued boundary result");
+        let continued_text =
+            function_call_output_text(continue_request, "call-boundary-continue").unwrap();
+        let continued: Value = serde_json::from_str(&continued_text).map_err(|error| {
+            anyhow::anyhow!("invalid continue output {continued_text:?}: {error}")
+        })?;
+        assert_eq!(continued["runId"], boundary["runId"]);
+        assert_eq!(continued["status"], "continued");
+
+        let final_request = requests
+            .iter()
+            .find(|request| has_function_call_output(request, "call-boundary-final-wait"))
+            .expect("terminal workflow result");
+        let terminal: Value = serde_json::from_str(
+            &function_call_output_text(final_request, "call-boundary-final-wait").unwrap(),
+        )?;
+        assert_eq!(terminal["runId"], start["runId"]);
+        assert_eq!(terminal["status"], "completed");
+        assert!(terminal["output"].as_str().is_some_and(|output| {
+            output.contains(&format!(
+                r#""runId":"{}""#,
+                boundary["runId"].as_str().unwrap()
+            )) && output.contains(r#""status":"completed""#)
+        }));
         Ok(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
