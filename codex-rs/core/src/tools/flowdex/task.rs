@@ -290,17 +290,17 @@ async fn open_store(
 fn repository_identity(cwd: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .current_dir(cwd)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err("current environment is not a Git repository".to_string());
     }
-    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if common_dir.is_empty() {
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
         return Err("current environment is not a Git repository".to_string());
     }
-    std::fs::canonicalize(common_dir)
+    std::fs::canonicalize(root)
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|e| e.to_string())
 }
