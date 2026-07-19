@@ -14,6 +14,8 @@ workspace = true
 ast-grep-config = "0.40.0"
 ast-grep-core = { version = "0.40.0", default-features = false, features = ["tree-sitter"] }
 ast-grep-language = "0.40.0"
+codex-config = { workspace = true }
+codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 ignore = { workspace = true }
 libc = { workspace = true }

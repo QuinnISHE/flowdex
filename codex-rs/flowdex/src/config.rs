@@ -1,4 +1,8 @@
-use serde::Deserialize;
+use codex_config::McpServerConfig;
+use codex_config::config_toml::ToolsToml;
+use codex_protocol::config_types::WebSearchMode;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,10 +11,21 @@ use thiserror::Error;
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 150_000;
 
 /// Resolved Flowdex settings used by a session.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FlowdexConfig {
     pub compaction_reminder_threshold_tokens: i64,
     pub ast_grep_always_run: Vec<String>,
+    pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
+}
+
+/// Tool-related configuration that can be selected by a Flowdex agent.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolProfileConfig {
+    pub web_search: Option<WebSearchMode>,
+    pub tools: Option<ToolsToml>,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 /// Loads global settings and, when eligible, a trusted repository override.
@@ -24,6 +39,7 @@ pub fn load_config(
     let global_path = codex_home.join("flowdex.toml");
     let mut threshold = DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
     let mut ast_grep_always_run = Vec::new();
+    let mut tool_profiles = BTreeMap::new();
 
     if let Some(config) = read_partial(&global_path)? {
         if let Some(value) = config.compaction_reminder_threshold_tokens {
@@ -34,6 +50,7 @@ pub fn load_config(
             validate_rule_ids(&value, &global_path)?;
             ast_grep_always_run = value;
         }
+        tool_profiles.extend(config.tool_profiles);
     }
 
     if let Some(repository_root) = trusted_repository_root {
@@ -47,12 +64,14 @@ pub fn load_config(
                 validate_rule_ids(&value, &repository_path)?;
                 ast_grep_always_run = value;
             }
+            tool_profiles.extend(config.tool_profiles);
         }
     }
 
     Ok(FlowdexConfig {
         compaction_reminder_threshold_tokens: threshold,
         ast_grep_always_run,
+        tool_profiles,
     })
 }
 
@@ -61,6 +80,8 @@ pub fn load_config(
 struct PartialFlowdexConfig {
     compaction_reminder_threshold_tokens: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
+    #[serde(default)]
+    tool_profiles: BTreeMap<String, ToolProfileConfig>,
 }
 
 fn read_partial(path: &Path) -> Result<Option<PartialFlowdexConfig>, FlowdexConfigError> {
@@ -203,6 +224,39 @@ mod tests {
     }
 
     #[test]
+    fn loads_global_profiles_and_replaces_named_profiles_from_repository() {
+        let temp = tempdir().expect("temp dir");
+        let repository_root = temp.path().join("repo");
+        fs::create_dir_all(repository_root.join(".flowdex")).expect("repository config dir");
+        fs::write(
+            temp.path().join("flowdex.toml"),
+            r#"
+[tool_profiles.research]
+web_search = "live"
+
+[tool_profiles.docs]
+web_search = "cached"
+"#,
+        )
+        .expect("global config");
+        fs::write(
+            repository_root.join(".flowdex/config.toml"),
+            r#"
+[tool_profiles.research]
+web_search = "disabled"
+"#,
+        )
+        .expect("repository config");
+
+        let profiles = config(temp.path(), Some(&repository_root)).tool_profiles;
+        assert_eq!(
+            profiles["research"].web_search,
+            Some(WebSearchMode::Disabled)
+        );
+        assert_eq!(profiles["docs"].web_search, Some(WebSearchMode::Cached));
+    }
+
+    #[test]
     fn rejects_malformed_unknown_and_invalid_values_with_paths() {
         let temp = tempdir().expect("temp dir");
         let global_path = temp.path().join("flowdex.toml");
@@ -219,6 +273,10 @@ mod tests {
             (
                 "compaction_reminder_threshold_tokens = -1",
                 "value must be positive",
+            ),
+            (
+                "[tool_profiles.research]\nmodel = \"gpt-5\"",
+                "unknown field `model`",
             ),
         ];
         for (source, expected) in cases {

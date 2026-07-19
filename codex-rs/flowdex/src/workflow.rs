@@ -25,6 +25,7 @@ pub struct AgentDefinition {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub tool_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -174,9 +175,14 @@ impl WorkflowDefinition {
             {
                 return Err(WorkflowValidationError::AgentWithoutSelector(name.clone()));
             }
-            for value in [&agent.profile, &agent.model, &agent.reasoning_effort]
-                .into_iter()
-                .flatten()
+            for value in [
+                &agent.profile,
+                &agent.model,
+                &agent.reasoning_effort,
+                &agent.tool_profile,
+            ]
+            .into_iter()
+            .flatten()
             {
                 non_empty("agent selector", value)?;
             }
@@ -452,6 +458,7 @@ mod tests {
                     profile: Some("worker".into()),
                     model: None,
                     reasoning_effort: None,
+                    tool_profile: None,
                 },
             )]
             .into_iter()
@@ -563,5 +570,17 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.boundary, Boundary::Continue);
         assert_eq!(parsed.verification_repair_limit, 0);
+
+        let agent = serde_json::from_value::<AgentDefinition>(serde_json::json!({
+            "toolProfile": "research"
+        }))
+        .unwrap();
+        assert_eq!(agent.tool_profile.as_deref(), Some("research"));
+        assert!(
+            serde_json::from_value::<AgentDefinition>(serde_json::json!({
+                "tool_profile": "research"
+            }))
+            .is_err()
+        );
     }
 }
