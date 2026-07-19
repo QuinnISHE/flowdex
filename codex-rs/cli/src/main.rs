@@ -50,6 +50,7 @@ mod app_cmd;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
+mod flowdex_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
@@ -209,6 +210,9 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// Configure the Codex desktop app backend.
+    Flowdex(flowdex_cmd::FlowdexCli),
 }
 
 #[derive(Debug, Parser)]
@@ -1642,6 +1646,14 @@ async fn cli_main(
                 disable_feature_in_config(&feature).await?;
             }
         },
+        Some(Subcommand::Flowdex(flowdex_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "flowdex",
+            )?;
+            flowdex_cmd::run(flowdex_cli).await?;
+        }
     }
 
     Ok(())
@@ -2138,6 +2150,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
         Some(Subcommand::Features(_)) => Some("features"),
+        Some(Subcommand::Flowdex(_)) => Some("flowdex"),
     }
 }
 
