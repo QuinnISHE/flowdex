@@ -257,6 +257,25 @@ pub struct ReviewResolution {
     pub integrated_commit: Option<String>,
 }
 
+/// A bounded patch for one explicitly supplied commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedDiff {
+    pub source_commit: String,
+    pub integrated_commit: Option<String>,
+    pub patch: String,
+}
+
+/// The durable task/operation attribution for a review finding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewAttribution {
+    pub finding_id: String,
+    pub task_id: String,
+    pub operation_id: String,
+    pub agent_id: String,
+    pub source_commit: String,
+    pub integrated_commit: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingBoundary {
     pub run_id: String,
@@ -864,9 +883,206 @@ impl FlowdexStore {
         &self,
         resolution: &ReviewResolution,
     ) -> Result<(), FlowdexStoreError> {
-        self.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES (?,?,?,?) ON CONFLICT(finding_id,repair_operation_id,source_commit) DO UPDATE SET integrated_commit=excluded.integrated_commit")
-            .bind(&resolution.finding_id).bind(&resolution.repair_operation_id).bind(&resolution.source_commit).bind(&resolution.integrated_commit).execute(&self.pool))?;
+        self.runtime.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let finding_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM review_findings WHERE finding_id=?",
+            )
+            .bind(&resolution.finding_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if finding_exists == 0 {
+                return Err(FlowdexStoreError::Integration(format!(
+                    "review finding not found: {}",
+                    resolution.finding_id
+                )));
+            }
+            let repair_exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_commits WHERE operation_id=? AND source_commit=?",
+            )
+            .bind(&resolution.repair_operation_id)
+            .bind(&resolution.source_commit)
+            .fetch_one(&mut *tx)
+            .await?;
+            if repair_exists == 0 {
+                return Err(FlowdexStoreError::Integration(format!(
+                    "repair commit is not attributed to operation: {}:{}",
+                    resolution.repair_operation_id, resolution.source_commit
+                )));
+            }
+            sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES (?,?,?,?) ON CONFLICT(finding_id,repair_operation_id,source_commit) DO UPDATE SET integrated_commit=excluded.integrated_commit")
+                .bind(&resolution.finding_id).bind(&resolution.repair_operation_id).bind(&resolution.source_commit).bind(&resolution.integrated_commit).execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok::<(), FlowdexStoreError>(())
+        })?;
         Ok(())
+    }
+
+    pub fn review_resolutions(
+        &self,
+        finding_id: &str,
+    ) -> Result<Vec<ReviewResolution>, FlowdexStoreError> {
+        let rows = self.runtime.block_on(
+            sqlx::query("SELECT finding_id,repair_operation_id,source_commit,integrated_commit FROM review_resolutions WHERE finding_id=? ORDER BY repair_operation_id,source_commit")
+                .bind(finding_id)
+                .fetch_all(&self.pool),
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReviewResolution {
+                finding_id: row.get(0),
+                repair_operation_id: row.get(1),
+                source_commit: row.get(2),
+                integrated_commit: row.get(3),
+            })
+            .collect())
+    }
+
+    /// Returns bounded patches for the supplied task commits. No HEAD or range is inferred.
+    pub fn committed_diffs(
+        &self,
+        worktree: &Path,
+        commits: &[TaskCommit],
+        max_bytes: usize,
+    ) -> Result<Vec<CommittedDiff>, FlowdexStoreError> {
+        let mut remaining = max_bytes;
+        let mut diffs = Vec::with_capacity(commits.len());
+        for commit in commits {
+            let patch = commit_diff(worktree, &commit.source_commit, remaining)?;
+            remaining = remaining.saturating_sub(patch.len());
+            diffs.push(CommittedDiff {
+                source_commit: commit.source_commit.clone(),
+                integrated_commit: commit.integrated_commit.clone(),
+                patch,
+            });
+        }
+        Ok(diffs)
+    }
+
+    /// Returns bounded patches for explicitly supplied integrated phase commits.
+    pub fn integrated_phase_diffs(
+        &self,
+        worktree: &Path,
+        integrated_commits: &[String],
+        max_bytes: usize,
+    ) -> Result<Vec<CommittedDiff>, FlowdexStoreError> {
+        let commits = integrated_commits
+            .iter()
+            .map(|commit| TaskCommit {
+                source_commit: commit.clone(),
+                integrated_commit: Some(commit.clone()),
+                agent_id: String::new(),
+                model: String::new(),
+                summary: String::new(),
+            })
+            .collect::<Vec<_>>();
+        self.committed_diffs(worktree, &commits, max_bytes)
+    }
+
+    /// Attributes a finding to the Flowdex commit that owns its reported lines.
+    /// If no blamed line belongs to this run, the most recent run commit touching
+    /// the file is used as the required file-level fallback.
+    pub fn attribute_review_finding(
+        &self,
+        finding_id: &str,
+        integration_worktree: &Path,
+        integration_head: &str,
+    ) -> Result<Option<ReviewAttribution>, FlowdexStoreError> {
+        let row = self.runtime.block_on(
+            sqlx::query("SELECT f.file,f.line_start,f.line_end,o.run_id FROM review_findings f JOIN review_operations o ON o.operation_id=f.operation_id WHERE f.finding_id=?")
+                .bind(finding_id)
+                .fetch_optional(&self.pool),
+        )?.ok_or_else(|| FlowdexStoreError::Integration(format!("review finding not found: {finding_id}")))?;
+        let file: String = row.get(0);
+        let line_start: i64 = row.get(1);
+        let line_end: i64 = row.get(2);
+        let run_id: String = row.get(3);
+        let mut commits = self.runtime.block_on(sqlx::query("SELECT c.source_commit,c.integrated_commit,c.task_id,c.operation_id,c.agent_id,c.sequence FROM task_commits c JOIN tasks t ON t.task_id=c.task_id WHERE t.run_id=? AND c.integrated_commit IS NOT NULL ORDER BY c.sequence DESC")
+            .bind(&run_id).fetch_all(&self.pool))?;
+        if commits.is_empty() {
+            return Ok(None);
+        }
+        let history = git_stdout(
+            integration_worktree,
+            ["rev-list", "--first-parent", integration_head],
+        )?;
+        let order = history
+            .lines()
+            .enumerate()
+            .map(|(index, commit)| (commit, index))
+            .collect::<std::collections::HashMap<_, _>>();
+        commits.sort_by_key(|row| {
+            order
+                .get(row.get::<String, _>(1).as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        let mut selected = None;
+        if let Ok(blame) = git_stdout(
+            integration_worktree,
+            [
+                "blame",
+                "--line-porcelain",
+                &format!("-L{line_start},{line_end}"),
+                "--format=%H",
+                integration_head,
+                "--",
+                &file,
+            ],
+        ) {
+            let blamed = blame
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|sha| sha.len() >= 7 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .collect::<std::collections::HashSet<_>>();
+            for commit in &commits {
+                let integrated: String = commit.get(1);
+                if blamed.contains(integrated.as_str()) {
+                    selected = Some(commit);
+                    break;
+                }
+            }
+        }
+        if selected.is_none() {
+            let normalized_file = file.replace('\\', "/");
+            for commit in &commits {
+                let integrated: String = commit.get(1);
+                let files = git_stdout(
+                    integration_worktree,
+                    [
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        &integrated,
+                    ],
+                )?;
+                if files.lines().any(|path| path == normalized_file) {
+                    selected = Some(commit);
+                    break;
+                }
+            }
+        }
+        let Some(commit) = selected else {
+            return Ok(None);
+        };
+        let attribution = ReviewAttribution {
+            finding_id: finding_id.to_string(),
+            source_commit: commit.get(0),
+            integrated_commit: commit.get(1),
+            task_id: commit.get(2),
+            operation_id: commit.get(3),
+            agent_id: commit.get(4),
+        };
+        self.runtime.block_on(
+            sqlx::query("UPDATE review_findings SET attributed_task_id=?,attributed_operation_id=?,attributed_agent_id=? WHERE finding_id=?")
+                .bind(&attribution.task_id)
+                .bind(&attribution.operation_id)
+                .bind(&attribution.agent_id)
+                .bind(finding_id)
+                .execute(&self.pool),
+        )?;
+        Ok(Some(attribution))
     }
 
     pub fn set_pending_boundary(
@@ -914,17 +1130,19 @@ impl FlowdexStore {
     pub fn increment_verification_repairs(
         &self,
         scope_kind: &str,
+        run_id: &str,
         scope_id: &str,
     ) -> Result<i64, FlowdexStoreError> {
-        self.increment_scope_counter(scope_kind, scope_id, "verification_repair_count")
+        self.increment_scope_counter(scope_kind, run_id, scope_id, "verification_repair_count")
     }
 
     pub fn increment_review_rounds(
         &self,
         scope_kind: &str,
+        run_id: &str,
         scope_id: &str,
     ) -> Result<i64, FlowdexStoreError> {
-        self.increment_scope_counter(scope_kind, scope_id, "review_round_count")
+        self.increment_scope_counter(scope_kind, run_id, scope_id, "review_round_count")
     }
 
     pub fn increment_phase_verification_repairs(
@@ -964,16 +1182,17 @@ impl FlowdexStore {
     fn increment_scope_counter(
         &self,
         scope_kind: &str,
+        run_id: &str,
         scope_id: &str,
         column: &str,
     ) -> Result<i64, FlowdexStoreError> {
         let row = match (scope_kind, column) {
-            ("run", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET verification_repair_count=verification_repair_count+1 WHERE run_id=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
-            ("run", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET review_round_count=review_round_count+1 WHERE run_id=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
-            ("phase", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET verification_repair_count=verification_repair_count+1 WHERE name=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
-            ("phase", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET review_round_count=review_round_count+1 WHERE name=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
-            ("task", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET verification_repair_count=verification_repair_count+1 WHERE task_id=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
-            ("task", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET review_round_count=review_round_count+1 WHERE task_id=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("run", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET verification_repair_count=verification_repair_count+1 WHERE run_id=? RETURNING verification_repair_count").bind(run_id).fetch_optional(&self.pool))?,
+            ("run", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET review_round_count=review_round_count+1 WHERE run_id=? RETURNING review_round_count").bind(run_id).fetch_optional(&self.pool))?,
+            ("phase", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET verification_repair_count=verification_repair_count+1 WHERE run_id=? AND name=? RETURNING verification_repair_count").bind(run_id).bind(scope_id).fetch_optional(&self.pool))?,
+            ("phase", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET review_round_count=review_round_count+1 WHERE run_id=? AND name=? RETURNING review_round_count").bind(run_id).bind(scope_id).fetch_optional(&self.pool))?,
+            ("task", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET verification_repair_count=verification_repair_count+1 WHERE run_id=? AND task_id=? RETURNING verification_repair_count").bind(run_id).bind(scope_id).fetch_optional(&self.pool))?,
+            ("task", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET review_round_count=review_round_count+1 WHERE run_id=? AND task_id=? RETURNING review_round_count").bind(run_id).bind(scope_id).fetch_optional(&self.pool))?,
             _ => return Err(FlowdexStoreError::Integration(format!("unknown scope: {scope_kind}:{scope_id}"))),
         };
         let row = row.ok_or_else(|| {
@@ -1520,6 +1739,31 @@ where
         .map(|s| s.trim().to_string())
         .map_err(|_| FlowdexStoreError::Git("git returned invalid UTF-8".to_string()))
 }
+
+fn commit_diff(
+    worktree: &Path,
+    commit: &str,
+    max_bytes: usize,
+) -> Result<String, FlowdexStoreError> {
+    let output = run_git(
+        worktree,
+        [
+            "diff-tree",
+            "--root",
+            "--binary",
+            "--no-ext-diff",
+            "--no-commit-id",
+            "-p",
+            commit,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(FlowdexStoreError::Git(format_git_error(&output)));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| FlowdexStoreError::Git("git returned invalid UTF-8".to_string()))?;
+    Ok(bound_text(text, max_bytes))
+}
 fn run_git<I, S>(dir: &Path, args: I) -> Result<Output, FlowdexStoreError>
 where
     I: IntoIterator<Item = S>,
@@ -1538,9 +1782,13 @@ fn format_git_error(output: &Output) -> String {
     }
 }
 
-fn bound_git_output(mut text: String) -> String {
-    if text.len() > MAX_GIT_OUTPUT {
-        let mut end = MAX_GIT_OUTPUT;
+fn bound_git_output(text: String) -> String {
+    bound_text(text, MAX_GIT_OUTPUT)
+}
+
+fn bound_text(mut text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let mut end = max_bytes;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -1730,6 +1978,81 @@ mod tests {
     }
 
     #[test]
+    fn committed_diff_and_review_attribution_are_exact() {
+        let (repo, _home, store, run) = store();
+        let task = store
+            .create_task(
+                &run,
+                &TaskDeclaration {
+                    id: "task".into(),
+                    name: "n".into(),
+                    instructions: "i".into(),
+                    read_scope: vec![],
+                    write_scope: vec![],
+                    verification: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .start_operation("task", "op", "agent", "model")
+            .unwrap();
+        fs::write(task.worktree_path.join("reviewed.txt"), "reviewed\n").unwrap();
+        git(&task.worktree_path, &["add", "reviewed.txt"]);
+        git(&task.worktree_path, &["commit", "-qm", "reviewed"]);
+        let source = store.finish_operation("task", "op", "completed").unwrap();
+        let diffs = store.committed_diffs(repo.path(), &source, 4096).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].patch.contains("reviewed.txt"));
+        let integrated = store.integrate("task").unwrap().commits.remove(0);
+        store
+            .record_review_operation(&ReviewOperation {
+                operation_id: "review".into(),
+                run_id: run.run_id.clone(),
+                scope_kind: "task".into(),
+                scope_id: "task".into(),
+                round: 1,
+                reviewer_thread_id: "reviewer".into(),
+                state: "reported".into(),
+            })
+            .unwrap();
+        store
+            .record_review_findings(&[ReviewFinding {
+                finding_id: "finding".into(),
+                operation_id: "review".into(),
+                finding_order: 0,
+                file: "reviewed.txt".into(),
+                line_start: 1,
+                line_end: 1,
+                reason: "bad line".into(),
+                rule_key: None,
+                ast_grep_suitable: false,
+                attributed_task_id: None,
+                attributed_operation_id: None,
+                attributed_agent_id: None,
+            }])
+            .unwrap();
+        let attribution = store
+            .attribute_review_finding(
+                "finding",
+                repo.path(),
+                integrated.integrated_commit.as_deref().unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attribution.source_commit, source[0].source_commit);
+        assert_eq!(attribution.operation_id, "op");
+        store
+            .record_review_resolution(&ReviewResolution {
+                finding_id: "finding".into(),
+                repair_operation_id: "op".into(),
+                source_commit: source[0].source_commit.clone(),
+                integrated_commit: integrated.integrated_commit,
+            })
+            .unwrap();
+        assert_eq!(store.review_resolutions("finding").unwrap().len(), 1);
+    }
+
+    #[test]
     fn reservation_captures_head_before_operation_is_bound() {
         let (_repo, _home, store, run) = store();
         let task = store
@@ -1915,6 +2238,18 @@ mod tests {
         store.mark_task_integrated(&task_id).unwrap();
         store.mark_phase_completed("run", "phase").unwrap();
         store.mark_run_completed("run").unwrap();
+        assert_eq!(
+            store
+                .increment_review_rounds("phase", "run", "phase")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .increment_verification_repairs("task", "run", &task_id)
+                .unwrap(),
+            1
+        );
         assert_eq!(store.scheduler_task(&task_id).unwrap().state, "integrated");
         assert_eq!(store.run_metadata("run").unwrap().state, "completed");
     }
