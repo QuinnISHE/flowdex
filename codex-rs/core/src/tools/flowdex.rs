@@ -48,10 +48,7 @@ pub(crate) use agents::FlowdexWaitAgentHandler;
 pub(crate) use context::PublishFlowdexContextHandler;
 pub(crate) use context::ReadFlowdexContextHandler;
 pub(crate) use review::FlowdexReviewReportHandler;
-pub(crate) use review::activate_review_agent;
-pub(crate) use review::deactivate_review_agent;
 pub(crate) use review::review_report_tool_visible;
-pub(crate) use review::review_reported;
 pub(crate) use rules::FlowdexCheckRulesHandler;
 pub(crate) use scheduler::{
     FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
@@ -264,11 +261,11 @@ impl ContinueFlowdexWorkflowHandler {
             ));
         };
         let args: WaitArgs = parse_arguments(&arguments)?;
-        let (store, signal) = {
-            let mut registry = boundaries().lock().map_err(|_| {
+        let (store, boundary) = {
+            let registry = boundaries().lock().map_err(|_| {
                 FunctionCallError::RespondToModel("Flowdex boundary registry unavailable".into())
             })?;
-            let state = registry.get_mut(&args.run_id).ok_or_else(|| {
+            let state = registry.get(&args.run_id).ok_or_else(|| {
                 FunctionCallError::RespondToModel("Flowdex boundary not found".into())
             })?;
             if state.terminal {
@@ -281,25 +278,38 @@ impl ContinueFlowdexWorkflowHandler {
                     "Flowdex boundary is stale or already consumed".into(),
                 ));
             }
-            state.consumed = true;
             let boundary = state.signal.borrow().clone();
-            state.signal.send(None).map_err(|_| {
-                FunctionCallError::RespondToModel("Flowdex boundary waiters stopped".into())
-            })?;
             (Arc::clone(&state.store), boundary)
         };
-        let Some(boundary) = signal else {
+        let Some(boundary) = boundary else {
             return Err(FunctionCallError::RespondToModel(
                 "Flowdex boundary is stale or already consumed".into(),
             ));
         };
         let run_id = args.run_id.clone();
+        let scope_kind = boundary.scope_kind.clone();
+        let scope_id = boundary.scope_id.clone();
         tokio::task::spawn_blocking(move || {
-            store.clear_pending_boundary(&run_id, &boundary.scope_kind, &boundary.scope_id)
+            store.clear_pending_boundary(&run_id, &scope_kind, &scope_id)
         })
         .await
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+        let mut registry = boundaries().lock().map_err(|_| {
+            FunctionCallError::RespondToModel("Flowdex boundary registry unavailable".into())
+        })?;
+        let state = registry.get_mut(&args.run_id).ok_or_else(|| {
+            FunctionCallError::RespondToModel("Flowdex boundary not found".into())
+        })?;
+        if state.terminal || state.consumed || state.signal.borrow().as_ref() != Some(&boundary) {
+            return Err(FunctionCallError::RespondToModel(
+                "Flowdex boundary is stale or already consumed".into(),
+            ));
+        }
+        state.consumed = true;
+        state.signal.send(None).map_err(|_| {
+            FunctionCallError::RespondToModel("Flowdex boundary waiters stopped".into())
+        })?;
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
             serde_json::json!({"runId": args.run_id, "status": "continued"}).to_string(),
             Some(true),
@@ -460,7 +470,7 @@ impl WaitFlowdexWorkflowHandler {
     }
 }
 
-async fn wait_for_flowdex_boundary(run_id: String) -> PendingBoundary {
+pub(crate) async fn wait_for_flowdex_boundary(run_id: String) -> PendingBoundary {
     let Some(mut signal) = subscribe_flowdex_boundary(&run_id).await else {
         return std::future::pending().await;
     };

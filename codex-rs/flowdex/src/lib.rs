@@ -250,9 +250,28 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     };
     const selector = (value, label) =>
       value === undefined ? undefined : requireString(value, label);
+    const boundary = (value, label) => {
+      const result = value === undefined ? "continue" : requireString(value, label);
+      if (!["continue", "orchestrator", "human"].includes(result)) {
+        throw new TypeError(`${label} must be continue, orchestrator, or human`);
+      }
+      return result;
+    };
+    const reviewDefinition = (value, knownAgents, label) => {
+      if (value === undefined) return undefined;
+      requireObject(value, `${label}.review`);
+      requireKeys(value, new Set(["agent", "instructions", "maxRounds"]), `${label}.review`);
+      const agent = requireString(value.agent, `${label}.review.agent`);
+      if (!knownAgents.has(agent)) throw new TypeError(`${label}.review.agent is unknown`);
+      const instructions = requireString(value.instructions, `${label}.review.instructions`);
+      if (!Number.isInteger(value.maxRounds) || value.maxRounds <= 0) {
+        throw new TypeError(`${label}.review.maxRounds must be a positive integer`);
+      }
+      return { agent, instructions, maxRounds: value.maxRounds };
+    };
     const taskDefinition = (task, knownAgents, knownContextPacks, label = "task") => {
       requireObject(task, `${label} definition`);
-      requireKeys(task, new Set(["name", "agent", "instructions", "dependencies", "readScope", "writeScope", "verification", "context"]), label);
+      requireKeys(task, new Set(["name", "agent", "instructions", "dependencies", "readScope", "writeScope", "verification", "verificationRepairLimit", "review", "boundary", "context"]), label);
       const name = requireString(task.name, `${label}.name`);
       const agent = requireString(task.agent, `${label}.agent`);
       if (!knownAgents.has(agent)) throw new TypeError(`${label}.agent is unknown`);
@@ -260,6 +279,9 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       if (!Array.isArray(dependencies)) throw new TypeError(`${label}.dependencies must be an array`);
       const context = task.context === undefined ? [] : task.context;
       if (!Array.isArray(context)) throw new TypeError(`${label}.context must be an array`);
+      if (task.verificationRepairLimit !== undefined && (!Number.isInteger(task.verificationRepairLimit) || task.verificationRepairLimit < 0)) {
+        throw new TypeError(`${label}.verificationRepairLimit must be a non-negative integer`);
+      }
       const contextNames = new Set();
       const normalizedContext = context.map((pack, index) => {
         const name = requireString(pack, `${label}.context[${index}]`);
@@ -276,12 +298,15 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
         read_scope: commandArray(task.readScope, `${label}.readScope`),
         write_scope: commandArray(task.writeScope, `${label}.writeScope`),
         verification: commandArray(task.verification, `${label}.verification`),
+        verification_repair_limit: task.verificationRepairLimit === undefined ? 0 : task.verificationRepairLimit,
+        review: reviewDefinition(task.review, knownAgents, label),
+        boundary: boundary(task.boundary, `${label}.boundary`),
         context: normalizedContext,
       };
     };
 
     requireObject(definition, "startRun definition");
-    requireKeys(definition, new Set(["name", "agents", "phases", "verification", "contextPacks"]), "startRun");
+    requireKeys(definition, new Set(["name", "agents", "phases", "verification", "contextPacks", "boundary"]), "startRun");
     const runName = requireString(definition.name, "startRun.name");
     const agents = requireObject(definition.agents, "startRun.agents");
     const agentNames = new Set(Object.keys(agents));
@@ -324,7 +349,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     const phaseNames = new Set();
     const phases = definition.phases.map((phase, phaseIndex) => {
       requireObject(phase, `startRun.phases[${phaseIndex}]`);
-      requireKeys(phase, new Set(["name", "instructions", "tasks", "open", "verification"]), `startRun.phases[${phaseIndex}]`);
+      requireKeys(phase, new Set(["name", "instructions", "tasks", "open", "verification", "boundary", "review"]), `startRun.phases[${phaseIndex}]`);
       const name = requireString(phase.name, `startRun.phases[${phaseIndex}].name`);
       if (phaseNames.has(name)) throw new TypeError(`duplicate phase name: ${name}`);
       phaseNames.add(name);
@@ -362,10 +387,13 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
         tasks,
         open,
         verification: commandArray(phase.verification, `startRun.phases[${phaseIndex}].verification`),
+        boundary: boundary(phase.boundary, `startRun.phases[${phaseIndex}].boundary`),
+        review: reviewDefinition(phase.review, agentNames, `startRun.phases[${phaseIndex}]`),
       };
     });
     const normalized = {
       name: runName,
+      boundary: boundary(definition.boundary, "startRun.boundary"),
       agents: normalizedAgents,
       context_packs: normalizedContextPacks,
       phases,
@@ -394,7 +422,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       },
       wait: async () => {
         const result = await tools.flowdex_wait_run({ run_id: id });
-        return { runId: result.runId, status: result.status };
+        return result;
       },
     };
     return Object.freeze(handle);
@@ -1141,6 +1169,14 @@ mod tests {
         assert!(loaded.source.contains("key !== \"contextMode\""));
         assert!(loaded.source.contains("createTask unknown field"));
         assert!(loaded.source.contains("runAgent unknown field"));
+        assert!(loaded.source.contains("verificationRepairLimit"));
+        assert!(loaded.source.contains("startRun.boundary"));
+        assert!(
+            loaded
+                .source
+                .contains("startRun.phases[${phaseIndex}].boundary")
+        );
+        assert!(loaded.source.contains("review.maxRounds"));
         assert!(
             loaded
                 .source

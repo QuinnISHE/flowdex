@@ -811,7 +811,7 @@ impl FlowdexStore {
         &self,
         operation: &ReviewOperation,
     ) -> Result<(), FlowdexStoreError> {
-        self.runtime.block_on(sqlx::query("INSERT INTO review_operations(operation_id,run_id,scope_kind,scope_id,round,reviewer_thread_id,state) VALUES (?,?,?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET state=excluded.state,reviewer_thread_id=excluded.reviewer_thread_id")
+        self.runtime.block_on(sqlx::query("INSERT INTO review_operations(operation_id,run_id,scope_kind,scope_id,round,reviewer_thread_id,state) VALUES (?,?,?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET state=CASE WHEN review_operations.state='accepted' THEN review_operations.state ELSE excluded.state END,reviewer_thread_id=excluded.reviewer_thread_id")
             .bind(&operation.operation_id).bind(&operation.run_id).bind(&operation.scope_kind).bind(&operation.scope_id)
             .bind(operation.round).bind(&operation.reviewer_thread_id).bind(&operation.state).execute(&self.pool))?;
         Ok(())
@@ -997,7 +997,7 @@ impl FlowdexStore {
         let line_start: i64 = row.get(1);
         let line_end: i64 = row.get(2);
         let run_id: String = row.get(3);
-        let mut commits = self.runtime.block_on(sqlx::query("SELECT c.source_commit,c.integrated_commit,c.task_id,c.operation_id,c.agent_id,c.sequence FROM task_commits c JOIN tasks t ON t.task_id=c.task_id WHERE t.run_id=? AND c.integrated_commit IS NOT NULL ORDER BY c.sequence DESC")
+        let mut commits = self.runtime.block_on(sqlx::query("SELECT c.source_commit,c.integrated_commit,c.task_id,c.operation_id,c.agent_id,c.sequence FROM task_commits c JOIN tasks t ON t.task_id=c.task_id WHERE t.run_id=? ORDER BY c.sequence DESC")
             .bind(&run_id).fetch_all(&self.pool))?;
         if commits.is_empty() {
             return Ok(None);
@@ -1012,10 +1012,10 @@ impl FlowdexStore {
             .map(|(index, commit)| (commit, index))
             .collect::<std::collections::HashMap<_, _>>();
         commits.sort_by_key(|row| {
-            order
-                .get(row.get::<String, _>(1).as_str())
-                .copied()
-                .unwrap_or(usize::MAX)
+            let commit: String = row
+                .get::<Option<String>, _>(1)
+                .unwrap_or_else(|| row.get(0));
+            order.get(commit.as_str()).copied().unwrap_or(usize::MAX)
         });
         let mut selected = None;
         if let Ok(blame) = git_stdout(
@@ -1036,7 +1036,9 @@ impl FlowdexStore {
                 .filter(|sha| sha.len() >= 7 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
                 .collect::<std::collections::HashSet<_>>();
             for commit in &commits {
-                let integrated: String = commit.get(1);
+                let integrated: String = commit
+                    .get::<Option<String>, _>(1)
+                    .unwrap_or_else(|| commit.get(0));
                 if blamed.contains(integrated.as_str()) {
                     selected = Some(commit);
                     break;
@@ -1046,7 +1048,9 @@ impl FlowdexStore {
         if selected.is_none() {
             let normalized_file = file.replace('\\', "/");
             for commit in &commits {
-                let integrated: String = commit.get(1);
+                let integrated: String = commit
+                    .get::<Option<String>, _>(1)
+                    .unwrap_or_else(|| commit.get(0));
                 let files = git_stdout(
                     integration_worktree,
                     [
@@ -1066,10 +1070,11 @@ impl FlowdexStore {
         let Some(commit) = selected else {
             return Ok(None);
         };
+        let source_commit: String = commit.get(0);
         let attribution = ReviewAttribution {
             finding_id: finding_id.to_string(),
-            source_commit: commit.get(0),
-            integrated_commit: commit.get(1),
+            source_commit: source_commit.clone(),
+            integrated_commit: commit.get::<Option<String>, _>(1).unwrap_or(source_commit),
             task_id: commit.get(2),
             operation_id: commit.get(3),
             agent_id: commit.get(4),

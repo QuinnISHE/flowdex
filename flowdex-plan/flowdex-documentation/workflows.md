@@ -53,6 +53,7 @@ const run = await flowdex.startRun({
 
 const result = await run.wait();
 // { runId, status: "completed" }
+// or { runId, status: "boundary", scope: { kind, name }, target, reason }
 ```
 
 Phases run in declaration order. Ready tasks run concurrently within the

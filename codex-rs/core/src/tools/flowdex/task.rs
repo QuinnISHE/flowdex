@@ -434,6 +434,16 @@ pub(crate) struct ReviewDispatch {
     pub(crate) worktree: Option<std::path::PathBuf>,
 }
 
+struct ReviewRegistrationGuard(Option<AgentPath>);
+
+impl Drop for ReviewRegistrationGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            super::review::deactivate_review_agent(&path);
+        }
+    }
+}
+
 pub(crate) async fn handle_run_with_review(
     invocation: ToolInvocation,
     review: Option<ReviewDispatch>,
@@ -527,13 +537,16 @@ pub(crate) async fn handle_run_with_review(
     let child_path = source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel("spawned agent is missing an agent path".into())
     })?;
-    if let Some(review) = review.as_ref() {
+    let _review_guard = if let Some(review) = review.as_ref() {
         super::review::activate_review_agent(
             child_path.clone(),
             review.operation.clone(),
             Arc::clone(&review.store),
         );
-    }
+        Some(ReviewRegistrationGuard(Some(child_path.clone())))
+    } else {
+        None
+    };
     let author = invocation
         .turn
         .session_source
@@ -578,9 +591,6 @@ pub(crate) async fn handle_run_with_review(
     {
         Ok(child) => child,
         Err(error) => {
-            if review.is_some() {
-                super::review::deactivate_review_agent(&child_path);
-            }
             cancel_task_operation_reservation(
                 &invocation.session,
                 &invocation.turn,
@@ -657,9 +667,6 @@ pub(crate) async fn handle_run_with_review(
             }
         }
     };
-    if review.is_some() {
-        super::review::deactivate_review_agent(&child_path);
-    }
     let terminal = if matches!(status, crate::agent::AgentStatus::Completed(_)) {
         "completed"
     } else {

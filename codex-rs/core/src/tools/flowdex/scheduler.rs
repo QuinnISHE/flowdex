@@ -1,3 +1,4 @@
+use super::FlowdexResumeAgentHandler;
 use super::task::{self, AgentSpec};
 use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
@@ -538,13 +539,25 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
         .cloned()
         .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex run not found".into()))?;
     let mut rx = controller.status_rx.clone();
+    let mut boundary_wait = Box::pin(super::wait_for_flowdex_boundary(args.run_id.clone()));
     loop {
         let status = rx.borrow_and_update().clone();
         match status {
             RunStatus::Running => {
-                rx.changed()
-                    .await
-                    .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
+                tokio::select! {
+                    boundary = &mut boundary_wait => {
+                        return Ok(task::JsonOutput(serde_json::json!({
+                            "runId": boundary.run_id,
+                            "status": "boundary",
+                            "scope": {"kind": boundary.scope_kind, "name": boundary.scope_id},
+                            "target": boundary.target,
+                            "reason": boundary.reason,
+                        })));
+                    }
+                    changed = rx.changed() => {
+                        changed.map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
+                    }
+                }
             }
             RunStatus::Completed => {
                 remove_run_controller(&args.run_id).await;
@@ -577,8 +590,10 @@ async fn run_scheduler(controller: Arc<RunController>) {
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
         let _ = tokio::task::spawn_blocking(move || store.mark_run_failed(&run_id)).await;
+        super::mark_flowdex_boundary_terminal(&controller.id);
         let _ = controller.status.send(RunStatus::Failed(error));
     } else {
+        super::mark_flowdex_boundary_terminal(&controller.id);
         let _ = controller.status.send(RunStatus::Completed);
     }
 }
@@ -727,14 +742,6 @@ async fn run_phase(
             }
             if let Some(review) = phase.review.as_ref() {
                 run_phase_review(controller, &phase, review, &all).await?;
-                for task in &all {
-                    let store = Arc::clone(&controller.store);
-                    let task_id = task.task_id.clone();
-                    tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
-                }
             }
             let store = Arc::clone(&controller.store);
             let run_id = controller.id.clone();
@@ -751,6 +758,16 @@ async fn run_phase(
                 format!("Completed phase: {}", phase.name),
             )
             .await?;
+            if phase.review.is_some() {
+                for task in &all {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = task.task_id.clone();
+                    tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             progress(
                 &controller.invocation,
                 format!("Completed phase {}/{}: {}", index + 1, total, phase.name),
@@ -1380,7 +1397,7 @@ async fn run_phase_review(
             let store = Arc::clone(&controller.store);
             let mut accepted = operation.clone();
             accepted.reviewer_thread_id = reviewer_thread_id;
-            accepted.state = "accepted".into();
+            accepted.state = "pending".into();
             tokio::task::spawn_blocking(move || store.record_review_operation(&accepted))
                 .await
                 .map_err(|e| e.to_string())?
@@ -1439,14 +1456,10 @@ async fn run_phase_review(
             )
             .await;
         }
-        let repairs = join_all(grouped.into_iter().map(|(task_id, task_findings)| {
-            let controller = Arc::clone(controller);
-            let phase = phase.clone();
-            async move { repair_phase_task(&controller, &phase, &task_id, &task_findings).await }
-        }))
-        .await;
-        if let Some(error) = repairs.into_iter().find_map(Result::err) {
-            return Err(error);
+        let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+        grouped.sort_by(|left, right| left.0.cmp(&right.0));
+        for (task_id, task_findings) in grouped {
+            repair_phase_task(controller, phase, &task_id, &task_findings).await?;
         }
         if !phase.verification.is_empty() {
             verify_commands(controller, &phase.verification).await?;
@@ -1512,30 +1525,19 @@ async fn repair_phase_task(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let agent_def = controller
-        .definition
-        .lock()
-        .await
-        .agents
-        .get(&task_def.agent)
-        .cloned()
-        .ok_or_else(|| "phase repair agent missing".to_string())?;
-    run_task_handler(
-        controller.invocation.clone(),
-        task_id.to_string(),
-        AgentSpec {
-            name: task_def.name.clone(),
-            instructions: format!(
-                "Repair these phase review findings, rerun verification, and commit:\n{repair}\n\n{}",
-                task_def.instructions
-            ),
-            profile: agent_def.profile,
-            model: agent_def.model,
-            reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
-        },
+    let agent_id = findings
+        .first()
+        .map(|(_, attribution)| attribution.agent_id.as_str())
+        .ok_or_else(|| "phase repair finding attribution missing".to_string())?;
+    resume_task_agent(
+        controller,
+        agent_id,
+        format!(
+            "Repair these phase review findings, rerun verification, and commit:\n{repair}\n\n{}",
+            task_def.instructions
+        ),
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     if !task_def.verification.is_empty() {
         let output = run_verify_handler(controller.invocation.clone(), task_id.to_string())
             .await
@@ -1675,27 +1677,6 @@ async fn review_task(
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?
     };
-    let diff = tokio::task::spawn_blocking({
-        let path = review_worktree
-            .clone()
-            .unwrap_or_else(|| task.worktree_path.clone());
-        let base = task.base_commit.clone();
-        move || {
-            Command::new("git")
-                .current_dir(path)
-                .args(["diff", &base, "HEAD"])
-                .output()
-                .map(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .chars()
-                        .take(64 * 1024)
-                        .collect::<String>()
-                })
-                .map_err(|e| e.to_string())
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())??;
     for round in 1..=review.max_rounds {
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
@@ -1707,6 +1688,27 @@ async fn review_task(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+        let diff = tokio::task::spawn_blocking({
+            let path = review_worktree
+                .clone()
+                .unwrap_or_else(|| task.worktree_path.clone());
+            let base = task.base_commit.clone();
+            move || {
+                Command::new("git")
+                    .current_dir(path)
+                    .args(["diff", &base, "HEAD"])
+                    .output()
+                    .map(|output| {
+                        String::from_utf8_lossy(&output.stdout)
+                            .chars()
+                            .take(64 * 1024)
+                            .collect::<String>()
+                    })
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())??;
         let operation = codex_flowdex::store::ReviewOperation {
             operation_id: Uuid::new_v4().to_string(),
             run_id: controller.id.clone(),
@@ -1762,7 +1764,7 @@ async fn review_task(
             let store = Arc::clone(&controller.store);
             let mut updated = operation.clone();
             updated.reviewer_thread_id = reviewer_thread_id;
-            updated.state = "accepted".to_string();
+            updated.state = "pending".to_string();
             tokio::task::spawn_blocking(move || store.record_review_operation(&updated))
                 .await
                 .map_err(|e| e.to_string())?
@@ -1790,14 +1792,45 @@ async fn review_task(
         if findings.is_empty() {
             return Ok(());
         }
-        if round == review.max_rounds {
-            return Err(format!(
-                "task review exhausted after {} rounds",
-                review.max_rounds
-            ));
+        let review_path = review_worktree
+            .clone()
+            .unwrap_or_else(|| task.worktree_path.clone());
+        let review_head = integration_head(&review_path).await?;
+        let mut attributed = Vec::with_capacity(findings.len());
+        for finding in findings {
+            let store = Arc::clone(&controller.store);
+            let finding_id = finding.finding_id.clone();
+            let path = review_path.clone();
+            let head = review_head.clone();
+            let attribution = tokio::task::spawn_blocking(move || {
+                store.attribute_review_finding(&finding_id, &path, &head)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            let Some(attribution) = attribution else {
+                return task_review_boundary(
+                    controller,
+                    task_def,
+                    task_id,
+                    format!("Unattributed task review finding: {}", finding.reason),
+                )
+                .await;
+            };
+            attributed.push((finding, attribution));
         }
-        let repair = findings
+        if round == review.max_rounds {
+            return task_review_boundary(
+                controller,
+                task_def,
+                task_id,
+                format!("Task review exhausted after {} rounds", review.max_rounds),
+            )
+            .await;
+        }
+        let repair = attributed
             .iter()
+            .map(|(finding, _)| finding)
             .map(|finding| {
                 format!(
                     "{}:{}-{}: {}",
@@ -1806,38 +1839,16 @@ async fn review_task(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let agent = AgentSpec {
-            name: task_def.name.clone(),
-            instructions: format!(
+        let agent_id = attributed[0].1.agent_id.clone();
+        resume_task_agent(
+            controller,
+            &agent_id,
+            format!(
                 "Repair these review findings, rerun verification, and commit:\n{repair}\n\n{}",
                 task_def.instructions
             ),
-            profile: controller
-                .definition
-                .lock()
-                .await
-                .agents
-                .get(&task_def.agent)
-                .and_then(|a| a.profile.clone()),
-            model: controller
-                .definition
-                .lock()
-                .await
-                .agents
-                .get(&task_def.agent)
-                .and_then(|a| a.model.clone()),
-            reasoning_effort: controller
-                .definition
-                .lock()
-                .await
-                .agents
-                .get(&task_def.agent)
-                .and_then(|a| a.reasoning_effort.clone())
-                .and_then(parse_effort),
-        };
-        run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
-            .await
-            .map_err(|e| e.to_string())?;
+        )
+        .await?;
         if !task_def.verification.is_empty() {
             let output = run_verify_handler(controller.invocation.clone(), task_id.to_string())
                 .await
@@ -1853,8 +1864,91 @@ async fn review_task(
                 return Err("review repair failed verification".into());
             }
         }
+        let repair_commits = task_source_commits(&task.worktree_path, &task.base_commit).await?;
+        if let Some(source_commit) = repair_commits.last() {
+            let operation_id = {
+                let store = Arc::clone(&controller.store);
+                let task_id = task_id.to_string();
+                let source = source_commit.clone();
+                tokio::task::spawn_blocking(move || store.task_commit_operation(&task_id, &source))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?
+            };
+            for (finding, _) in &attributed {
+                let resolution = ReviewResolution {
+                    finding_id: finding.finding_id.clone(),
+                    repair_operation_id: operation_id.clone(),
+                    source_commit: source_commit.clone(),
+                    integrated_commit: None,
+                };
+                let store = Arc::clone(&controller.store);
+                tokio::task::spawn_blocking(move || store.record_review_resolution(&resolution))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     Ok(())
+}
+
+async fn task_review_boundary(
+    controller: &Arc<RunController>,
+    task: &TaskDefinition,
+    task_id: &str,
+    reason: String,
+) -> Result<(), String> {
+    let boundary = if task.boundary == Boundary::Human {
+        Boundary::Human
+    } else {
+        Boundary::Orchestrator
+    };
+    await_boundary(controller, "task", task_id, boundary, reason).await
+}
+
+async fn resume_task_agent(
+    controller: &Arc<RunController>,
+    agent_id: &str,
+    instructions: String,
+) -> Result<(), String> {
+    let mut invocation = controller.invocation.clone();
+    invocation.payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "agent_id": agent_id,
+            "instructions": instructions,
+            "options": {"context_mode": "keep"},
+        })
+        .to_string(),
+    };
+    FlowdexResumeAgentHandler
+        .handle(invocation)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+async fn task_source_commits(
+    worktree: &std::path::Path,
+    base_commit: &str,
+) -> Result<Vec<String>, String> {
+    let worktree = worktree.to_path_buf();
+    let base_commit = base_commit.to_string();
+    tokio::task::spawn_blocking(move || {
+        Command::new("git")
+            .current_dir(worktree)
+            .args(["rev-list", "--reverse", &format!("{base_commit}..HEAD")])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn is_capacity_error(error: &FunctionCallError) -> bool {

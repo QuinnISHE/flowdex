@@ -64,15 +64,6 @@ pub(crate) fn review_report_tool_visible(agent_path: Option<&AgentPath>) -> bool
     })
 }
 
-pub(crate) fn review_reported(agent_path: &AgentPath) -> bool {
-    active()
-        .lock()
-        .ok()
-        .and_then(|reviews| reviews.get(agent_path).cloned())
-        .and_then(|review| review.accepted.lock().ok().map(|accepted| *accepted))
-        .unwrap_or(false)
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReportArgs {
@@ -183,16 +174,12 @@ impl FlowdexReviewReportHandler {
                         .into(),
                 )
             })?;
-        {
-            let mut accepted = review.accepted.lock().map_err(|_| {
-                FunctionCallError::RespondToModel("Flowdex review registry unavailable".into())
-            })?;
-            if *accepted {
-                return Err(FunctionCallError::RespondToModel(
-                    "review report already accepted".into(),
-                ));
-            }
-            *accepted = true;
+        if *review.accepted.lock().map_err(|_| {
+            FunctionCallError::RespondToModel("Flowdex review registry unavailable".into())
+        })? {
+            return Err(FunctionCallError::RespondToModel(
+                "review report already accepted".into(),
+            ));
         }
         let operation = review.operation.clone();
         let findings = args
@@ -242,6 +229,10 @@ impl FlowdexReviewReportHandler {
         .await
         .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
         .map_err(FunctionCallError::RespondToModel)?;
+        if let Ok(mut accepted) = review.accepted.lock() {
+            *accepted = true;
+        }
+        deactivate_review_agent(&agent_path);
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
             serde_json::json!({"accepted": true, "findings": finding_count}).to_string(),
             Some(true),

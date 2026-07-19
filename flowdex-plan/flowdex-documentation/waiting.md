@@ -24,8 +24,9 @@ reuse the start result shape and bounds:
 boundary result is also possible:
 
 ```json
-{ "runId": "run-1", "status": "boundary", "scopeKind": "task",
-  "scopeName": "parser", "target": "orchestrator", "reason": "review exhausted" }
+{ "runId": "run-1", "status": "boundary",
+  "scope": { "kind": "task", "name": "parser" },
+  "target": "orchestrator", "reason": "review exhausted" }
 ```
 `output` is bounded as in code mode. `error` is optional and appears only for a
 JavaScript failure.
