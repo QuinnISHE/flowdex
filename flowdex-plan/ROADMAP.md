@@ -41,14 +41,15 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **Context packs (Batch 013):** workflows declare named packs and task requirements; immutable fragments are persisted with source hashes and supersession, missing or stale packs dispatch one ordinary collector, unrelated ready tasks continue concurrently, and only dependent task prompts receive bounded fresh context.
 - **Review, repair, and boundaries (Batch 015):** task verification can repair through the declared task agent, task and phase reviews use any declared agent plus a review-only structured reporting tool, findings route through exact commit attribution, verification and review budgets remain independent, and orchestrator/human boundaries suspend event-driven without consuming steering. Generic multi-agent rounds remain ordinary role-neutral JavaScript loops over messaging and resume primitives.
 - **Agent tool profiles and named signals (Batch 016):** strict global/repository tool-only profiles compose with normal `.codex/agents` profiles and explicit model/reasoning overrides, while persisted FIFO signals wake workflow waits without a model call or loss during steering.
+- **Review-history rule promotion (Batch 017):** a trusted-repository, direct-model scan derives bounded AST-grep candidates from distinct resolved findings and their integrated commits without writing state, dispatching a model, or bypassing individual human approval.
 
 ### Partial or correction needed
 
-- No known contract correction remains. The next batch completes the final requested backend feature before the cohesive completion pass.
+- No known contract correction remains. All requested feature slices are implemented; the cohesive completion pass is now checking their joined behavior and final documentation.
 
 ### In progress
 
-- **Review-history rule promotion (Batch 017):** derive repository AST-grep candidates from repeated resolved review findings, expose them through a user-started read-only scan, and document the individually approved rule-writing flow over the accepted Batch 011 rule format.
+- **Cohesive completion (Batch 018):** exercise the joined workflow pipeline, fix only integration defects it exposes, and finish the user-facing source of truth without introducing another API layer.
 
 ## Remaining durable feature slices
 
@@ -143,7 +144,7 @@ Expand global and trusted-repository configuration for named tool profiles, alon
 
 Batch 016 completed tool-profile composition and named workflow signals. Existing `.codex/agents` profiles remain reusable agent defaults, Flowdex tool profiles remain tool-only overlays, and explicit model/reasoning values remain final overrides. Selectors and operation budgets stay explicit in workflow definitions.
 
-### 9. Review history and AST-grep rule promotion — in progress (Batch 017)
+### 9. Review history and AST-grep rule promotion — complete (Batch 017)
 
 Persist findings and the commits that resolve them. Group repeated resolved findings by the reviewer-provided stable rule key and expose candidates after the configured repetition count. Do not add model-based background clustering.
 
@@ -156,6 +157,8 @@ Batch 017 derives candidates from the durable finding/resolution source of truth
 Once the real workflow pipeline exists, exercise one representative workflow covering phase inheritance, parallel dependency-ready tasks, dynamic queuing, direct agent messages, worktrees, verification/repair, review routing, context collection, integration, boundaries, automatic progress, steering, and completion.
 
 Use that pass to close genuine integration gaps and make the Flowdex documentation describe the final authoring API and runtime behavior. Avoid expanding it into exhaustive tests for every schema field or duplicating checks already owned by Codex primitives.
+
+Batch 018 is this pass. It adds no planned public API: the accepted workflow language and tools are the contract. One joined acceptance path plus the existing focused tests should provide the evidence; process-restart controller resurrection and a live macOS host run remain explicitly outside this completion contract.
 
 ## Likely dependency shape
 
@@ -198,6 +201,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted Batch 017 and fast-forwarded `codex/flowdex` to `1305d0d08f`. Candidate scanning is repository-rooted, bounded, read-only on first use and thereafter, and preserves the explicit human-approval boundary. Started Batch 018 as the final cohesive acceptance and documentation pass; no new public API is planned.
 - **2026-07-19:** Accepted Batch 016 and fast-forwarded `codex/flowdex` to `fc6a8f03b1`. Tool-profile precedence and propagation are complete, and persisted FIFO named signals now wake event-driven waits without model/history output while preserving steering. Started Batch 017 for the remaining AST-grep candidate-promotion backend.
 - **2026-07-19:** Started Batch 016 from authoritative commit `e360b5fe6c`. It combines the final agent tool-profile composition with named workflow signals. The config/profile and signal/wait paths can proceed in parallel after one shared contract; process-restart controller recovery remains optional, out-of-scope machinery.
 - **2026-07-19:** Accepted Batch 015 and fast-forwarded `codex/flowdex` to `e360b5fe6c`. Verification repair, generic task/phase reviews, exact attribution routing, independent budgets, retained reviewed worktrees, and event-driven orchestrator/human boundaries are complete. Review-specific behavior is limited to the structured report tool; arbitrary agent rounds remain workflow-authored JavaScript.
