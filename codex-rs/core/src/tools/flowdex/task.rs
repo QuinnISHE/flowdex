@@ -431,6 +431,7 @@ async fn handle_run(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCa
 pub(crate) struct ReviewDispatch {
     pub(crate) operation: codex_flowdex::store::ReviewOperation,
     pub(crate) store: std::sync::Arc<codex_flowdex::store::FlowdexStore>,
+    pub(crate) worktree: Option<std::path::PathBuf>,
 }
 
 pub(crate) async fn handle_run_with_review(
@@ -494,7 +495,11 @@ pub(crate) async fn handle_run_with_review(
             .filter(|v| !v.is_empty()),
     )
     .await?;
-    let task_cwd = AbsolutePathBuf::from_absolute_path(&task.worktree_path)
+    let execution_worktree = review
+        .as_ref()
+        .and_then(|dispatch| dispatch.worktree.as_deref())
+        .unwrap_or(&task.worktree_path);
+    let task_cwd = AbsolutePathBuf::from_absolute_path(execution_worktree)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
     config.cwd = task_cwd.clone();
     config.workspace_roots = vec![task_cwd.clone()];

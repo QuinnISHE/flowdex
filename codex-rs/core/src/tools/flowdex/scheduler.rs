@@ -725,6 +725,46 @@ async fn run_phase(
                     return Err(error);
                 }
             }
+            if let Some(review) = phase.review.as_ref() {
+                let first = all
+                    .first()
+                    .ok_or_else(|| "phase review requires a task".to_string())?;
+                let details = {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = first.task_id.clone();
+                    tokio::task::spawn_blocking(move || store.scheduler_task(&task_id))
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?
+                };
+                let task_def = controller
+                    .definition
+                    .lock()
+                    .await
+                    .phases
+                    .get(index)
+                    .and_then(|p| p.tasks.iter().find(|task| task.name == details.name))
+                    .cloned()
+                    .ok_or_else(|| "phase review task definition missing".to_string())?;
+                review_task(
+                    controller,
+                    &first.task_id,
+                    &task_def,
+                    review,
+                    Some(controller.info.integration_worktree.clone()),
+                    "phase",
+                    &phase.name,
+                )
+                .await?;
+                for task in &all {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = task.task_id.clone();
+                    tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             let store = Arc::clone(&controller.store);
             let run_id = controller.id.clone();
             let name = phase.name.clone();
@@ -858,6 +898,13 @@ async fn run_phase(
                 )
                 .await;
                 first_error.get_or_insert(error);
+            } else if phase.review.is_none() {
+                let store = Arc::clone(&controller.store);
+                let task_id = scheduled.task_id.clone();
+                tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
             }
         }
         if let Some(error) = first_error {
@@ -1184,7 +1231,7 @@ async fn complete_task(
         .map_err(|error| ("verification".to_string(), error.to_string()))?;
     }
     if let Some(review) = task_def.review.as_ref() {
-        review_task(controller, task_id, task_def, review)
+        review_task(controller, task_id, task_def, review, None, "task", task_id)
             .await
             .map_err(|error| ("review".to_string(), error))?;
     }
@@ -1267,6 +1314,9 @@ async fn review_task(
     task_id: &str,
     task_def: &TaskDefinition,
     review: &ReviewDefinition,
+    review_worktree: Option<std::path::PathBuf>,
+    scope_kind: &str,
+    scope_id: &str,
 ) -> Result<(), String> {
     let reviewer = controller
         .definition
@@ -1285,7 +1335,9 @@ async fn review_task(
             .map_err(|e| e.to_string())?
     };
     let diff = tokio::task::spawn_blocking({
-        let path = task.worktree_path.clone();
+        let path = review_worktree
+            .clone()
+            .unwrap_or_else(|| task.worktree_path.clone());
         let base = task.base_commit.clone();
         move || {
             Command::new("git")
@@ -1306,16 +1358,19 @@ async fn review_task(
     for round in 1..=review.max_rounds {
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
-        let id = task_id.to_string();
-        tokio::task::spawn_blocking(move || store.increment_review_rounds("task", &run_id, &id))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+        let id = scope_id.to_string();
+        let scope_kind_for_counter = scope_kind.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.increment_review_rounds(&scope_kind_for_counter, &run_id, &id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
         let operation = codex_flowdex::store::ReviewOperation {
             operation_id: Uuid::new_v4().to_string(),
             run_id: controller.id.clone(),
-            scope_kind: "task".into(),
-            scope_id: task_id.into(),
+            scope_kind: scope_kind.into(),
+            scope_id: scope_id.into(),
             round: round as i64,
             reviewer_thread_id: String::new(),
             state: "pending".into(),
@@ -1349,6 +1404,7 @@ async fn review_task(
                     ..operation.clone()
                 },
                 store: Arc::clone(&controller.store),
+                worktree: review_worktree.clone(),
             },
         )
         .await

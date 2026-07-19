@@ -1574,19 +1574,20 @@ impl FlowdexStore {
             .bind(task_id)
             .execute(&mut *tx)
             .await?;
-        if let Err(error) = remove_task_worktree(
-            &self.integration_worktree,
-            &self.worktree_root,
-            &task.worktree_path,
-        ) {
-            rollback_integration(&self.integration_worktree, &pre_head)?;
-            return Err(error);
-        }
         tx.commit().await?;
         Ok(IntegrationResult {
             task_id: task_id.to_string(),
             commits: result_commits,
         })
+    }
+
+    pub fn cleanup_task_worktree(&self, task_id: &str) -> Result<(), FlowdexStoreError> {
+        let task = self.task(task_id)?;
+        remove_task_worktree(
+            &self.integration_worktree,
+            &self.worktree_root,
+            &task.worktree_path,
+        )
     }
 }
 
