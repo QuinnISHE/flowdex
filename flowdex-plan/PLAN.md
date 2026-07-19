@@ -186,7 +186,7 @@ Messages go directly to the target thread without passing through the orchestrat
 - Overlay repository settings from `.flowdex/config.toml`.
 - Use these files for tool profiles, compaction threshold, AST-grep behavior, and other defaults only when a completed feature consumes them. Keep agent selection and round budgets explicit in workflow definitions.
 - Keep one per-repository SQLite database under `$CODEX_HOME/flowdex/`.
-- Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-fragment versions, review history, and rule candidates.
+- Store runs, phases, tasks, dynamic queue entries, events, messages, agent/commit attribution, context-fragment versions, and review history. Derive rule candidates from that durable history instead of duplicating candidate state.
 - Add `codex flowdex install --binary <absolute-path>` on Windows:
   - Validate the compiled Flowdex executable.
   - Configure the current user’s Codex Windows app backend override.
