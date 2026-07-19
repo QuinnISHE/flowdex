@@ -5,6 +5,7 @@ Place the release binary in the Flowdex package as `flowdex.exe` on Windows or `
 ```text
 flowdex install
 flowdex uninstall
+flowdex uninstall --purge
 ```
 
 Install validates the running package with `--version`, copies it to
@@ -20,4 +21,8 @@ after either command.
 The installer does not modify `PATH`, machine-wide environment state, launchd,
 the Codex application bundle, or compatibility variables. It does not create a
 Flowdex config file; global and repository configuration remain optional.
-Uninstall leaves workflows, optional configuration, and runtime history intact.
+Normal uninstall leaves workflows, optional configuration, and runtime history
+intact. `uninstall --purge` also removes `$CODEX_HOME/flowdex/` and
+`$CODEX_HOME/flowdex.toml`, including global workflows, SQLite state, and task
+worktrees. It preserves repository `.flowdex/` directories because they are
+project-owned and may be committed.

@@ -17,11 +17,18 @@ pub enum FlowdexSubcommand {
     /// Install this Flowdex binary as the Codex desktop app backend.
     Install(InstallArgs),
     /// Remove the Flowdex desktop backend override and installed binary.
-    Uninstall,
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, clap::Args)]
 pub struct InstallArgs {}
+
+#[derive(Debug, clap::Args)]
+pub struct UninstallArgs {
+    /// Also remove global Flowdex workflows, configuration, and runtime data.
+    #[arg(long)]
+    pub purge: bool,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "flowdex", bin_name = "flowdex")]
@@ -33,7 +40,7 @@ struct StandaloneFlowdexCli {
 pub async fn run(cli: FlowdexCli) -> Result<()> {
     match cli.subcommand {
         FlowdexSubcommand::Install(_) => run_install().await,
-        FlowdexSubcommand::Uninstall => run_uninstall().await,
+        FlowdexSubcommand::Uninstall(args) => run_uninstall(args.purge).await,
     }
 }
 
@@ -102,12 +109,12 @@ async fn run_install() -> Result<()> {
     }
 }
 
-async fn run_uninstall() -> Result<()> {
+async fn run_uninstall(purge: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         macos::uninstall()?;
-        remove_installed_binary()?;
-        println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
+        remove_flowdex_files(purge)?;
+        print_uninstall_result(purge);
         return Ok(());
     }
 
@@ -115,14 +122,34 @@ async fn run_uninstall() -> Result<()> {
     {
         let mut writer = RegistryEnvironmentWriter;
         writer.remove_codex_cli_path()?;
-        remove_installed_binary()?;
-        println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
+        remove_flowdex_files(purge)?;
+        print_uninstall_result(purge);
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         anyhow::bail!("`flowdex uninstall` is only supported on Windows and macOS");
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn remove_flowdex_files(purge: bool) -> Result<()> {
+    if purge {
+        purge_flowdex_data(find_codex_home()?.as_path())
+    } else {
+        remove_installed_binary()
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn print_uninstall_result(purge: bool) {
+    if purge {
+        println!(
+            "Flowdex uninstalled and global Flowdex data removed. Fully quit and restart the Codex app."
+        );
+    } else {
+        println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
     }
 }
 
@@ -240,6 +267,35 @@ where
 fn remove_installed_binary() -> Result<()> {
     let path = installed_binary_path()?;
     match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
+    }
+}
+
+fn purge_flowdex_data(codex_home: &Path) -> Result<()> {
+    remove_path_if_exists(&codex_home.join("flowdex"))?;
+    remove_file_if_exists(&codex_home.join("flowdex.toml"))
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .with_context(|| format!("cannot remove {}", path.display()))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
@@ -788,10 +844,40 @@ mod tests {
         assert!(is_flowdex_executable(Path::new("/tmp/Flowdex")));
         assert!(!is_flowdex_executable(Path::new("codex.exe")));
         assert!(StandaloneFlowdexCli::try_parse_from(["flowdex", "install"]).is_ok());
-        assert!(StandaloneFlowdexCli::try_parse_from(["flowdex", "uninstall"]).is_ok());
+        let uninstall =
+            StandaloneFlowdexCli::try_parse_from(["flowdex", "uninstall"]).expect("uninstall");
+        assert!(matches!(
+            uninstall.subcommand,
+            FlowdexSubcommand::Uninstall(UninstallArgs { purge: false })
+        ));
+        let purge = StandaloneFlowdexCli::try_parse_from(["flowdex", "uninstall", "--purge"])
+            .expect("purge uninstall");
+        assert!(matches!(
+            purge.subcommand,
+            FlowdexSubcommand::Uninstall(UninstallArgs { purge: true })
+        ));
         assert!(
             StandaloneFlowdexCli::try_parse_from(["flowdex", "install", "--binary", "old.exe"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn purge_removes_only_global_flowdex_data() {
+        let codex_home = tempdir().expect("codex home");
+        let data = codex_home.path().join("flowdex");
+        fs::create_dir_all(data.join("workflows")).expect("workflow directory");
+        fs::write(data.join("workflows").join("review.js"), b"workflow").expect("workflow");
+        fs::write(codex_home.path().join("flowdex.toml"), b"config").expect("config");
+        fs::write(codex_home.path().join("config.toml"), b"codex").expect("codex config");
+
+        purge_flowdex_data(codex_home.path()).expect("purge");
+
+        assert!(!data.exists());
+        assert!(!codex_home.path().join("flowdex.toml").exists());
+        assert_eq!(
+            fs::read(codex_home.path().join("config.toml")).expect("codex config remains"),
+            b"codex"
         );
     }
 }

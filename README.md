@@ -33,4 +33,7 @@ Run the packaged binary and restart the Codex app:
 ```shell
 flowdex install
 flowdex uninstall
+flowdex uninstall --purge
 ```
+
+Normal uninstall preserves Flowdex workflows and configuration. `--purge` also removes global Flowdex data from `CODEX_HOME`; repository `.flowdex/` directories remain project-owned.

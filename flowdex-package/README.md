@@ -10,13 +10,14 @@ Install or uninstall from this directory:
 ```text
 flowdex install
 flowdex uninstall
+flowdex uninstall --purge
 ```
 
 PowerShell may require `./flowdex.exe`; macOS shells may require `./flowdex`.
 
 Install copies the backend to `$CODEX_HOME/flowdex/bin/codex[.exe]` and configures the Codex app to use it. The package itself can then be moved or archived. Keep a copy if you want the same `flowdex uninstall` command later.
 
-Uninstall removes the copied backend and app override. It preserves workflows, optional configuration, and Flowdex runtime history.
+Uninstall removes the copied backend and app override. It preserves workflows, optional configuration, and Flowdex runtime history. Add `--purge` to also remove `$CODEX_HOME/flowdex/` and `$CODEX_HOME/flowdex.toml`. Repository-owned `.flowdex/` directories are preserved because they may be committed project files.
 
 ## Automatic upstream releases
 
