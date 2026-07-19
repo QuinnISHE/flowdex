@@ -3173,6 +3173,8 @@ dependencies = [
  "ast-grep-config",
  "ast-grep-core",
  "ast-grep-language",
+ "codex-config",
+ "codex-protocol",
  "codex-utils-absolute-path",
  "ignore",
  "libc",

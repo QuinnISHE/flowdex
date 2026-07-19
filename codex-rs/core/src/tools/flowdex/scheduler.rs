@@ -91,6 +91,8 @@ struct RawAgent {
     model: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    tool_profile: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +163,7 @@ impl From<RawWorkflow> for WorkflowDefinition {
                             profile: a.profile,
                             model: a.model,
                             reasoning_effort: a.reasoning_effort,
+                            tool_profile: a.tool_profile,
                         },
                     )
                 })
@@ -837,6 +840,7 @@ async fn run_phase(
                     profile: agent_def.profile,
                     model: agent_def.model,
                     reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
+                    tool_profile: agent_def.tool_profile,
                 };
                 let store = Arc::clone(&controller.store);
                 let id = scheduled.task_id.clone();
@@ -1081,6 +1085,7 @@ async fn collect_context(
         profile: agent_definition.profile,
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
+        tool_profile: agent_definition.tool_profile,
     };
     let result = run_task_handler(controller.invocation.clone(), task_id.clone(), agent).await;
     let cleanup = task::integrate_task(controller.invocation.clone(), task_id)
@@ -1203,6 +1208,7 @@ async fn complete_task(
                 profile: agent_def.profile,
                 model: agent_def.model,
                 reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
+                tool_profile: agent_def.tool_profile,
             };
             run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
                 .await
@@ -1372,6 +1378,7 @@ async fn run_phase_review(
             profile: reviewer.profile.clone(),
             model: reviewer.model.clone(),
             reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
+            tool_profile: reviewer.tool_profile.clone(),
         };
         let reviewer_result = task::run_task_agent_with_review(
             controller.invocation.clone(),
@@ -1736,6 +1743,7 @@ async fn review_task(
             profile: reviewer.profile.clone(),
             model: reviewer.model.clone(),
             reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
+            tool_profile: reviewer.tool_profile.clone(),
         };
         let reviewer_result = task::run_task_agent_with_review(
             controller.invocation.clone(),

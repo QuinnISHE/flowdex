@@ -12,7 +12,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
+use crate::tools::handlers::multi_agents_common::apply_explicit_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::collab_agent_error;
@@ -37,6 +37,13 @@ use codex_tools::ToolSpec;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+use crate::config::{Config, ConfigOverrides, deserialize_config_toml_with_base};
+use codex_config::{
+    ConfigLayerEntry, ConfigLayerSource, ConfigLayerStack, ConfigLayerStackOrdering,
+};
+use codex_exec_server::LOCAL_FS;
+use toml::Value as TomlValue;
 
 const SPAWN_NAME: &str = "flowdex_spawn_agent";
 const SEND_NAME: &str = "flowdex_send_message";
@@ -109,6 +116,72 @@ struct SpawnArgs {
     profile: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
+    tool_profile: Option<String>,
+}
+
+pub(crate) async fn apply_flowdex_tool_profile(
+    _session: &crate::session::session::Session,
+    config: &mut Config,
+    profile_name: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let Some(profile_name) = profile_name else {
+        return Ok(());
+    };
+    let profile = config
+        .flowdex_config
+        .tool_profiles
+        .get(profile_name)
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "unknown Flowdex tool profile `{profile_name}`"
+            ))
+        })?
+        .clone();
+    let profile_value = toml::Value::try_from(profile).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("invalid Flowdex tool profile: {error}"))
+    })?;
+    let mut layer = toml::map::Map::new();
+    if let TomlValue::Table(values) = profile_value {
+        for (key, value) in values {
+            layer.insert(key, value);
+        }
+    }
+    let mut layers = config
+        .config_layer_stack
+        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    layers.push(ConfigLayerEntry::new(
+        ConfigLayerSource::SessionFlags,
+        TomlValue::Table(layer),
+    ));
+    let stack = ConfigLayerStack::new(
+        layers,
+        config.config_layer_stack.requirements().clone(),
+        config.config_layer_stack.requirements_toml().clone(),
+    )
+    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let cfg =
+        deserialize_config_toml_with_base(stack.effective_config(), config.codex_home.as_path())
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let next = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
+        cfg,
+        ConfigOverrides {
+            cwd: Some(config.cwd.to_path_buf()),
+            model: config.model.clone(),
+            model_provider: Some(config.model_provider_id.clone()),
+            service_tier: Some(config.service_tier.clone()),
+            ..Default::default()
+        },
+        config.codex_home.clone(),
+        stack,
+    )
+    .await
+    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    *config = next;
+    Ok(())
 }
 
 async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, FunctionCallError> {
@@ -150,7 +223,17 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
     }
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-    apply_requested_spawn_agent_model_overrides(
+    apply_spawn_agent_role(&session, &mut config, profile).await?;
+    apply_flowdex_tool_profile(
+        &session,
+        &mut config,
+        args.tool_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .await?;
+    apply_explicit_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
         &mut config,
@@ -158,7 +241,6 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
         args.reasoning_effort,
     )
     .await?;
-    apply_spawn_agent_role(&session, &mut config, profile).await?;
     let spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,

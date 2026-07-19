@@ -21,6 +21,7 @@ pub use store::FlowdexStore;
 pub use store::FlowdexStoreError;
 pub use store::IntegrationResult;
 pub use store::PendingBoundary;
+pub use store::PendingSignal;
 pub use store::PhaseMetadata;
 pub use store::PhaseState;
 pub use store::ReviewFinding;
@@ -70,6 +71,12 @@ const CHECK_RULES_BOOTSTRAP: &str = r#"  checkRules: async (...args) => {
     }
     return tools.flowdex_check_rules({ rule_ids: ruleIds });
   },
+  signal: async (...args) => {
+    if (args.length !== 1 || typeof args[0] !== "string" || args[0].trim().length === 0) {
+      throw new TypeError("signal expects exactly one non-empty string");
+    }
+    await tools.flowdex_signal({ signal: args[0] });
+  },
 "#;
 const RESUME_AGENT_BOOTSTRAP: &str = r#"  resumeAgent: async (agentId, instructions, options = {}) => {
     if (options === null || typeof options !== "object" || Array.isArray(options)) {
@@ -80,6 +87,12 @@ const RESUME_AGENT_BOOTSTRAP: &str = r#"  resumeAgent: async (agentId, instructi
       throw new TypeError(`resumeAgent unknown option: ${unknownOptions[0]}`);
     }
     return tools.flowdex_resume_agent({ agent_id: agentId, instructions, options: { context_mode: options.contextMode } });
+  },
+  signal: async (...args) => {
+    if (args.length !== 1 || typeof args[0] !== "string" || args[0].trim().length === 0) {
+      throw new TypeError("signal expects exactly one non-empty string");
+    }
+    await tools.flowdex_signal({ signal: args[0] });
   },
 "#;
 const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
@@ -105,7 +118,7 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
         if (agentSpec === null || typeof agentSpec !== "object" || Array.isArray(agentSpec)) {
           throw new TypeError("runAgent agentSpec must be an object");
         }
-        const agentKeys = new Set(["name", "instructions", "profile", "model", "reasoningEffort"]);
+        const agentKeys = new Set(["name", "instructions", "profile", "model", "reasoningEffort", "toolProfile"]);
         const unknownAgentKeys = Object.keys(agentSpec).filter((key) => !agentKeys.has(key));
         if (unknownAgentKeys.length > 0) {
           throw new TypeError(`runAgent unknown field: ${unknownAgentKeys[0]}`);
@@ -118,6 +131,7 @@ const TASK_BOOTSTRAP: &str = r#"  createTask: async (declaration) => {
             profile: agentSpec.profile,
             model: agentSpec.model,
             reasoning_effort: agentSpec.reasoningEffort,
+            tool_profile: agentSpec.toolProfile,
           },
         });
       },
@@ -315,10 +329,11 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     for (const agentName of agentNames) {
       requireString(agentName, "startRun agent name");
       const agent = requireObject(agents[agentName], `startRun.agents.${agentName}`);
-      requireKeys(agent, new Set(["profile", "model", "reasoningEffort"]), `startRun.agents.${agentName}`);
+      requireKeys(agent, new Set(["profile", "model", "reasoningEffort", "toolProfile"]), `startRun.agents.${agentName}`);
       const profile = selector(agent.profile, `startRun.agents.${agentName}.profile`);
       const model = selector(agent.model, `startRun.agents.${agentName}.model`);
       const reasoningEffort = selector(agent.reasoningEffort, `startRun.agents.${agentName}.reasoningEffort`);
+      const toolProfile = selector(agent.toolProfile, `startRun.agents.${agentName}.toolProfile`);
       if (profile === undefined && model === undefined && reasoningEffort === undefined) {
         throw new TypeError(`startRun.agents.${agentName} needs a profile, model, or reasoningEffort`);
       }
@@ -326,6 +341,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       if (profile !== undefined) normalizedAgents[agentName].profile = profile;
       if (model !== undefined) normalizedAgents[agentName].model = model;
       if (reasoningEffort !== undefined) normalizedAgents[agentName].reasoning_effort = reasoningEffort;
+      if (toolProfile !== undefined) normalizedAgents[agentName].tool_profile = toolProfile;
     }
 
     const contextPacks = definition.contextPacks === undefined ? {} : requireObject(definition.contextPacks, "startRun.contextPacks");
@@ -643,7 +659,7 @@ impl WorkflowLoader {
 
         Ok(LoadedWorkflow {
             source: format!(
-                "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{CHECK_RULES_BOOTSTRAP}{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+                "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n    tool_profile: spec.toolProfile,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{CHECK_RULES_BOOTSTRAP}{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
             ),
         })
     }
@@ -715,7 +731,7 @@ fn build_loaded_workflow(
         serde_json::to_string(workflow_path).map_err(WorkflowLoadError::serialize_bootstrap)?;
     Ok(LoadedWorkflow {
         source: format!(
-            "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+            "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => tools.flowdex_spawn_agent({{\n    name: spec.name,\n    instructions: spec.instructions,\n    profile: spec.profile,\n    model: spec.model,\n    reasoning_effort: spec.reasoningEffort,\n    tool_profile: spec.toolProfile,\n  }}),\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
         ),
     })
 }

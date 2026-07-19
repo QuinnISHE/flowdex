@@ -11,6 +11,7 @@ use crate::tools::flowdex::FlowdexQueueTaskHandler;
 use crate::tools::flowdex::FlowdexReviewReportHandler;
 use crate::tools::flowdex::FlowdexRunWorkflowHandler;
 use crate::tools::flowdex::FlowdexSealPhaseHandler;
+use crate::tools::flowdex::FlowdexSignalHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::flowdex::FlowdexWaitRunHandler;
@@ -220,6 +221,7 @@ fn build_tool_specs_and_registry(
     append_tool_search_executor(&context, &mut planned_tools);
     let flowdex_agent_tools_enabled = collab_tools_enabled(turn_context);
     planned_tools.add_with_exposure(FlowdexCheckRulesHandler, ToolExposure::Hidden);
+    planned_tools.add_with_exposure(FlowdexSignalHandler, ToolExposure::Hidden);
     if flowdex_agent_tools_enabled {
         planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
         planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
@@ -259,6 +261,7 @@ fn build_tool_specs_and_registry(
         .map(|runtime| runtime.spec())
         .collect::<Vec<_>>();
     flowdex_nested_tool_specs.push(FlowdexCheckRulesHandler.spec());
+    flowdex_nested_tool_specs.push(FlowdexSignalHandler.spec());
     if flowdex_agent_tools_enabled {
         flowdex_nested_tool_specs.extend([
             FlowdexSpawnAgentHandler.spec(),

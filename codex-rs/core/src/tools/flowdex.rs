@@ -13,6 +13,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_flowdex::FlowdexStore;
 use codex_flowdex::PendingBoundary;
+use codex_flowdex::PendingSignal;
 use codex_flowdex::WorkflowLoader;
 use codex_flowdex::WorkflowRef;
 use codex_flowdex::WorkflowScope;
@@ -65,10 +66,13 @@ const WAIT_TOOL_NAME: &str = "wait_flowdex_workflow";
 const RUN_TOOL_NAME: &str = "flowdex_run_workflow";
 const SAVE_TOOL_NAME: &str = "save_flowdex_workflow";
 const CONTINUE_TOOL_NAME: &str = "continue_flowdex_workflow";
+const SIGNAL_TOOL_NAME: &str = "flowdex_signal";
 
 struct BoundaryState {
     store: Arc<FlowdexStore>,
     signal: watch::Sender<Option<PendingBoundary>>,
+    activity: watch::Sender<u64>,
+    activity_generation: u64,
     terminal: bool,
     consumed: bool,
 }
@@ -82,6 +86,7 @@ fn boundaries() -> &'static Mutex<HashMap<String, BoundaryState>> {
 /// Registers the event channel used by a live scheduler run.
 pub(crate) fn register_flowdex_boundary_run(run_id: impl Into<String>, store: Arc<FlowdexStore>) {
     let (signal, _) = watch::channel(None);
+    let (activity, _) = watch::channel(0);
     boundaries()
         .lock()
         .expect("Flowdex boundary registry poisoned")
@@ -90,6 +95,8 @@ pub(crate) fn register_flowdex_boundary_run(run_id: impl Into<String>, store: Ar
             BoundaryState {
                 store,
                 signal,
+                activity,
+                activity_generation: 0,
                 terminal: false,
                 consumed: false,
             },
@@ -111,18 +118,90 @@ pub(crate) async fn publish_flowdex_boundary(
         .map_err(|_| "Flowdex boundary registry poisoned".to_string())?;
     let state = registry.entry(boundary.run_id.clone()).or_insert_with(|| {
         let (signal, _) = watch::channel(None);
+        let (activity, _) = watch::channel(0);
         BoundaryState {
             store: Arc::clone(&store),
             signal,
+            activity,
+            activity_generation: 0,
             terminal: false,
             consumed: false,
         }
     });
     state.consumed = false;
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    let _ = state.activity.send(state.activity_generation);
     state
         .signal
         .send(Some(boundary))
         .map_err(|_| "Flowdex boundary waiters stopped".to_string())
+}
+
+pub(crate) async fn publish_flowdex_signal(
+    store: Arc<FlowdexStore>,
+    run_id: String,
+    signal: String,
+) -> Result<(), String> {
+    let store_for_persist = Arc::clone(&store);
+    let run_id_for_persist = run_id.clone();
+    tokio::task::spawn_blocking(move || {
+        store_for_persist.enqueue_signal(&run_id_for_persist, &signal)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    let mut registry = boundaries()
+        .lock()
+        .map_err(|_| "Flowdex boundary registry poisoned".to_string())?;
+    let state = registry.entry(run_id).or_insert_with(|| {
+        let (signal_tx, _) = watch::channel(None);
+        let (activity, _) = watch::channel(0);
+        BoundaryState {
+            store: Arc::clone(&store),
+            signal: signal_tx,
+            activity,
+            activity_generation: 0,
+            terminal: false,
+            consumed: false,
+        }
+    });
+    state.activity_generation = state.activity_generation.wrapping_add(1);
+    state
+        .activity
+        .send(state.activity_generation)
+        .map_err(|_| "Flowdex signal waiters stopped".to_string())
+}
+
+async fn signal_waiter(run_id: String) -> PendingSignal {
+    let (store, mut activity) = match boundaries().lock().ok().and_then(|registry| {
+        registry
+            .get(&run_id)
+            .map(|state| (Arc::clone(&state.store), state.activity.subscribe()))
+    }) {
+        Some(value) => value,
+        None => return std::future::pending().await,
+    };
+    loop {
+        let pending = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            let run_id = run_id.clone();
+            move || store.oldest_pending_signal(&run_id)
+        })
+        .await;
+        if let Ok(Ok(Some(signal))) = pending {
+            return signal;
+        }
+        if activity.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+async fn signal_store(run_id: &str) -> Option<Arc<FlowdexStore>> {
+    boundaries()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(run_id).map(|state| Arc::clone(&state.store)))
 }
 
 pub(crate) fn mark_flowdex_boundary_terminal(run_id: &str) {
@@ -218,6 +297,71 @@ pub(crate) struct SaveFlowdexWorkflowHandler;
 
 pub(crate) struct WaitFlowdexWorkflowHandler;
 pub(crate) struct ContinueFlowdexWorkflowHandler;
+pub(crate) struct FlowdexSignalHandler;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalArgs {
+    signal: String,
+}
+
+impl ToolExecutor<ToolInvocation> for FlowdexSignalHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(SIGNAL_TOOL_NAME)
+    }
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: SIGNAL_TOOL_NAME.to_string(),
+            description: "Publish a named signal to a saved Flowdex workflow.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: JsonSchema::object(
+                BTreeMap::from([("signal".to_string(), JsonSchema::string(None))]),
+                Some(vec!["signal".to_string()]),
+                Some(false.into()),
+            ),
+            output_schema: Some(serde_json::json!({"type":"null"})),
+        })
+    }
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async move {
+            let ToolInvocation {
+                payload: ToolPayload::Function { arguments },
+                source,
+                ..
+            } = invocation
+            else {
+                return Err(FunctionCallError::RespondToModel(
+                    "flowdex.signal expects JSON arguments".into(),
+                ));
+            };
+            let args: SignalArgs = parse_arguments(&arguments)?;
+            if args.signal.trim().is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "signal name must be non-empty".into(),
+                ));
+            }
+            let crate::tools::context::ToolCallSource::CodeMode { cell_id, .. } = source else {
+                return Err(FunctionCallError::RespondToModel(
+                    "flowdex.signal is available only inside saved workflows".into(),
+                ));
+            };
+            let Some(store) = signal_store(&cell_id).await else {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex workflow is not active".into(),
+                ));
+            };
+            publish_flowdex_signal(store, cell_id, args.signal)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                "null".to_string(),
+                Some(true),
+            )))
+        })
+    }
+}
+impl CoreToolRuntime for FlowdexSignalHandler {}
 
 impl ToolExecutor<ToolInvocation> for ContinueFlowdexWorkflowHandler {
     fn tool_name(&self) -> ToolName {
@@ -379,6 +523,7 @@ impl WaitFlowdexWorkflowHandler {
         }
 
         let mut boundary_wait = Box::pin(wait_for_flowdex_boundary(args.run_id.clone()));
+        let mut signal_wait = Box::pin(signal_waiter(args.run_id.clone()));
         if matches!(pending_activity, Some(InputQueueActivity::Mailbox))
             && session.input_queue.has_trigger_turn_mailbox_items().await
         {
@@ -424,6 +569,24 @@ impl WaitFlowdexWorkflowHandler {
                         session.services.elicitations.wait_until_clear().await;
                     }
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(result.to_string(), Some(true))));
+                }
+                pending = &mut signal_wait => {
+                    let pending_steer = match turn_state.as_deref() {
+                        Some(turn_state) => session.input_queue.has_pending_user_input_for_turn_state(turn_state).await,
+                        None => false,
+                    };
+                    if pending_steer {
+                        return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                            serde_json::json!({"runId": args.run_id, "status": "steered"}).to_string(), Some(true))));
+                    }
+                    let store = signal_store(&args.run_id).await.ok_or_else(|| FunctionCallError::RespondToModel("Flowdex workflow is not active".into()))?;
+                    let signal_id = pending.id;
+                    let run_id = args.run_id.clone();
+                    tokio::task::spawn_blocking(move || store.consume_signal(&run_id, signal_id))
+                        .await.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        serde_json::json!({"runId": args.run_id, "status": "signal", "signal": pending.signal}).to_string(), Some(true))));
                 }
                 boundary = &mut boundary_wait => {
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(

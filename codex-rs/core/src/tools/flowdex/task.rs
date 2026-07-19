@@ -12,7 +12,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::multi_agents_common::apply_requested_spawn_agent_model_overrides;
+use crate::tools::handlers::multi_agents_common::apply_explicit_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::collab_spawn_error;
@@ -106,6 +106,7 @@ pub(crate) struct AgentSpec {
     pub(crate) profile: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) tool_profile: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -487,14 +488,6 @@ pub(crate) async fn handle_run_with_review(
         &invocation.session.get_base_instructions().await,
         invocation.turn.as_ref(),
     )?;
-    apply_requested_spawn_agent_model_overrides(
-        &invocation.session,
-        invocation.turn.as_ref(),
-        &mut config,
-        args.agent.model.as_deref(),
-        args.agent.reasoning_effort,
-    )
-    .await?;
     apply_spawn_agent_role(
         &invocation.session,
         &mut config,
@@ -503,6 +496,24 @@ pub(crate) async fn handle_run_with_review(
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty()),
+    )
+    .await?;
+    super::agents::apply_flowdex_tool_profile(
+        &invocation.session,
+        &mut config,
+        args.agent
+            .tool_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .await?;
+    apply_explicit_spawn_agent_model_overrides(
+        &invocation.session,
+        invocation.turn.as_ref(),
+        &mut config,
+        args.agent.model.as_deref(),
+        args.agent.reasoning_effort,
     )
     .await?;
     let execution_worktree = review
