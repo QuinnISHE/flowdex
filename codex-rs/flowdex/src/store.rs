@@ -2191,6 +2191,34 @@ mod tests {
             "new-integrated"
         );
     }
+
+    #[test]
+    fn candidate_scan_excludes_approved_ids_and_caps_groups_at_fifty() {
+        let (_repo, _home, store, _run) = store();
+        for index in 0..51_i64 {
+            let finding_id = format!("finding-{index}");
+            let rule_key = format!("rule-{index:02}");
+            let operation = format!("repair-{index}");
+            let source = format!("source-{index}");
+            store.runtime.block_on(sqlx::query("INSERT INTO review_findings(finding_id,operation_id,finding_order,file,line_start,line_end,reason,rule_key,ast_grep_suitable) VALUES (?,?,?,?,?,?,?,?,1)")
+                .bind(&finding_id).bind("review").bind(index).bind(format!("src/{index}.rs")).bind(1_i64).bind(1_i64).bind("reason").bind(&rule_key).execute(&store.pool)).unwrap();
+            store.runtime.block_on(sqlx::query("INSERT INTO task_commits(task_id,source_commit,integrated_commit,operation_id,agent_id,model,sequence,summary) VALUES (?,?,?,?,?,?,?,?)")
+                .bind(&operation).bind(&source).bind(format!("integrated-{index}")).bind(&operation).bind("agent").bind("model").bind(index).bind("summary").execute(&store.pool)).unwrap();
+            store.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES (?,?,?,NULL)")
+                .bind(&finding_id).bind(&operation).bind(&source).execute(&store.pool)).unwrap();
+        }
+        let approved = std::collections::BTreeSet::from(["rule-00".to_string()]);
+        let candidates = store.rule_candidates(1, &approved).expect("candidate scan");
+        assert_eq!(candidates.candidates.len(), 50);
+        assert!(
+            candidates
+                .candidates
+                .iter()
+                .all(|candidate| candidate.rule_key != "rule-00")
+        );
+        assert_eq!(candidates.candidates.first().unwrap().rule_key, "rule-01");
+    }
+
     #[test]
     fn lifecycle_create_commit_integrate() {
         let (repo, _home, store, run) = store();
