@@ -37,6 +37,7 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **Executable workflow scheduler (Batch 010):** `flowdex.startRun(...)` now executes durable runs with sequential phases, dependency-ready parallel tasks, advisory scope conflict serialization, dynamic open-phase queues, phase/run verification, deterministic integration, automatic non-model progress, app-visible StatusOnly agents, and strict final run/phase/task definitions.
 - **Reusable and nested workflows (Batch 012):** repository/global workflow references, strict declared JSON input, exact JSON output, event-driven nested V8 execution, durable parent/child identity, cancellation, and rooted atomic saving are complete.
 - **AST-grep rule runtime (Batch 011, integrated after Batch 012):** approved repository rules, strict global/repository configuration, explicit workflow checks, automatic post-command verification, bounded findings, and trusted-root/task-worktree separation are complete on the authoritative scheduler line.
+- **Desktop app-backend installer (Batch 014):** `codex flowdex install --binary <path>` validates a compiled Codex executable and persistently selects it through `CODEX_CLI_PATH` for the current Windows or macOS user. Windows uses the user environment registry; macOS maintains an idempotent marked block in the supported login-shell profile. Other platforms and unsupported shells fail without mutation.
 
 ### Partial or correction needed
 
@@ -47,7 +48,6 @@ JavaScript is the workflow definition and control language. The final authoring 
 ### In progress
 
 - **Context packs (Batch 013):** implement the complete persisted fragment lifecycle, stale detection, automatic collector dispatch, and task prompt injection on the settled scheduler.
-- **Windows/macOS app-backend installer (Batch 014, parallel):** add the isolated `codex flowdex install` command using the app-owned `CODEX_CLI_PATH` override without touching scheduler code.
 
 ## Remaining durable feature slices
 
@@ -144,11 +144,7 @@ Persist findings and the commits that resolve them. Group repeated resolved find
 
 A user-started action may dispatch the future rule-writing agent or skill. Each repository rule requires individual human approval and is then configured as always-on verification or explicitly requested by a workflow.
 
-### 10. Windows app-backend installer
-
-Add the final Windows installer command that validates a compiled Flowdex executable and configures the current user's Codex app backend override, then asks the user to restart the app. Discover the app-owned environment-variable name during this slice; it is intentionally not guessed in advance.
-
-### 11. Cohesive completion pass
+### 10. Cohesive completion pass
 
 Once the real workflow pipeline exists, exercise one representative workflow covering phase inheritance, parallel dependency-ready tasks, dynamic queuing, direct agent messages, worktrees, verification/repair, review routing, context collection, integration, boundaries, automatic progress, steering, and completion.
 
@@ -163,7 +159,7 @@ The broad direction is:
 3. Connect automatic progress, app-server visibility, and scheduler waits to its real state transitions.
 4. Add boundaries and verification/review composition.
 5. Add context packs once dynamic task suspension/resumption exists.
-6. Add profile/configuration completion, AST-grep promotion, and installation where they naturally fit.
+6. Add profile/configuration completion and AST-grep promotion where they naturally fit.
 7. Finish with the cohesive workflow pass and final usage documentation.
 
 This order is intentionally movable. For example, the automatic event emitter and app-server propagation can be implemented in parallel with scheduler storage once the scheduler transition vocabulary is settled. Context persistence and prompt injection can also be divided after the fragment schema is final.
@@ -195,6 +191,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted and integrated Batch 014 onto `codex/flowdex`. The installer now configures the current-user Codex desktop backend on Windows and macOS with strict executable identity checks and no scheduler/store coupling. The macOS path is statically and unit tested but still needs a real-host acceptance run when one is available.
 - **2026-07-19:** Anchored the accepted Batch 010/012 line plus integrated Batch 011 as the canonical `codex/flowdex` branch. Batch 012 reusable/nested workflows and Batch 011 AST-grep verification are complete. Prepared Batch 013 context packs and the disjoint Batch 014 Windows installer for parallel execution from that exact baseline.
 - **2026-07-18:** Accepted Batch 010: the final `startRun` scheduler now executes sequential phases, dependency-ready parallel tasks, dynamic queues, verification, integration, automatic progress, and app-visible StatusOnly agents. Started Batch 012 for reusable repository/global workflows and event-driven nesting on that settled API.
 - **2026-07-18:** Started parallel Batch 011 for the independent AST-grep accepted-rule runtime, with focused behavioral verification and one cohesive risk-based review rather than a broad test/reviewer matrix.
