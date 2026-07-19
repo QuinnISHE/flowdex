@@ -47,7 +47,7 @@ JavaScript is the workflow definition and control language. The final authoring 
 ### In progress
 
 - **Context packs (Batch 013):** implement the complete persisted fragment lifecycle, stale detection, automatic collector dispatch, and task prompt injection on the settled scheduler.
-- **Windows app-backend installer (Batch 014, parallel):** add the isolated `codex flowdex install` command using the app-owned `CODEX_CLI_PATH` override without touching scheduler code.
+- **Windows/macOS app-backend installer (Batch 014, parallel):** add the isolated `codex flowdex install` command using the app-owned `CODEX_CLI_PATH` override without touching scheduler code.
 
 ## Remaining durable feature slices
 
