@@ -2,6 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Boundary {
+    #[default]
+    Continue,
+    Orchestrator,
+    Human,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewDefinition {
+    pub agent: String,
+    pub instructions: String,
+    pub max_rounds: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentDefinition {
@@ -15,6 +32,8 @@ pub struct AgentDefinition {
 pub struct WorkflowDefinition {
     pub name: String,
     pub agents: BTreeMap<String, AgentDefinition>,
+    #[serde(default)]
+    pub boundary: Boundary,
     #[serde(default)]
     pub context_packs: BTreeMap<String, ContextPackDefinition>,
     #[serde(default)]
@@ -39,6 +58,10 @@ pub struct PhaseDefinition {
     pub open: bool,
     #[serde(default)]
     pub verification: Vec<String>,
+    #[serde(default)]
+    pub boundary: Boundary,
+    #[serde(default)]
+    pub review: Option<ReviewDefinition>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,6 +78,12 @@ pub struct TaskDefinition {
     pub write_scope: Vec<String>,
     #[serde(default)]
     pub verification: Vec<String>,
+    #[serde(default)]
+    pub verification_repair_limit: usize,
+    #[serde(default)]
+    pub review: Option<ReviewDefinition>,
+    #[serde(default)]
+    pub boundary: Boundary,
     #[serde(default)]
     pub context: Vec<String>,
 }
@@ -97,6 +126,12 @@ pub enum WorkflowValidationError {
     DependencyCycle(String),
     #[error("phase is not open: {0}")]
     PhaseNotOpen(String),
+    #[error("{scope} review agent {agent} does not exist")]
+    UnknownReviewAgent { scope: String, agent: String },
+    #[error("{scope} review instructions must be non-empty")]
+    EmptyReviewInstructions { scope: String },
+    #[error("{scope} review maxRounds must be positive")]
+    InvalidReviewRounds { scope: String },
 }
 
 /// Returns whether two advisory write scopes have equal or ancestor roots.
@@ -173,6 +208,7 @@ impl WorkflowDefinition {
                 ));
             }
             validate_commands(&phase.verification)?;
+            self.validate_review(&format!("phase {}", phase.name), phase.review.as_ref())?;
             self.validate_phase_tasks(phase)?;
         }
         Ok(())
@@ -194,6 +230,7 @@ impl WorkflowDefinition {
                     agent: task.agent.clone(),
                 });
             }
+            self.validate_review(&format!("task {}", task.name), task.review.as_ref())?;
             for dependency in &task.dependencies {
                 if !names.contains(dependency)
                     && !phase
@@ -249,6 +286,7 @@ impl WorkflowDefinition {
                 agent: task.agent.clone(),
             });
         }
+        self.validate_review(&format!("task {}", task.name), task.review.as_ref())?;
         self.validate_task_context(task)?;
         for dependency in &task.dependencies {
             if !phase
@@ -283,6 +321,34 @@ impl WorkflowDefinition {
                     pack: pack.clone(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn validate_review(
+        &self,
+        scope: &str,
+        review: Option<&ReviewDefinition>,
+    ) -> Result<(), WorkflowValidationError> {
+        let Some(review) = review else {
+            return Ok(());
+        };
+        non_empty("review agent", &review.agent)?;
+        non_empty("review instructions", &review.instructions).map_err(|_| {
+            WorkflowValidationError::EmptyReviewInstructions {
+                scope: scope.to_string(),
+            }
+        })?;
+        if review.max_rounds == 0 {
+            return Err(WorkflowValidationError::InvalidReviewRounds {
+                scope: scope.to_string(),
+            });
+        }
+        if !self.agents.contains_key(&review.agent) {
+            return Err(WorkflowValidationError::UnknownReviewAgent {
+                scope: scope.to_string(),
+                agent: review.agent.clone(),
+            });
         }
         Ok(())
     }
@@ -371,6 +437,9 @@ mod tests {
             read_scope: vec![],
             write_scope: vec![],
             verification: vec![],
+            verification_repair_limit: 0,
+            review: None,
+            boundary: Boundary::Continue,
             context: vec![],
         }
     }
@@ -387,6 +456,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            boundary: Boundary::Continue,
             verification: vec![],
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
@@ -395,6 +465,8 @@ mod tests {
                 tasks,
                 open: false,
                 verification: vec![],
+                boundary: Boundary::Continue,
+                review: None,
             }],
         }
     }
@@ -452,5 +524,44 @@ mod tests {
             definition.validate(),
             Err(WorkflowValidationError::EmptyString("command or scope"))
         ));
+    }
+
+    #[test]
+    fn validates_review_and_boundary_contract() {
+        let mut definition = workflow(vec![task("a", &[])]);
+        definition.phases[0].tasks[0].review = Some(ReviewDefinition {
+            agent: "a".into(),
+            instructions: "inspect".into(),
+            max_rounds: 1,
+        });
+        definition.phases[0].tasks[0].boundary = Boundary::Human;
+        assert!(definition.validate().is_ok());
+        definition.phases[0].tasks[0]
+            .review
+            .as_mut()
+            .unwrap()
+            .max_rounds = 0;
+        assert!(matches!(
+            definition.validate(),
+            Err(WorkflowValidationError::InvalidReviewRounds { .. })
+        ));
+    }
+
+    #[test]
+    fn serde_rejects_unknown_fields_and_negative_limits() {
+        let unknown = serde_json::from_value::<TaskDefinition>(serde_json::json!({
+            "name":"task", "agent":"a", "instructions":"do", "bogus": true
+        }));
+        assert!(unknown.is_err());
+        let negative = serde_json::from_value::<TaskDefinition>(serde_json::json!({
+            "name":"task", "agent":"a", "instructions":"do", "verificationRepairLimit": -1
+        }));
+        assert!(negative.is_err());
+        let parsed = serde_json::from_value::<TaskDefinition>(serde_json::json!({
+            "name":"task", "agent":"a", "instructions":"do"
+        }))
+        .unwrap();
+        assert_eq!(parsed.boundary, Boundary::Continue);
+        assert_eq!(parsed.verification_repair_limit, 0);
     }
 }

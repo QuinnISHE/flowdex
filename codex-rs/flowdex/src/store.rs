@@ -222,6 +222,51 @@ pub struct PhaseMetadata {
     pub state: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewOperation {
+    pub operation_id: String,
+    pub run_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub round: i64,
+    pub reviewer_thread_id: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewFinding {
+    pub finding_id: String,
+    pub operation_id: String,
+    pub finding_order: i64,
+    pub file: String,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub reason: String,
+    pub rule_key: Option<String>,
+    pub ast_grep_suitable: bool,
+    pub attributed_task_id: Option<String>,
+    pub attributed_operation_id: Option<String>,
+    pub attributed_agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewResolution {
+    pub finding_id: String,
+    pub repair_operation_id: String,
+    pub source_commit: String,
+    pub integrated_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingBoundary {
+    pub run_id: String,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub target: String,
+    pub reason: String,
+    pub transition: String,
+}
+
 pub struct FlowdexStore {
     pool: SqlitePool,
     runtime: ManuallyDrop<tokio::runtime::Runtime>,
@@ -519,17 +564,18 @@ impl FlowdexStore {
         self.ensure_run(info)?;
         self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
-            sqlx::query("UPDATE runs SET name=?, verification=?, state=? WHERE run_id=?")
-                .bind(&definition.name).bind(encode(&definition.verification)).bind(RunState::Queued.as_str()).bind(&info.run_id)
+            sqlx::query("UPDATE runs SET name=?, verification=?, state=?, boundary=? WHERE run_id=?")
+                .bind(&definition.name).bind(encode(&definition.verification)).bind(RunState::Queued.as_str()).bind(boundary_name(definition.boundary)).bind(&info.run_id)
                 .execute(&mut *tx).await?;
             for (agent_name, agent) in &definition.agents {
                 sqlx::query("INSERT INTO workflow_agents(run_id,name,profile,model,reasoning_effort) VALUES (?,?,?,?,?)")
                     .bind(&info.run_id).bind(agent_name).bind(agent.profile.as_deref()).bind(agent.model.as_deref()).bind(agent.reasoning_effort.as_deref()).execute(&mut *tx).await?;
             }
             for (index, phase) in definition.phases.iter().enumerate() {
-                sqlx::query("INSERT INTO workflow_phases(run_id,name,declaration_order,instructions,open,sealed,verification,state) VALUES (?,?,?,?,?,?,?,?)")
+                sqlx::query("INSERT INTO workflow_phases(run_id,name,declaration_order,instructions,open,sealed,verification,state,boundary,review_agent,review_instructions,review_max_rounds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
                     .bind(&info.run_id).bind(&phase.name).bind(index as i64).bind(&phase.instructions)
                     .bind(phase.open as i64).bind((!phase.open) as i64).bind(encode(&phase.verification)).bind(if phase.open { PhaseState::Pending.as_str() } else { PhaseState::Sealed.as_str() })
+                    .bind(boundary_name(phase.boundary)).bind(phase.review.as_ref().map(|review| review.agent.as_str())).bind(phase.review.as_ref().map(|review| review.instructions.as_str())).bind(phase.review.as_ref().map(|review| review.max_rounds as i64))
                     .execute(&mut *tx).await?;
                 for (task_index, task) in phase.tasks.iter().enumerate() {
                     let task_id = uuid::Uuid::new_v4().to_string();
@@ -740,6 +786,166 @@ impl FlowdexStore {
     }
     pub fn mark_run_failed(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
         self.set_run_state(run_id, RunState::Failed)
+    }
+
+    pub fn record_review_operation(
+        &self,
+        operation: &ReviewOperation,
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(sqlx::query("INSERT INTO review_operations(operation_id,run_id,scope_kind,scope_id,round,reviewer_thread_id,state) VALUES (?,?,?,?,?,?,?) ON CONFLICT(operation_id) DO UPDATE SET state=excluded.state,reviewer_thread_id=excluded.reviewer_thread_id")
+            .bind(&operation.operation_id).bind(&operation.run_id).bind(&operation.scope_kind).bind(&operation.scope_id)
+            .bind(operation.round).bind(&operation.reviewer_thread_id).bind(&operation.state).execute(&self.pool))?;
+        Ok(())
+    }
+
+    pub fn review_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<ReviewOperation, FlowdexStoreError> {
+        let row = self.runtime.block_on(sqlx::query("SELECT operation_id,run_id,scope_kind,scope_id,round,reviewer_thread_id,state FROM review_operations WHERE operation_id=?").bind(operation_id).fetch_optional(&self.pool))?
+            .ok_or_else(|| FlowdexStoreError::Operation(format!("review operation not found: {operation_id}")))?;
+        Ok(ReviewOperation {
+            operation_id: row.get(0),
+            run_id: row.get(1),
+            scope_kind: row.get(2),
+            scope_id: row.get(3),
+            round: row.get(4),
+            reviewer_thread_id: row.get(5),
+            state: row.get(6),
+        })
+    }
+
+    pub fn record_review_findings(
+        &self,
+        findings: &[ReviewFinding],
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            for finding in findings {
+                if finding.line_start <= 0 || finding.line_end < finding.line_start {
+                    return Err(FlowdexStoreError::Integration("invalid review finding lines".into()));
+                }
+                sqlx::query("INSERT INTO review_findings(finding_id,operation_id,finding_order,file,line_start,line_end,reason,rule_key,ast_grep_suitable,attributed_task_id,attributed_operation_id,attributed_agent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(finding_id) DO UPDATE SET attributed_task_id=excluded.attributed_task_id,attributed_operation_id=excluded.attributed_operation_id,attributed_agent_id=excluded.attributed_agent_id")
+                    .bind(&finding.finding_id).bind(&finding.operation_id).bind(finding.finding_order).bind(&finding.file)
+                    .bind(finding.line_start).bind(finding.line_end).bind(&finding.reason).bind(&finding.rule_key)
+                    .bind(finding.ast_grep_suitable as i64).bind(&finding.attributed_task_id).bind(&finding.attributed_operation_id).bind(&finding.attributed_agent_id)
+                    .execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            Ok::<(), FlowdexStoreError>(())
+        })
+    }
+
+    pub fn review_findings(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<ReviewFinding>, FlowdexStoreError> {
+        let rows = self.runtime.block_on(sqlx::query("SELECT finding_id,operation_id,finding_order,file,line_start,line_end,reason,rule_key,ast_grep_suitable,attributed_task_id,attributed_operation_id,attributed_agent_id FROM review_findings WHERE operation_id=? ORDER BY finding_order").bind(operation_id).fetch_all(&self.pool))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReviewFinding {
+                finding_id: row.get(0),
+                operation_id: row.get(1),
+                finding_order: row.get(2),
+                file: row.get(3),
+                line_start: row.get(4),
+                line_end: row.get(5),
+                reason: row.get(6),
+                rule_key: row.get(7),
+                ast_grep_suitable: row.get::<i64, _>(8) != 0,
+                attributed_task_id: row.get(9),
+                attributed_operation_id: row.get(10),
+                attributed_agent_id: row.get(11),
+            })
+            .collect())
+    }
+
+    pub fn record_review_resolution(
+        &self,
+        resolution: &ReviewResolution,
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(sqlx::query("INSERT INTO review_resolutions(finding_id,repair_operation_id,source_commit,integrated_commit) VALUES (?,?,?,?) ON CONFLICT(finding_id,repair_operation_id,source_commit) DO UPDATE SET integrated_commit=excluded.integrated_commit")
+            .bind(&resolution.finding_id).bind(&resolution.repair_operation_id).bind(&resolution.source_commit).bind(&resolution.integrated_commit).execute(&self.pool))?;
+        Ok(())
+    }
+
+    pub fn set_pending_boundary(
+        &self,
+        boundary: &PendingBoundary,
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(sqlx::query("INSERT INTO pending_boundaries(run_id,scope_kind,scope_id,target,reason,transition) VALUES (?,?,?,?,?,?) ON CONFLICT(run_id,scope_kind,scope_id) DO UPDATE SET target=excluded.target,reason=excluded.reason,transition=excluded.transition")
+            .bind(&boundary.run_id).bind(&boundary.scope_kind).bind(&boundary.scope_id).bind(&boundary.target).bind(&boundary.reason).bind(&boundary.transition).execute(&self.pool))?;
+        Ok(())
+    }
+
+    pub fn pending_boundary(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<PendingBoundary>, FlowdexStoreError> {
+        let row = self.runtime.block_on(sqlx::query("SELECT run_id,scope_kind,scope_id,target,reason,transition FROM pending_boundaries WHERE run_id=? ORDER BY scope_kind,scope_id LIMIT 1").bind(run_id).fetch_optional(&self.pool))?;
+        Ok(row.map(|row| PendingBoundary {
+            run_id: row.get(0),
+            scope_kind: row.get(1),
+            scope_id: row.get(2),
+            target: row.get(3),
+            reason: row.get(4),
+            transition: row.get(5),
+        }))
+    }
+
+    pub fn clear_pending_boundary(
+        &self,
+        run_id: &str,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(
+            sqlx::query(
+                "DELETE FROM pending_boundaries WHERE run_id=? AND scope_kind=? AND scope_id=?",
+            )
+            .bind(run_id)
+            .bind(scope_kind)
+            .bind(scope_id)
+            .execute(&self.pool),
+        )?;
+        Ok(())
+    }
+
+    pub fn increment_verification_repairs(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        self.increment_scope_counter(scope_kind, scope_id, "verification_repair_count")
+    }
+
+    pub fn increment_review_rounds(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        self.increment_scope_counter(scope_kind, scope_id, "review_round_count")
+    }
+
+    fn increment_scope_counter(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        column: &str,
+    ) -> Result<i64, FlowdexStoreError> {
+        let row = match (scope_kind, column) {
+            ("run", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET verification_repair_count=verification_repair_count+1 WHERE run_id=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("run", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE runs SET review_round_count=review_round_count+1 WHERE run_id=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("phase", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET verification_repair_count=verification_repair_count+1 WHERE name=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("phase", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_phases SET review_round_count=review_round_count+1 WHERE name=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("task", "verification_repair_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET verification_repair_count=verification_repair_count+1 WHERE task_id=? RETURNING verification_repair_count").bind(scope_id).fetch_optional(&self.pool))?,
+            ("task", "review_round_count") => self.runtime.block_on(sqlx::query("UPDATE workflow_tasks SET review_round_count=review_round_count+1 WHERE task_id=? RETURNING review_round_count").bind(scope_id).fetch_optional(&self.pool))?,
+            _ => return Err(FlowdexStoreError::Integration(format!("unknown scope: {scope_kind}:{scope_id}"))),
+        };
+        let row = row.ok_or_else(|| {
+            FlowdexStoreError::Integration(format!("scope not found: {scope_kind}:{scope_id}"))
+        })?;
+        Ok(row.get(0))
     }
 
     /// Marks queued tasks ready only after all dependency tasks integrated.
@@ -1154,9 +1360,9 @@ async fn insert_schedule_row(
     state: SchedulerTaskState,
 ) -> Result<(), sqlx::Error> {
     let instructions = format!("{phase_instructions}\n\n{}", task.instructions);
-    sqlx::query("INSERT INTO workflow_tasks(task_id,run_id,phase,name,instructions,declaration_order,agent,dependencies,read_scope,write_scope,verification,state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO workflow_tasks(task_id,run_id,phase,name,instructions,declaration_order,agent,dependencies,read_scope,write_scope,verification,state,verification_repair_limit,boundary,review_agent,review_instructions,review_max_rounds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(task_id).bind(run_id).bind(phase).bind(&task.name).bind(instructions).bind(declaration_order).bind(&task.agent)
-        .bind(encode(&task.dependencies)).bind(encode(&task.read_scope)).bind(encode(&task.write_scope)).bind(encode(&task.verification)).bind(state.as_str())
+        .bind(encode(&task.dependencies)).bind(encode(&task.read_scope)).bind(encode(&task.write_scope)).bind(encode(&task.verification)).bind(state.as_str()).bind(task.verification_repair_limit as i64).bind(boundary_name(task.boundary)).bind(task.review.as_ref().map(|review| review.agent.as_str())).bind(task.review.as_ref().map(|review| review.instructions.as_str())).bind(task.review.as_ref().map(|review| review.max_rounds as i64))
         .execute(&mut **tx).await?;
     Ok(())
 }
@@ -1164,16 +1370,20 @@ async fn insert_schedule_row(
 async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let statements = "PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS repository(identity TEXT NOT NULL PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued');
+      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued',verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue');
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
-      CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(run_id,name));
+      CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue',review_agent TEXT,review_instructions TEXT,review_max_rounds INTEGER,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,PRIMARY KEY(run_id,name));
-      CREATE TABLE IF NOT EXISTS workflow_tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,phase TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL DEFAULT '',declaration_order INTEGER NOT NULL,agent TEXT NOT NULL,dependencies TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,UNIQUE(run_id,phase,name));
+      CREATE TABLE IF NOT EXISTS workflow_tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,phase TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL DEFAULT '',declaration_order INTEGER NOT NULL,agent TEXT NOT NULL,dependencies TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,verification_repair_limit INTEGER NOT NULL DEFAULT 0,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue',review_agent TEXT,review_instructions TEXT,review_max_rounds INTEGER,UNIQUE(run_id,phase,name));
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
       CREATE TABLE IF NOT EXISTS integration_lock(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS context_packs(run_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,instructions TEXT NOT NULL,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS context_fragments(run_id TEXT NOT NULL,pack TEXT NOT NULL,fragment_key TEXT NOT NULL,version INTEGER NOT NULL,publisher_thread_id TEXT,publisher_agent_id TEXT,path TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,summary TEXT,content TEXT NOT NULL,content_hash TEXT NOT NULL,superseded_version INTEGER,created_at INTEGER NOT NULL,PRIMARY KEY(run_id,pack,fragment_key,version));
+      CREATE TABLE IF NOT EXISTS review_operations(operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,round INTEGER NOT NULL,reviewer_thread_id TEXT NOT NULL,state TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS review_findings(finding_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,finding_order INTEGER NOT NULL,file TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,reason TEXT NOT NULL,rule_key TEXT,ast_grep_suitable INTEGER NOT NULL,attributed_task_id TEXT,attributed_operation_id TEXT,attributed_agent_id TEXT);
+      CREATE TABLE IF NOT EXISTS review_resolutions(finding_id TEXT NOT NULL,repair_operation_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,PRIMARY KEY(finding_id,repair_operation_id,source_commit));
+      CREATE TABLE IF NOT EXISTS pending_boundaries(run_id TEXT NOT NULL,scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,target TEXT NOT NULL,reason TEXT NOT NULL,transition TEXT NOT NULL,PRIMARY KEY(run_id,scope_kind,scope_id));
       INSERT OR IGNORE INTO integration_lock(id,generation) VALUES(1,0);";
     for statement in statements
         .split(';')
@@ -1189,6 +1399,22 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE runs ADD COLUMN parent_run_id TEXT",
         "ALTER TABLE runs ADD COLUMN workflow_identity TEXT",
         "ALTER TABLE workflow_tasks ADD COLUMN instructions TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE runs ADD COLUMN verification_repair_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE runs ADD COLUMN review_round_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE runs ADD COLUMN boundary TEXT NOT NULL DEFAULT 'continue'",
+        "ALTER TABLE workflow_phases ADD COLUMN verification_repair_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_phases ADD COLUMN review_round_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_phases ADD COLUMN boundary TEXT NOT NULL DEFAULT 'continue'",
+        "ALTER TABLE workflow_phases ADD COLUMN review_agent TEXT",
+        "ALTER TABLE workflow_phases ADD COLUMN review_instructions TEXT",
+        "ALTER TABLE workflow_phases ADD COLUMN review_max_rounds INTEGER",
+        "ALTER TABLE workflow_tasks ADD COLUMN verification_repair_limit INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_tasks ADD COLUMN verification_repair_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_tasks ADD COLUMN review_round_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workflow_tasks ADD COLUMN boundary TEXT NOT NULL DEFAULT 'continue'",
+        "ALTER TABLE workflow_tasks ADD COLUMN review_agent TEXT",
+        "ALTER TABLE workflow_tasks ADD COLUMN review_instructions TEXT",
+        "ALTER TABLE workflow_tasks ADD COLUMN review_max_rounds INTEGER",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
@@ -1197,6 +1423,13 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
 fn encode(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+}
+fn boundary_name(boundary: crate::workflow::Boundary) -> &'static str {
+    match boundary {
+        crate::workflow::Boundary::Continue => "continue",
+        crate::workflow::Boundary::Orchestrator => "orchestrator",
+        crate::workflow::Boundary::Human => "human",
+    }
 }
 fn decode(value: &str) -> Vec<String> {
     serde_json::from_str(value).unwrap_or_default()
@@ -1597,12 +1830,15 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec!["git diff --check".into()],
+            boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
                 instructions: "phase instructions".into(),
                 open: false,
                 verification: vec!["cargo test".into()],
+                boundary: crate::workflow::Boundary::Continue,
+                review: None,
                 tasks: vec![TaskDefinition {
                     name: "task".into(),
                     agent: "worker".into(),
@@ -1611,6 +1847,9 @@ mod tests {
                     read_scope: vec!["src/**".into()],
                     write_scope: vec!["src/**".into()],
                     verification: vec![],
+                    verification_repair_limit: 0,
+                    review: None,
+                    boundary: crate::workflow::Boundary::Continue,
                     context: vec![],
                 }],
             }],
@@ -1657,6 +1896,9 @@ mod tests {
             read_scope: vec![],
             write_scope: write_scope.iter().map(|value| (*value).into()).collect(),
             verification: vec![],
+            verification_repair_limit: 0,
+            review: None,
+            boundary: crate::workflow::Boundary::Continue,
             context: vec![],
         };
         let definition = WorkflowDefinition {
@@ -1672,12 +1914,15 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
                 instructions: "phase instructions".into(),
                 open: true,
                 verification: vec![],
+                boundary: crate::workflow::Boundary::Continue,
+                review: None,
                 tasks: vec![
                     task("first", &[], &["src/**"]),
                     task("second", &[], &["docs/**"]),
@@ -1749,6 +1994,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),
@@ -1756,6 +2002,8 @@ mod tests {
                 tasks: vec![],
                 open: true,
                 verification: vec![],
+                boundary: crate::workflow::Boundary::Continue,
+                review: None,
             }],
         };
         store.initialize_workflow(&run, &definition).unwrap();
