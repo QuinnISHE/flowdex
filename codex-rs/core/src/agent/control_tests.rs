@@ -3,6 +3,7 @@ use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
 use crate::agent::agent_status_from_event;
+use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
@@ -35,6 +36,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -416,6 +418,23 @@ async fn on_event_updates_status_from_task_complete() {
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
+
+    let status = agent_status_from_event(&EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-2".to_string(),
+        started_at: None,
+        last_agent_message: None,
+        error: Some(ErrorEvent {
+            message: "turn failed".to_string(),
+            codex_error_info: None,
+        }),
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    }));
+    assert_eq!(
+        status,
+        Some(AgentStatus::Errored("turn failed".to_string()))
+    );
 }
 
 #[tokio::test]
@@ -540,6 +559,161 @@ async fn subscribe_status_updates_on_shutdown() {
 
     let _ = status_rx.changed().await;
     assert_eq!(status_rx.borrow().clone(), AgentStatus::Shutdown);
+}
+
+#[tokio::test]
+async fn subscribe_status_marks_existing_terminal_value_seen() {
+    let harness = AgentControlHarness::new().await;
+    let (thread_id, thread) = harness.start_thread().await;
+    let turn = thread.session.new_default_turn().await;
+    thread
+        .session
+        .send_event(
+            turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("previous turn".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if thread.agent_status().await
+                == AgentStatus::Completed(Some("previous turn".to_string()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("thread should reach the prior terminal status");
+
+    let mut status_rx = harness
+        .control
+        .subscribe_status(thread_id)
+        .await
+        .expect("status subscription should succeed");
+    assert_eq!(
+        status_rx.borrow().clone(),
+        AgentStatus::Completed(Some("previous turn".to_string()))
+    );
+    assert!(
+        timeout(Duration::from_millis(20), status_rx.changed())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn wait_for_submitted_operation_ignores_foreign_terminal_status() {
+    let control = AgentControl::default();
+    let agent_id = ThreadId::new();
+    let operation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let guard = Arc::clone(&operation_lock).lock_owned().await;
+    let (status_tx, status_rx) = tokio::sync::broadcast::channel(4);
+    let operation = SubmittedAgentOperation {
+        agent_id,
+        submission_id: "owned-operation".to_string(),
+        status_rx,
+        _guard: guard,
+    };
+
+    status_tx
+        .send(AgentOperationEvent::new(
+            "foreign-operation".to_string(),
+            AgentStatus::Completed(Some("foreign output".to_string())),
+            true,
+        ))
+        .unwrap();
+    status_tx
+        .send(AgentOperationEvent::new(
+            "owned-operation".to_string(),
+            AgentStatus::Completed(Some("owned output".to_string())),
+            true,
+        ))
+        .unwrap();
+
+    let status = control.wait_for_submitted_operation(operation).await;
+    assert_eq!(
+        status,
+        AgentStatus::Completed(Some("owned output".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn wait_for_submitted_compaction_preserves_error_before_completion() {
+    let harness = AgentControlHarness::new().await;
+    let (agent_id, thread) = harness.start_thread().await;
+    let guard = Arc::clone(&thread.session.agent_operation_lock)
+        .lock_owned()
+        .await;
+    let operation = SubmittedAgentOperation {
+        agent_id,
+        submission_id: "compact-operation".to_string(),
+        status_rx: thread.session.agent_operation_events.subscribe(),
+        _guard: guard,
+    };
+
+    thread
+        .session
+        .send_event_raw(Event {
+            id: "compact-operation".to_string(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: "compaction failed".to_string(),
+                codex_error_info: None,
+            }),
+        })
+        .await;
+    thread
+        .session
+        .send_event_raw(Event {
+            id: "compact-operation".to_string(),
+            msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "compact-operation".to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        })
+        .await;
+
+    let status = harness
+        .control
+        .wait_for_submitted_operation(operation)
+        .await;
+    assert_eq!(
+        status,
+        AgentStatus::Errored("compaction failed".to_string())
+    );
+}
+
+#[tokio::test]
+async fn submit_compaction_submits_standalone_compact_operation() {
+    let harness = AgentControlHarness::new().await;
+    let (thread_id, _thread) = harness.start_thread().await;
+
+    harness
+        .control
+        .submit_compaction(thread_id)
+        .await
+        .expect("compaction should submit");
+
+    assert!(
+        harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|entry| entry == (thread_id, Op::Compact))
+    );
 }
 
 #[tokio::test]
@@ -2326,15 +2500,108 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_status_only_completion_does_not_queue_parent_message() {
+    let harness = AgentControlHarness::new().await;
+    let mut config = harness.config.clone();
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let root = harness
+        .manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    let root_thread_id = root.thread_id;
+    let child_path = AgentPath::root().join("worker_a").expect("child path");
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            config,
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root_thread_id,
+                depth: 1,
+                agent_path: Some(child_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(root_thread_id),
+                completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("child spawn should succeed")
+        .thread_id;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should exist");
+    let child_turn = child_thread.session.new_default_turn().await;
+    child_thread
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if child_thread.agent_status().await == AgentStatus::Completed(Some("done".to_string()))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("status-only child should become completed");
+    assert!(!harness
+        .manager
+        .captured_ops()
+        .into_iter()
+        .any(|(thread_id, op)| {
+            thread_id == root_thread_id
+                && matches!(op, Op::InterAgentCommunication { communication } if communication.author == child_path)
+        }));
+}
+
+#[tokio::test]
 async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
     let (worker_thread_id, _worker_thread) = harness.start_thread().await;
     let mut tester_config = harness.config.clone();
     let _ = tester_config.features.enable(Feature::MultiAgentV2);
+    let worker_path = AgentPath::root().join("worker_a").expect("worker path");
+    let tester_path = worker_path.join("tester").expect("tester path");
     let tester_thread_id = harness
-        .manager
-        .start_thread(tester_config.clone())
+        .control
+        .spawn_agent_with_metadata(
+            tester_config,
+            text_input("hello tester"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: worker_thread_id,
+                depth: 2,
+                agent_path: Some(tester_path.clone()),
+                agent_nickname: None,
+                agent_role: Some("explorer".to_string()),
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(worker_thread_id),
+                completion_delivery: SpawnAgentCompletionDelivery::NotifyParent,
+                ..Default::default()
+            },
+        )
         .await
         .expect("tester thread should start")
         .thread_id;
@@ -2343,20 +2610,6 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         .get_thread(tester_thread_id)
         .await
         .expect("tester thread should exist");
-    let worker_path = AgentPath::root().join("worker_a").expect("worker path");
-    let tester_path = worker_path.join("tester").expect("tester path");
-    harness.control.maybe_start_completion_watcher(
-        tester_thread_id,
-        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: worker_thread_id,
-            depth: 2,
-            agent_path: Some(tester_path.clone()),
-            agent_nickname: None,
-            agent_role: Some("explorer".to_string()),
-        })),
-        tester_path.to_string(),
-        Some(tester_path.clone()),
-    );
     let tester_turn = tester_thread.session.new_default_turn().await;
     tester_thread
         .session
@@ -2444,6 +2697,7 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
         })),
         child_thread_id.to_string(),
         /*child_agent_path*/ None,
+        SpawnAgentCompletionDelivery::NotifyParent,
     );
 
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);

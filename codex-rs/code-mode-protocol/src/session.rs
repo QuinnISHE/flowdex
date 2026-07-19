@@ -117,6 +117,11 @@ pub trait CodeModeSession: Send + Sync {
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
+    fn wait_until_yield<'a>(
+        &'a self,
+        cell_id: CellId,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+
     fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()>;

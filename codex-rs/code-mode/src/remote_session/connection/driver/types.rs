@@ -46,6 +46,12 @@ pub(in crate::remote_session::connection) enum DriverCommand {
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
+    WaitUntilYield {
+        session: RemoteSession,
+        cell_id: CellId,
+        caller_cancellation: CancellationToken,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    },
     Terminate {
         session: RemoteSession,
         cell_id: CellId,
@@ -152,6 +158,12 @@ pub(super) enum PendingRequest {
         cancellation: CancellableRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
+    WaitUntilYield {
+        session: RemoteSession,
+        cell_id: WireCellId,
+        cancellation: CancellableRequest,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    },
     Terminate {
         session: RemoteSession,
         cell_id: WireCellId,
@@ -168,6 +180,7 @@ pub(super) struct DeferredWait {
     pub(super) request: WireWaitRequest,
     pub(super) caller_cancellation: CancellationToken,
     pub(super) response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    pub(super) until_yield: bool,
 }
 
 impl PendingRequest {
@@ -175,7 +188,8 @@ impl PendingRequest {
         match self {
             Self::OpenSession { cancellation, .. }
             | Self::Execute { cancellation, .. }
-            | Self::Wait { cancellation, .. } => Some(cancellation),
+            | Self::Wait { cancellation, .. }
+            | Self::WaitUntilYield { cancellation, .. } => Some(cancellation),
             Self::Terminate { .. } | Self::ShutdownSession { .. } => None,
         }
     }
@@ -188,7 +202,9 @@ impl PendingRequest {
             Self::Execute { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
-            Self::Wait { response_tx, .. } | Self::Terminate { response_tx, .. } => {
+            Self::Wait { response_tx, .. }
+            | Self::WaitUntilYield { response_tx, .. }
+            | Self::Terminate { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
         }

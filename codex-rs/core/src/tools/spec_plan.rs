@@ -5,13 +5,40 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::flowdex::ContinueFlowdexWorkflowHandler;
+use crate::tools::flowdex::FlowdexCheckRulesHandler;
+use crate::tools::flowdex::FlowdexQueueTaskHandler;
+use crate::tools::flowdex::FlowdexReviewReportHandler;
+use crate::tools::flowdex::FlowdexRunWorkflowHandler;
+use crate::tools::flowdex::FlowdexScanRuleCandidatesHandler;
+use crate::tools::flowdex::FlowdexSealPhaseHandler;
+use crate::tools::flowdex::FlowdexSignalHandler;
+use crate::tools::flowdex::FlowdexStartRunHandler;
+use crate::tools::flowdex::FlowdexVerifyHandler;
+use crate::tools::flowdex::FlowdexWaitRunHandler;
+use crate::tools::flowdex::PublishFlowdexContextHandler;
+use crate::tools::flowdex::QueueFlowdexTaskHandler;
+use crate::tools::flowdex::ReadFlowdexContextHandler;
+use crate::tools::flowdex::SaveFlowdexWorkflowHandler;
+use crate::tools::flowdex::SealFlowdexPhaseHandler;
+use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
+use crate::tools::flowdex::review_report_tool_visible;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
+use crate::tools::handlers::CompactContextHandler;
 use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::FlowdexCreateTaskHandler;
+use crate::tools::handlers::FlowdexResumeAgentHandler;
+use crate::tools::handlers::FlowdexSendMessageHandler;
+use crate::tools::handlers::FlowdexSpawnAgentHandler;
+use crate::tools::handlers::FlowdexTaskIntegrateHandler;
+use crate::tools::handlers::FlowdexTaskRunAgentHandler;
+use crate::tools::handlers::FlowdexTaskVerifyHandler;
+use crate::tools::handlers::FlowdexWaitAgentHandler;
 use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
@@ -25,6 +52,7 @@ use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::StartFlowdexWorkflowHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -192,6 +220,100 @@ fn build_tool_specs_and_registry(
     add_tool_sources(&context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
+    let flowdex_agent_tools_enabled = collab_tools_enabled(turn_context);
+    planned_tools.add_with_exposure(FlowdexCheckRulesHandler, ToolExposure::Hidden);
+    planned_tools.add_with_exposure(FlowdexSignalHandler, ToolExposure::Hidden);
+    if flowdex_agent_tools_enabled {
+        planned_tools.add_with_exposure(FlowdexSpawnAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexSendMessageHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexWaitAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexResumeAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexCreateTaskHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskRunAgentHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskVerifyHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexTaskIntegrateHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexStartRunHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexQueueTaskHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexSealPhaseHandler, ToolExposure::Hidden);
+        planned_tools.add_with_exposure(FlowdexWaitRunHandler, ToolExposure::Hidden);
+    }
+    if review_report_tool_visible(turn_context.session_source.get_agent_path().as_ref()) {
+        planned_tools.add_with_exposure(FlowdexReviewReportHandler, ToolExposure::DirectModelOnly);
+    }
+    if !turn_context.session_source.is_non_root_agent() {
+        planned_tools.add_with_exposure(
+            FlowdexScanRuleCandidatesHandler,
+            ToolExposure::DirectModelOnly,
+        );
+    }
+    let flowdex_verification_enabled = planned_tools.runtimes().iter().any(|runtime| {
+        let name = runtime.tool_name();
+        name == ToolName::plain("shell_command") || name == ToolName::plain("exec_command")
+    });
+    if flowdex_verification_enabled {
+        planned_tools.add_with_exposure(
+            FlowdexVerifyHandler::new(shell_command_backend_for_features(
+                turn_context.config.features.get(),
+            )),
+            ToolExposure::Hidden,
+        );
+    }
+    let mut flowdex_nested_tool_specs = planned_tools
+        .runtimes()
+        .iter()
+        .filter(|runtime| {
+            runtime.exposure() != ToolExposure::DirectModelOnly
+                && runtime.exposure() != ToolExposure::Hidden
+        })
+        .map(|runtime| runtime.spec())
+        .collect::<Vec<_>>();
+    flowdex_nested_tool_specs.push(FlowdexCheckRulesHandler.spec());
+    flowdex_nested_tool_specs.push(FlowdexSignalHandler.spec());
+    if flowdex_agent_tools_enabled {
+        flowdex_nested_tool_specs.extend([
+            FlowdexSpawnAgentHandler.spec(),
+            FlowdexSendMessageHandler.spec(),
+            FlowdexWaitAgentHandler.spec(),
+            FlowdexResumeAgentHandler.spec(),
+            FlowdexCreateTaskHandler.spec(),
+            FlowdexTaskRunAgentHandler.spec(),
+            FlowdexTaskVerifyHandler.spec(),
+            FlowdexTaskIntegrateHandler.spec(),
+            FlowdexStartRunHandler.spec(),
+            FlowdexQueueTaskHandler.spec(),
+            FlowdexSealPhaseHandler.spec(),
+            FlowdexWaitRunHandler.spec(),
+        ]);
+    }
+    if flowdex_verification_enabled {
+        flowdex_nested_tool_specs.push(
+            FlowdexVerifyHandler::new(shell_command_backend_for_features(
+                turn_context.config.features.get(),
+            ))
+            .spec(),
+        );
+    }
+    // Nested saved workflows are hidden from model and ordinary code-mode tools,
+    // but are exposed through the Flowdex bootstrap as an internal primitive.
+    flowdex_nested_tool_specs.push(FlowdexRunWorkflowHandler::new(Vec::new()).spec());
+    planned_tools.add_with_exposure(
+        FlowdexRunWorkflowHandler::new(flowdex_nested_tool_specs.clone()),
+        ToolExposure::Hidden,
+    );
+    planned_tools.add_with_exposure(
+        StartFlowdexWorkflowHandler::new(flowdex_nested_tool_specs),
+        ToolExposure::DirectModelOnly,
+    );
+    planned_tools.add_with_exposure(SaveFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(WaitFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(
+        ContinueFlowdexWorkflowHandler,
+        ToolExposure::DirectModelOnly,
+    );
+    planned_tools.add_with_exposure(PublishFlowdexContextHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(ReadFlowdexContextHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(QueueFlowdexTaskHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(SealFlowdexPhaseHandler, ToolExposure::DirectModelOnly);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
 }
@@ -705,6 +827,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let environment_mode = tool_environment_mode(context.step_context);
 
     planned_tools.add(PlanHandler);
+    planned_tools.add_with_exposure(CompactContextHandler, ToolExposure::DirectModelOnly);
 
     if features.enabled(Feature::DeferredExecutor) {
         planned_tools.add(WaitForEnvironmentHandler);

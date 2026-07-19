@@ -45,11 +45,11 @@ JavaScript is the workflow definition and control language. The final authoring 
 
 ### Partial or correction needed
 
-- No known contract correction remains. All requested feature slices are implemented; the cohesive completion pass is now checking their joined behavior and final documentation.
+- None. All requested Flowdex feature slices are implemented and accepted.
 
 ### In progress
 
-- **Cohesive completion (Batch 018):** exercise the joined workflow pipeline, fix only integration defects it exposes, and finish the user-facing source of truth without introducing another API layer.
+- None.
 
 ## Remaining durable feature slices
 
@@ -152,13 +152,13 @@ A user-started action may dispatch the future rule-writing agent or skill. Each 
 
 Batch 017 derives candidates from the durable finding/resolution source of truth rather than duplicating candidate state. The read-only scan never writes rules or starts a model in the background; after a user approves an exact proposal, ordinary repository editing writes the accepted Batch 011 YAML/config format.
 
-### 10. Cohesive completion pass
+### 10. Cohesive completion pass — complete (Batch 018)
 
 Once the real workflow pipeline exists, exercise one representative workflow covering phase inheritance, parallel dependency-ready tasks, dynamic queuing, direct agent messages, worktrees, verification/repair, review routing, context collection, integration, boundaries, automatic progress, steering, and completion.
 
 Use that pass to close genuine integration gaps and make the Flowdex documentation describe the final authoring API and runtime behavior. Avoid expanding it into exhaustive tests for every schema field or duplicating checks already owned by Codex primitives.
 
-Batch 018 is this pass. It adds no planned public API: the accepted workflow language and tools are the contract. One joined acceptance path plus the existing focused tests should provide the evidence; process-restart controller resurrection and a live macOS host run remain explicitly outside this completion contract.
+Batch 018 completed this pass without changing production behavior or public APIs. Joined workflow evidence now covers saved V8 execution, phase inheritance, concurrent dependency-ready scheduling, verification, automatic progress isolation, app-visible children, an orchestrator boundary continued to terminal completion, and final scheduler completion. Existing focused tests remain authoritative for the other settled capabilities. Process-restart controller resurrection and a live macOS host run remain explicitly outside this completion contract.
 
 ## Likely dependency shape
 
@@ -201,6 +201,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-07-19:** Accepted Batch 018 and fast-forwarded `codex/flowdex` to `953964899e`. The joined completion path and focused evidence pass, including orchestrator-boundary continuation to the final terminal result. No production defect or API change was needed. All requested Flowdex feature slices are complete; process-restart controller resurrection and a live macOS host run remain optional follow-up validation rather than completion requirements.
 - **2026-07-19:** Accepted Batch 017 and fast-forwarded `codex/flowdex` to `1305d0d08f`. Candidate scanning is repository-rooted, bounded, read-only on first use and thereafter, and preserves the explicit human-approval boundary. Started Batch 018 as the final cohesive acceptance and documentation pass; no new public API is planned.
 - **2026-07-19:** Accepted Batch 016 and fast-forwarded `codex/flowdex` to `fc6a8f03b1`. Tool-profile precedence and propagation are complete, and persisted FIFO named signals now wake event-driven waits without model/history output while preserving steering. Started Batch 017 for the remaining AST-grep candidate-promotion backend.
 - **2026-07-19:** Started Batch 016 from authoritative commit `e360b5fe6c`. It combines the final agent tool-profile composition with named workflow signals. The config/profile and signal/wait paths can proceed in parallel after one shared contract; process-restart controller recovery remains optional, out-of-scope machinery.

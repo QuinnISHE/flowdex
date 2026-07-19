@@ -248,9 +248,53 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), FunctionCallError> {
-    let requested_model = requested_model.or(turn.config.agent_default_subagent_model.as_deref());
-    let requested_reasoning_effort = requested_reasoning_effort
-        .or_else(|| turn.config.agent_default_subagent_reasoning_effort.clone());
+    apply_spawn_agent_model_overrides(
+        session,
+        turn,
+        config,
+        requested_model,
+        requested_reasoning_effort,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn apply_explicit_spawn_agent_model_overrides(
+    session: &Session,
+    turn: &TurnContext,
+    config: &mut Config,
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+) -> Result<(), FunctionCallError> {
+    apply_spawn_agent_model_overrides(
+        session,
+        turn,
+        config,
+        requested_model,
+        requested_reasoning_effort,
+        false,
+    )
+    .await
+}
+
+async fn apply_spawn_agent_model_overrides(
+    session: &Session,
+    turn: &TurnContext,
+    config: &mut Config,
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    include_parent_defaults: bool,
+) -> Result<(), FunctionCallError> {
+    let requested_model = requested_model.or_else(|| {
+        include_parent_defaults
+            .then(|| turn.config.agent_default_subagent_model.as_deref())
+            .flatten()
+    });
+    let requested_reasoning_effort = requested_reasoning_effort.or_else(|| {
+        include_parent_defaults
+            .then(|| turn.config.agent_default_subagent_reasoning_effort.clone())
+            .flatten()
+    });
     if requested_model.is_none() && requested_reasoning_effort.is_none() {
         return Ok(());
     }

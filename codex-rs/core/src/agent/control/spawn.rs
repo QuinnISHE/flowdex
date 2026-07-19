@@ -475,6 +475,7 @@ impl AgentControl {
             (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?,
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
+        agent_metadata.completion_delivery = options.completion_delivery.clone();
         reservation.commit(agent_metadata.clone());
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
@@ -525,21 +526,24 @@ impl AgentControl {
         )
         .await;
 
-        match initial_input {
+        let (initial_submission_id, initial_operation) = match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
+                let operation = self
+                    .submit_input_operation(new_thread.thread_id, input)
                     .await?;
+                (operation.submission_id().to_string(), Some(operation))
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
-                self.send_inter_agent_communication_after_capacity_check(
-                    new_thread.thread_id,
-                    &state,
-                    communication,
-                    context,
-                )
-                .await?;
+                let operation = self
+                    .submit_inter_agent_communication_operation(
+                        new_thread.thread_id,
+                        communication,
+                        context,
+                    )
+                    .await?;
+                (operation.submission_id.clone(), Some(operation))
             }
-        }
+        };
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
@@ -551,11 +555,14 @@ impl AgentControl {
                 notification_source,
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                options.completion_delivery.clone(),
             );
         }
 
         Ok(LiveAgent {
             thread_id: new_thread.thread_id,
+            initial_submission_id,
+            initial_operation,
             metadata: agent_metadata,
             status: self.get_status(new_thread.thread_id).await,
         })
@@ -906,6 +913,7 @@ impl AgentControl {
                 Some(notification_source.clone()),
                 child_reference,
                 agent_metadata.agent_path.clone(),
+                SpawnAgentCompletionDelivery::default(),
             );
         }
         self.persist_thread_spawn_edge_for_source(

@@ -60,7 +60,7 @@ impl ShellCommandHandler {
         Self { backend, options }
     }
 
-    fn shell_runtime_backend(&self) -> ShellRuntimeBackend {
+    pub(crate) fn shell_runtime_backend(&self) -> ShellRuntimeBackend {
         match self.backend {
             ShellCommandBackend::Classic => ShellRuntimeBackend::ShellCommandClassic,
             ShellCommandBackend::ZshFork => ShellRuntimeBackend::ShellCommandZshFork,
@@ -84,7 +84,7 @@ impl ShellCommandHandler {
         shell.derive_exec_args(command, use_login_shell)
     }
 
-    pub(super) fn to_exec_params(
+    pub(crate) fn to_exec_params(
         params: &ShellCommandToolCallParams,
         session: &crate::session::session::Session,
         turn_context: &TurnContext,

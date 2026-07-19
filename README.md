@@ -1,71 +1,36 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Flowdex
 
----
+Flowdex is a modified Codex CLI for running model-authored coding workflows. It moves routine orchestration out of the main model loop: a saved JavaScript workflow can dispatch agents, wait on events, verify changes, route review findings, and continue through dependencies without repeatedly waking the orchestrator.
 
-## Quickstart
+Workflows run in Codex's native V8 runtime and require no Node.js installation.
 
-### Installing and running Codex CLI
+## What it adds
 
-Run the following on Mac or Linux to install Codex CLI:
+- Durable runs composed of phases and dependency-aware tasks.
+- Parallel agents working in isolated Git worktrees with commit attribution.
+- Silent command verification and line-attributed review/repair rounds.
+- Event-driven waiting that still wakes for user steering, boundaries, and named signals.
+- Reusable repository or global workflows with strict JSON inputs and outputs.
+- Context packs that deliver refreshable source fragments directly to dependent agents.
+- Automatic, nonpersistent progress summaries and normal app-visible subagent events.
+- Native context compaction, per-agent tool profiles, and repository AST-grep rules.
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+See the [getting-started guide](flowdex-plan/flowdex-documentation/getting-started.md), [workflow documentation](flowdex-plan/flowdex-documentation/workflows.md), and [video demo](flowdex-demo/VIDEO_DEMO.md).
 
-Run the following on Windows to install Codex CLI:
+## Build
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
-
-Codex CLI can also be installed via the following package managers:
+Install the normal Codex build prerequisites, then build the modified CLI from the Rust workspace:
 
 ```shell
-# Install using npm
-npm install -g @openai/codex
+cd codex-rs
+cargo build -p codex-cli --bin codex
 ```
+
+The executable is written to `codex-rs/target/debug/codex` on macOS and Linux or `codex-rs/target/debug/codex.exe` on Windows.
+
+To use it as the Codex desktop app backend, pass its absolute path to the installer and restart the app:
 
 ```shell
-# Install using Homebrew
-brew install --cask codex
+codex flowdex install --binary /absolute/path/to/codex
+# Windows: codex flowdex install --binary C:\absolute\path\to\codex.exe
 ```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).

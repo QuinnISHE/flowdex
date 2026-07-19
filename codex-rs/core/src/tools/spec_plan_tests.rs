@@ -47,6 +47,70 @@ use crate::tools::router::ToolSuggestPresentation;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 
+#[tokio::test]
+async fn compact_context_is_empty_direct_model_only_tool() {
+    let plan = probe(|_| {}).await;
+    plan.assert_visible_contains(&["compact_context"]);
+    plan.assert_registered_contains(&["compact_context"]);
+    assert_eq!(
+        plan.exposure("compact_context"),
+        ToolExposure::DirectModelOnly
+    );
+
+    let ToolSpec::Function(tool) = plan.visible_spec("compact_context") else {
+        panic!("expected compact_context function spec");
+    };
+    assert_eq!(
+        serde_json::to_value(&tool.parameters).expect("serialize compact_context schema"),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn scan_flowdex_rule_candidates_is_strict_direct_model_only() {
+    let plan = probe(|_| {}).await;
+    plan.assert_visible_contains(&["scan_flowdex_rule_candidates"]);
+    plan.assert_registered_contains(&["scan_flowdex_rule_candidates"]);
+    assert_eq!(
+        plan.exposure("scan_flowdex_rule_candidates"),
+        ToolExposure::DirectModelOnly
+    );
+    let ToolSpec::Function(tool) = plan.visible_spec("scan_flowdex_rule_candidates") else {
+        panic!("expected scan_flowdex_rule_candidates function spec");
+    };
+    assert!(tool.strict);
+    assert_eq!(
+        serde_json::to_value(&tool.parameters).expect("serialize scan schema"),
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        })
+    );
+
+    let code_mode = probe(|turn| {
+        set_features(turn, &[Feature::CodeMode]);
+    })
+    .await;
+    assert!(
+        !code_mode
+            .namespace_function_names("tools")
+            .iter()
+            .any(|name| name == "scan_flowdex_rule_candidates")
+    );
+
+    let subagent = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other("ordinary".into()));
+    })
+    .await;
+    subagent.assert_visible_lacks(&["scan_flowdex_rule_candidates"]);
+    subagent.assert_registered_lacks(&["scan_flowdex_rule_candidates"]);
+}
+
 #[derive(Default)]
 struct ToolPlanInputs {
     tool_runtimes: Vec<Arc<dyn CoreToolRuntime>>,
@@ -1508,6 +1572,8 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "wait",
             "request_user_input",
             "agents",
+            "start_flowdex_workflow",
+            "wait_flowdex_workflow",
             // Hosted Responses tool.
             "web_search",
         ]
@@ -1628,6 +1694,8 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
             "request_user_input",
             // Multi-agent v2 tools.
             MULTI_AGENT_V2_NAMESPACE,
+            "start_flowdex_workflow",
+            "wait_flowdex_workflow",
             // Hosted Responses tools.
             "web_search",
         ]

@@ -189,6 +189,11 @@ pub enum HostRequest {
         session_id: SessionId,
         request: WireWaitRequest,
     },
+    #[serde(rename = "session/waitUntilYield")]
+    WaitUntilYield {
+        session_id: SessionId,
+        cell_id: WireCellId,
+    },
     #[serde(rename = "session/terminate")]
     Terminate {
         session_id: SessionId,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Report Flowdex Reviews"
+  short_description: "Report attributable findings from Flowdex reviews"
+  default_prompt: "Use $report-flowdex-review to report precise findings from this Flowdex review."

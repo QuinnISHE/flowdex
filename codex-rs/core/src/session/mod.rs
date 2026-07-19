@@ -13,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
 use crate::agent::agent_status_from_event;
+use crate::agent::control::AgentOperationEvent;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
@@ -201,6 +202,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+pub(crate) mod compaction_reminder;
 mod config_lock;
 pub(crate) mod context_window;
 mod handlers;
@@ -313,6 +315,7 @@ use crate::shell;
 use crate::skills::SkillLoadOutcome;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
+use crate::state::PendingContextAction;
 use crate::state::PendingRequestPermissions;
 use crate::state::SessionServices;
 use crate::state::SessionState;
@@ -1815,6 +1818,15 @@ impl Session {
             return;
         }
 
+        if self
+            .services
+            .agent_control
+            .completion_delivery_for_thread(self.thread_id)
+            == crate::agent::control::SpawnAgentCompletionDelivery::StatusOnly
+        {
+            return;
+        }
+
         self.forward_child_completion_to_parent(
             turn_context,
             *parent_thread_id,
@@ -1974,7 +1986,20 @@ impl Session {
     async fn deliver_event_raw(&self, event: Event) {
         // Record the last known agent status.
         if let Some(status) = agent_status_from_event(&event.msg) {
-            self.agent_status.send_replace(status);
+            self.agent_status.send_replace(status.clone());
+            if matches!(
+                &event.msg,
+                EventMsg::TurnComplete(_)
+                    | EventMsg::TurnAborted(_)
+                    | EventMsg::Error(_)
+                    | EventMsg::ShutdownComplete
+            ) {
+                let _ = self.agent_operation_events.send(AgentOperationEvent::new(
+                    event.id.clone(),
+                    status,
+                    !matches!(&event.msg, EventMsg::Error(_)),
+                ));
+            }
         }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
@@ -2010,6 +2035,46 @@ impl Session {
             }),
         )
         .await;
+    }
+
+    /// Delivers a Flowdex reasoning summary to live clients without recording it in the rollout.
+    pub(crate) async fn emit_flowdex_progress(&self, turn_context: &TurnContext, item: TurnItem) {
+        let started = EventMsg::ItemStarted(ItemStartedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item: item.clone(),
+            started_at_ms: now_unix_timestamp_ms(),
+        });
+        self.send_transient_event(turn_context, started).await;
+
+        let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
+            thread_id: self.thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            item,
+            completed_at_ms: now_unix_timestamp_ms(),
+        });
+        self.send_transient_event(turn_context, completed).await;
+    }
+
+    async fn send_transient_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg: msg.clone(),
+        };
+        self.send_event_raw_with_persistence(event, /*persist*/ false)
+            .await;
+
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        for legacy in msg.as_legacy_events(show_raw_agent_reasoning) {
+            self.send_event_raw_with_persistence(
+                Event {
+                    id: turn_context.sub_id.clone(),
+                    msg: legacy,
+                },
+                /*persist*/ false,
+            )
+            .await;
+        }
     }
 
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
@@ -3511,9 +3576,19 @@ impl Session {
         state.request_new_context_window();
     }
 
-    pub(crate) async fn take_new_context_window_request(&self) -> bool {
+    pub(crate) async fn request_compact(&self) {
         let mut state = self.state.lock().await;
-        state.take_new_context_window_request()
+        state.request_compact();
+    }
+
+    pub(crate) async fn take_pending_context_action(&self) -> Option<PendingContextAction> {
+        let mut state = self.state.lock().await;
+        state.take_pending_context_action()
+    }
+
+    pub(crate) async fn clear_pending_compact_request(&self) {
+        let mut state = self.state.lock().await;
+        state.clear_pending_compact_request();
     }
 
     pub(crate) async fn start_new_context_window(

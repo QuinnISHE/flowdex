@@ -8,6 +8,7 @@ use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
+use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireWaitRequest;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,12 @@ impl ConnectionDriver {
                 caller_cancellation,
                 response_tx,
             } => self.wait(session, request, caller_cancellation, response_tx),
+            DriverCommand::WaitUntilYield {
+                session,
+                cell_id,
+                caller_cancellation,
+                response_tx,
+            } => self.wait_until_yield(session, cell_id, caller_cancellation, response_tx),
             DriverCommand::Terminate {
                 session,
                 cell_id,
@@ -191,10 +198,66 @@ impl ConnectionDriver {
                 request,
                 caller_cancellation,
                 response_tx,
+                until_yield: false,
             });
             return true;
         }
         self.start_wait(session, request, caller_cancellation, response_tx)
+    }
+
+    fn wait_until_yield(
+        &mut self,
+        session: RemoteSession,
+        cell_id: CellId,
+        caller_cancellation: CancellationToken,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    ) -> bool {
+        if let Err(err) = self.sessions.require_ready(&session) {
+            let _ = response_tx.send(Err(err));
+            return true;
+        }
+        let cell_id = match remote_cell_id(&session, &cell_id) {
+            Ok(cell_id) => cell_id,
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+                return true;
+            }
+        };
+        if self.requests.has_cancelled_wait(&session, &cell_id) {
+            self.requests.push_deferred_wait(DeferredWait {
+                session,
+                request: WireWaitRequest {
+                    cell_id,
+                    yield_time_ms: 0,
+                },
+                caller_cancellation,
+                response_tx,
+                until_yield: true,
+            });
+            return true;
+        }
+        self.start_wait_until_yield(session, cell_id, caller_cancellation, response_tx)
+    }
+
+    pub(super) fn start_wait_until_yield(
+        &mut self,
+        session: RemoteSession,
+        cell_id: WireCellId,
+        caller_cancellation: CancellationToken,
+        response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
+    ) -> bool {
+        self.send_request(
+            HostRequest::WaitUntilYield {
+                session_id: session.id.clone(),
+                cell_id: cell_id.clone(),
+            },
+            PendingRequest::WaitUntilYield {
+                session,
+                cell_id,
+                cancellation: CancellableRequest::new(caller_cancellation),
+                response_tx,
+            },
+        )
     }
 
     pub(super) fn start_wait(

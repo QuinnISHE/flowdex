@@ -1,4 +1,5 @@
 use codex_features::Feature;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ShellCommandToolCallParams;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -7,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecApprovalRequest;
 use crate::function_tool::FunctionCallError;
+use crate::hook_runtime::PreToolUseHookResult;
+use crate::hook_runtime::record_additional_contexts;
+use crate::hook_runtime::run_post_tool_use_hooks;
+use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
@@ -19,11 +24,16 @@ use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::updated_hook_command;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
+use crate::tools::sandboxing::ToolError;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::SandboxErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_tools::ToolName;
@@ -44,23 +54,60 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
         .map(|params| params.command)
 }
 
-struct RunExecLikeArgs {
-    tool_name: ToolName,
-    exec_params: ExecParams,
-    cancellation_token: CancellationToken,
-    hook_command: String,
-    shell_type: Option<ShellType>,
-    additional_permissions: Option<AdditionalPermissionProfile>,
-    prefix_rule: Option<Vec<String>>,
-    session: Arc<crate::session::session::Session>,
-    turn: Arc<TurnContext>,
-    turn_environment: TurnEnvironment,
-    tracker: crate::tools::context::SharedTurnDiffTracker,
-    call_id: String,
-    shell_runtime_backend: ShellRuntimeBackend,
+pub(crate) struct RunExecLikeArgs {
+    pub(crate) tool_name: ToolName,
+    pub(crate) exec_params: ExecParams,
+    pub(crate) cancellation_token: CancellationToken,
+    pub(crate) hook_command: String,
+    pub(crate) shell_type: Option<ShellType>,
+    pub(crate) additional_permissions: Option<AdditionalPermissionProfile>,
+    pub(crate) prefix_rule: Option<Vec<String>>,
+    pub(crate) session: Arc<crate::session::session::Session>,
+    pub(crate) turn: Arc<TurnContext>,
+    pub(crate) turn_environment: TurnEnvironment,
+    pub(crate) tracker: crate::tools::context::SharedTurnDiffTracker,
+    pub(crate) call_id: String,
+    pub(crate) shell_runtime_backend: ShellRuntimeBackend,
+}
+
+pub(crate) enum RunExecLikeResult {
+    Command {
+        output: Option<ExecToolCallOutput>,
+        content: String,
+        post_tool_use_response: Option<JsonValue>,
+        error: Option<FunctionCallError>,
+    },
+    Intercepted(FunctionToolOutput),
 }
 
 async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, FunctionCallError> {
+    match run_exec_like_result(args).await? {
+        RunExecLikeResult::Command {
+            content,
+            post_tool_use_response,
+            error,
+            ..
+        } => {
+            if let Some(error) = error {
+                return Err(error);
+            }
+            Ok(FunctionToolOutput {
+                body: vec![
+                    codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                        text: content,
+                    },
+                ],
+                success: Some(true),
+                post_tool_use_response,
+            })
+        }
+        RunExecLikeResult::Intercepted(output) => Ok(output),
+    }
+}
+
+pub(crate) async fn run_exec_like_result(
+    args: RunExecLikeArgs,
+) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
         exec_params,
@@ -152,7 +199,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
     )
     .await?
     {
-        return Ok(output);
+        return Ok(RunExecLikeResult::Intercepted(output));
     }
 
     let source = ExecCommandSource::Agent;
@@ -225,23 +272,95 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         &call_id,
         /*turn_diff_tracker*/ None,
     );
-    let post_tool_use_response = out
+    let structured_output = match &out {
+        Ok(output) => Some(output.clone()),
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output }))) => {
+            Some((**output).clone())
+        }
+        _ => None,
+    };
+    let post_tool_use_response = structured_output
         .as_ref()
-        .ok()
         .map(|output| {
             crate::tools::format_exec_output_str(output, turn.model_info.truncation_policy.into())
         })
         .map(JsonValue::String);
-    let content = emitter
+    let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
-        .await?;
-    Ok(FunctionToolOutput {
-        body: vec![
-            codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
-        ],
-        success: Some(true),
+        .await;
+    let (content, error) = match finish_result {
+        Ok(content) => (content, None),
+        Err(error) if structured_output.is_some() => {
+            let FunctionCallError::RespondToModel(content) = &error else {
+                return Err(error);
+            };
+            (content.clone(), Some(error))
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(RunExecLikeResult::Command {
+        output: structured_output,
+        content,
         post_tool_use_response,
+        error,
     })
+}
+
+pub(crate) async fn run_shell_command_pre_hooks(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    call_id: String,
+    command: String,
+) -> Result<String, FunctionCallError> {
+    let tool_name = HookToolName::bash();
+    match run_pre_tool_use_hooks(
+        session,
+        turn,
+        call_id,
+        &tool_name,
+        &serde_json::json!({ "command": command }),
+    )
+    .await
+    {
+        PreToolUseHookResult::Blocked(message) => Err(FunctionCallError::RespondToModel(message)),
+        PreToolUseHookResult::Continue {
+            updated_input: Some(updated_input),
+        } => Ok(updated_hook_command(&updated_input)?.to_string()),
+        PreToolUseHookResult::Continue {
+            updated_input: None,
+        } => Ok(command),
+    }
+}
+
+pub(crate) async fn run_shell_command_post_hooks(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    call_id: String,
+    command: String,
+    output: &ExecToolCallOutput,
+) -> Result<Option<String>, FunctionCallError> {
+    let outcome = run_post_tool_use_hooks(
+        session,
+        turn,
+        call_id,
+        HookToolName::bash().name().to_string(),
+        HookToolName::bash().matcher_aliases().to_vec(),
+        serde_json::json!({ "command": command }),
+        JsonValue::String(crate::tools::format_exec_output_str(
+            output,
+            turn.model_info.truncation_policy.into(),
+        )),
+    )
+    .await;
+    record_additional_contexts(session, turn, outcome.additional_contexts).await;
+    if outcome.should_block {
+        return Err(FunctionCallError::RespondToModel(
+            outcome
+                .feedback_message
+                .unwrap_or_else(|| "PostToolUse hook blocked the tool result".to_string()),
+        ));
+    }
+    Ok(outcome.feedback_message)
 }
 
 #[cfg(test)]

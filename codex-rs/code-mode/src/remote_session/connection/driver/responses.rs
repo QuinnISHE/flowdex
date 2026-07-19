@@ -38,12 +38,22 @@ impl ConnectionDriver {
                 self.requests.push_deferred_wait(wait);
                 continue;
             }
-            if !self.start_wait(
-                wait.session,
-                wait.request,
-                wait.caller_cancellation,
-                wait.response_tx,
-            ) {
+            let started = if wait.until_yield {
+                self.start_wait_until_yield(
+                    wait.session,
+                    wait.request.cell_id,
+                    wait.caller_cancellation,
+                    wait.response_tx,
+                )
+            } else {
+                self.start_wait(
+                    wait.session,
+                    wait.request,
+                    wait.caller_cancellation,
+                    wait.response_tx,
+                )
+            };
+            if !started {
                 for wait in deferred {
                     let _ = wait
                         .response_tx
@@ -183,6 +193,36 @@ impl ConnectionDriver {
                 }
             },
             PendingRequest::Wait {
+                session,
+                cell_id,
+                cancellation: _,
+                response_tx,
+            } => {
+                let result = match result {
+                    Ok(HostResponse::WaitCompleted { outcome }) => {
+                        if wait_outcome_cell_id(&outcome) != &cell_id {
+                            let reason = format!(
+                                "code-mode host returned cell {} for request targeting {}",
+                                wait_outcome_cell_id(&outcome).as_str(),
+                                cell_id.as_str()
+                            );
+                            let _ = response_tx.send(Err(reason.clone()));
+                            self.fail(reason);
+                            return false;
+                        }
+                        Ok(public_wait_outcome(session.generation, outcome.into()))
+                    }
+                    Ok(_) => {
+                        let reason = "code-mode host returned an invalid cell response".to_string();
+                        let _ = response_tx.send(Err(reason.clone()));
+                        self.fail(reason);
+                        return false;
+                    }
+                    Err(err) => Err(err),
+                };
+                let _ = response_tx.send(result);
+            }
+            PendingRequest::WaitUntilYield {
                 session,
                 cell_id,
                 cancellation: _,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Flowdex Workflows"
+  short_description: "Author and dispatch saved Flowdex workflows"
+  default_prompt: "Use $run-flowdex-workflows to create and dispatch a saved Flowdex workflow."

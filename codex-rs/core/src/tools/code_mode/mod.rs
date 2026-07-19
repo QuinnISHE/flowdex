@@ -45,7 +45,8 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
-use response_adapter::into_function_call_output_content_items;
+pub(crate) use execute_handler::execute_source_with_cell_hook;
+pub(crate) use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
@@ -97,6 +98,13 @@ impl CodeModeService {
         request: codex_code_mode::WaitRequest,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
         self.session().await?.wait(request).await
+    }
+
+    pub(crate) async fn wait_until_yield(
+        &self,
+        cell_id: CellId,
+    ) -> Result<codex_code_mode::WaitOutcome, String> {
+        self.session().await?.wait_until_yield(cell_id).await
     }
 
     pub(crate) async fn terminate(
@@ -254,7 +262,7 @@ fn prepend_script_status(
     content_items.insert(0, FunctionCallOutputContentItem::InputText { text: header });
 }
 
-fn truncate_code_mode_result(
+pub(super) fn truncate_code_mode_result(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
 ) -> Vec<FunctionCallOutputContentItem> {

@@ -69,6 +69,7 @@ use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
 use codex_features::TokenBudgetConfigToml;
+use codex_flowdex::FlowdexConfig;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -1050,6 +1051,9 @@ pub struct Config {
     pub rollout_budget: Option<RolloutBudgetConfig>,
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
+
+    /// Resolved Flowdex settings for this session.
+    pub flowdex_config: FlowdexConfig,
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
@@ -3222,6 +3226,19 @@ impl Config {
                 repo_root.as_ref().map(AbsolutePathBuf::as_path),
             )
             .unwrap_or(ProjectConfig { trust_level: None });
+        let trusted_flowdex_repository_root = active_project
+            .is_trusted()
+            .then(|| repo_root.as_ref().unwrap_or(&resolved_cwd).to_path_buf());
+        let flowdex_codex_home = codex_home.clone();
+        let flowdex_config = tokio::task::spawn_blocking(move || {
+            codex_flowdex::load_config(
+                flowdex_codex_home.as_path(),
+                trusted_flowdex_repository_root.as_deref(),
+            )
+        })
+        .await
+        .map_err(|err| std::io::Error::other(format!("failed to load Flowdex config: {err}")))?
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         let permission_config_syntax = resolve_permission_config_syntax(
             &config_layer_stack,
             &cfg,
@@ -4057,6 +4074,7 @@ impl Config {
             token_budget,
             rollout_budget,
             current_time_reminder,
+            flowdex_config,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning

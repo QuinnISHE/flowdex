@@ -26,6 +26,20 @@ pub(crate) struct StepContext {
     pub(crate) loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
 }
 
+impl Clone for StepContext {
+    fn clone(&self) -> Self {
+        Self {
+            turn: self.turn.clone(),
+            environments: self.environments.clone(),
+            selected_capability_roots: self.selected_capability_roots.clone(),
+            executor_capability_discovery: self.executor_capability_discovery.clone(),
+            mcp: self.mcp.clone(),
+            mcp_tool_snapshot: OnceCell::new(),
+            loaded_agents_md: self.loaded_agents_md.clone(),
+        }
+    }
+}
+
 impl StepContext {
     pub(crate) fn new(
         turn: Arc<TurnContext>,

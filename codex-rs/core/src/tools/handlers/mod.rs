@@ -2,6 +2,8 @@ pub(crate) mod agent_jobs;
 pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
+mod compact_context;
+pub(crate) mod compact_context_spec;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
@@ -25,7 +27,7 @@ mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
-mod shell;
+pub(crate) mod shell;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -54,9 +56,19 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
+pub(crate) use crate::tools::flowdex::FlowdexCreateTaskHandler;
+pub(crate) use crate::tools::flowdex::FlowdexResumeAgentHandler;
+pub(crate) use crate::tools::flowdex::FlowdexSendMessageHandler;
+pub(crate) use crate::tools::flowdex::FlowdexSpawnAgentHandler;
+pub(crate) use crate::tools::flowdex::FlowdexTaskIntegrateHandler;
+pub(crate) use crate::tools::flowdex::FlowdexTaskRunAgentHandler;
+pub(crate) use crate::tools::flowdex::FlowdexTaskVerifyHandler;
+pub(crate) use crate::tools::flowdex::FlowdexWaitAgentHandler;
+pub(crate) use crate::tools::flowdex::StartFlowdexWorkflowHandler;
 pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+pub use compact_context::CompactContextHandler;
 pub use current_time::CurrentTimeHandler;
 pub use dynamic::DynamicToolHandler;
 pub use get_context_remaining::GetContextRemainingHandler;
@@ -90,7 +102,7 @@ where
     })
 }
 
-fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
+pub(crate) fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
     updated_input
         .get("command")
         .and_then(Value::as_str)
@@ -142,7 +154,7 @@ where
     parse_arguments(arguments)
 }
 
-fn resolve_workdir_base_path(
+pub(crate) fn resolve_workdir_base_path(
     arguments: &str,
     default_cwd: &AbsolutePathBuf,
 ) -> Result<AbsolutePathBuf, FunctionCallError> {

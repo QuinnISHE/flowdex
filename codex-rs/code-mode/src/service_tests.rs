@@ -235,6 +235,59 @@ async fn synchronous_exit_returns_successfully() {
 }
 
 #[tokio::test]
+async fn no_deadline_wait_resumes_yielded_cell_until_completion() {
+    let service = InProcessCodeModeSession::new();
+    let started = service
+        .execute(ExecuteRequest {
+            source: r#"yield_control(); text("done");"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    let initial = started.initial_response().await.unwrap();
+    assert!(matches!(initial, RuntimeResponse::Yielded { .. }));
+
+    let outcome = service.wait_until_yield(cell_id("1")).await.unwrap();
+    assert_eq!(
+        outcome,
+        WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "done".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn dropping_no_deadline_wait_releases_observer() {
+    let service = InProcessCodeModeSession::new();
+    let started = service
+        .execute(ExecuteRequest {
+            source: r#"yield_control(); text("done");"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        started.initial_response().await.unwrap(),
+        RuntimeResponse::Yielded { .. }
+    ));
+
+    let pending = service.begin_wait_until_yield(cell_id("1")).await;
+    drop(pending);
+    tokio::task::yield_now().await;
+
+    assert!(matches!(
+        service.wait_until_yield(cell_id("1")).await.unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::Result { .. })
+    ));
+}
+
+#[tokio::test]
 async fn stored_values_are_shared_between_cells_but_not_sessions() {
     let first_session = InProcessCodeModeSession::new();
     let second_session = InProcessCodeModeSession::new();

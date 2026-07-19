@@ -89,10 +89,11 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.supports_remote_compaction()
 }
 
-pub(crate) async fn run_inline_auto_compact_task(
+pub(crate) async fn run_inline_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
@@ -113,7 +114,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         turn_context,
         input,
         initial_context_injection,
-        CompactionTrigger::Auto,
+        trigger,
         reason,
         phase,
     )
