@@ -1,6 +1,5 @@
 use anyhow::Result;
 use codex_features::Feature;
-use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -10,6 +9,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
+use codex_protocol::ThreadId;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -25,15 +25,15 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 use wiremock::Mock;
 use wiremock::Respond;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path_regex;
 
 fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
@@ -71,6 +71,82 @@ fn function_call_output_text(request: &wiremock::Request, call_id: &str) -> Opti
 struct SchedulerAgentResponder {
     alpha_requests: Arc<AtomicUsize>,
     beta_requests: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Default)]
+struct ContextPackResponder {
+    collector_requests: Arc<AtomicUsize>,
+    first_requests: Arc<AtomicUsize>,
+    second_requests: Arc<AtomicUsize>,
+}
+
+impl Respond for ContextPackResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if body_contains(request, "Collect context pack") {
+            self.collector_requests.fetch_add(1, Ordering::SeqCst);
+            if has_function_call_output(request, "publish-context") {
+                return sse_response(sse(vec![
+                    ev_response_created("resp-context-collector-done"),
+                    ev_assistant_message("msg-context-collector", "published"),
+                    ev_completed("resp-context-collector-done"),
+                ]));
+            }
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-collector-call"),
+                ev_function_call(
+                    "publish-context",
+                    "publish_flowdex_context",
+                    &serde_json::json!({
+                        "pack": "fixture",
+                        "key": "context",
+                        "path": "context.txt",
+                        "line_start": 1,
+                        "line_end": 1,
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-context-collector-call"),
+            ]));
+        }
+        if body_contains(request, "first instructions") {
+            self.first_requests.fetch_add(1, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-first"),
+                ev_assistant_message("msg-context-first", "first complete"),
+                ev_completed("resp-context-first"),
+            ]))
+            .set_delay(Duration::from_secs(4));
+        }
+        if body_contains(request, "second instructions") {
+            self.second_requests.fetch_add(1, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-second"),
+                ev_assistant_message("msg-context-second", "second complete"),
+                ev_completed("resp-context-second"),
+            ]));
+        }
+        if body_contains(request, "run the context workflow") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-parent"),
+                ev_function_call(
+                    "call-context-outer",
+                    "start_flowdex_workflow",
+                    &serde_json::json!({"path": ".flowdex/workflows/context.js"}).to_string(),
+                ),
+                ev_completed("resp-context-parent"),
+            ]));
+        }
+        if has_function_call_output(request, "call-context-outer") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-context-parent-done"),
+                ev_completed("resp-context-parent-done"),
+            ]));
+        }
+        sse_response(sse(vec![
+            ev_response_created("resp-context-empty"),
+            ev_completed("resp-context-empty"),
+        ]))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -581,14 +657,12 @@ async fn flowdex_resume_agent_context_modes_are_submission_owned() -> Result<()>
     assert_eq!(replacement_request.body_json()["model"], "gpt-5.4");
     let follow_up_request = follow_up.single_request();
     assert!(!follow_up_request.body_contains_text("completed work: initial"));
-    assert!(
-        server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .all(|request| !body_contains(request, "must not dispatch"))
-    );
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .all(|request| !body_contains(request, "must not dispatch")));
     Ok(())
 }
 
@@ -1125,6 +1199,102 @@ text(JSON.stringify(await run.wait()));"#,
             snapshot.session_source,
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
         ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.features.enable(Feature::CodeMode).unwrap();
+            config.features.enable(Feature::Collab).unwrap();
+            config.agent_max_threads = Some(8);
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            fs::create_dir_all(cwd.join(".flowdex/workflows"))?;
+            fs::write(cwd.join("context.txt"), "OLD\n")?;
+            fs::write(
+                cwd.join(".flowdex/workflows/context.js"),
+                r#"const run = await flowdex.startRun({
+  name: 'context-fixture', agents: { explorer: { model: 'gpt-5.4' }, worker: { model: 'gpt-5.4' } },
+  contextPacks: { fixture: { agent: 'explorer', instructions: 'Collect context.' } },
+  phases: [{ name: 'build', instructions: 'Build.', tasks: [
+    { name: 'first', agent: 'worker', instructions: 'first instructions', context: ['fixture'] },
+    { name: 'second', agent: 'worker', instructions: 'second instructions', dependencies: ['first'], context: ['fixture'] },
+  ] }],
+}); text(JSON.stringify(await run.wait()));"#,
+            )?;
+            let git = |args: &[&str]| -> Result<()> {
+                let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                if !output.status.success() { anyhow::bail!("git {args:?} failed"); }
+                Ok(())
+            };
+            git(&["init"])?; git(&["config", "user.name", "Flowdex Test"])?;
+            git(&["config", "user.email", "flowdex-test@example.com"])?;
+            git(&["add", "."])?; git(&["commit", "-m", "fixture baseline"])?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build(&server).await?;
+    let responder = ContextPackResponder::default();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(responder.clone())
+        .mount(&server)
+        .await;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "run the context workflow".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut modified = false;
+    loop {
+        let event =
+            tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await??;
+        if responder.first_requests.load(Ordering::SeqCst) > 0 && !modified {
+            fs::write(test.workspace_path("context.txt"), "NEW\n")?;
+            let output = Command::new("git")
+                .current_dir(test.workspace_path("."))
+                .args(["add", "context.txt"])
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!("git add failed");
+            }
+            let output = Command::new("git")
+                .current_dir(test.workspace_path("."))
+                .args(["commit", "-m", "refresh context"])
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!("git commit failed");
+            }
+            modified = true;
+        }
+        if matches!(event.msg, EventMsg::TurnComplete(_)) && modified {
+            break;
+        }
+    }
+    assert_eq!(responder.collector_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(responder.first_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(responder.second_requests.load(Ordering::SeqCst), 1);
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(requests.iter().any(|request| body_contains(request, "OLD")));
+    assert!(requests.iter().any(|request| body_contains(request, "NEW")));
+    let parent_requests = requests
+        .iter()
+        .filter(|request| body_contains(request, "run the context workflow"));
+    for request in parent_requests {
+        assert!(!body_contains(request, "OLD"));
+        assert!(!body_contains(request, "NEW"));
     }
     Ok(())
 }

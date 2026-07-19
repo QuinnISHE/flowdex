@@ -191,6 +191,7 @@ struct RunController {
     status_rx: watch::Receiver<RunStatus>,
     activity: watch::Sender<u64>,
     activity_rx: watch::Receiver<u64>,
+    context_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 static RUNS: OnceLock<Mutex<HashMap<String, Arc<RunController>>>> = OnceLock::new();
@@ -397,6 +398,7 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         status_rx,
         activity,
         activity_rx,
+        context_gates: Mutex::new(HashMap::new()),
     });
     runs()
         .lock()
@@ -908,6 +910,14 @@ async fn resolve_or_collect_context(
     controller: &Arc<RunController>,
     pack: &str,
 ) -> Result<ResolvedContextPack, String> {
+    let gate = {
+        let mut gates = controller.context_gates.lock().await;
+        gates
+            .entry(pack.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = gate.lock().await;
     let store = Arc::clone(&controller.store);
     let run_id = controller.id.clone();
     let pack = pack.to_string();
