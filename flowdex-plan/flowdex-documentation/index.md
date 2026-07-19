@@ -1,5 +1,7 @@
 # Flowdex documentation
 
+- [Getting started](getting-started.md)
+
 - [Groundwork](groundwork.md)
 - [Agent workflows](agents.md)
 - [Executable workflows](workflows.md)
