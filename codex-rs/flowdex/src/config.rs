@@ -9,11 +9,13 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 150_000;
+pub const DEFAULT_AST_GREP_CANDIDATE_THRESHOLD: i64 = 3;
 
 /// Resolved Flowdex settings used by a session.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowdexConfig {
     pub compaction_reminder_threshold_tokens: i64,
+    pub ast_grep_candidate_threshold: i64,
     pub ast_grep_always_run: Vec<String>,
     pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
 }
@@ -40,6 +42,7 @@ pub fn load_config(
 ) -> Result<FlowdexConfig, FlowdexConfigError> {
     let global_path = codex_home.join("flowdex.toml");
     let mut threshold = DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+    let mut ast_grep_candidate_threshold = DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
 
@@ -47,6 +50,10 @@ pub fn load_config(
         if let Some(value) = config.compaction_reminder_threshold_tokens {
             validate_threshold(value, &global_path)?;
             threshold = value;
+        }
+        if let Some(value) = config.ast_grep_candidate_threshold {
+            validate_candidate_threshold(value, &global_path)?;
+            ast_grep_candidate_threshold = value;
         }
         if let Some(value) = config.ast_grep_always_run {
             validate_rule_ids(&value, &global_path)?;
@@ -62,6 +69,10 @@ pub fn load_config(
                 validate_threshold(value, &repository_path)?;
                 threshold = value;
             }
+            if let Some(value) = config.ast_grep_candidate_threshold {
+                validate_candidate_threshold(value, &repository_path)?;
+                ast_grep_candidate_threshold = value;
+            }
             if let Some(value) = config.ast_grep_always_run {
                 validate_rule_ids(&value, &repository_path)?;
                 ast_grep_always_run = value;
@@ -72,6 +83,7 @@ pub fn load_config(
 
     Ok(FlowdexConfig {
         compaction_reminder_threshold_tokens: threshold,
+        ast_grep_candidate_threshold,
         ast_grep_always_run,
         tool_profiles,
     })
@@ -81,6 +93,7 @@ pub fn load_config(
 #[serde(deny_unknown_fields)]
 struct PartialFlowdexConfig {
     compaction_reminder_threshold_tokens: Option<i64>,
+    ast_grep_candidate_threshold: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
     #[serde(default)]
     tool_profiles: BTreeMap<String, ToolProfileConfig>,
@@ -109,6 +122,15 @@ fn read_partial(path: &Path) -> Result<Option<PartialFlowdexConfig>, FlowdexConf
 fn validate_threshold(value: i64, path: &Path) -> Result<(), FlowdexConfigError> {
     if value <= 0 {
         return Err(FlowdexConfigError::InvalidThreshold {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_candidate_threshold(value: i64, path: &Path) -> Result<(), FlowdexConfigError> {
+    if value <= 0 {
+        return Err(FlowdexConfigError::InvalidCandidateThreshold {
             path: path.to_path_buf(),
         });
     }
@@ -152,6 +174,11 @@ pub enum FlowdexConfigError {
         "invalid compaction_reminder_threshold_tokens in Flowdex config at {path}: value must be positive"
     )]
     InvalidThreshold { path: PathBuf },
+
+    #[error(
+        "invalid ast_grep_candidate_threshold in Flowdex config at {path}: value must be positive"
+    )]
+    InvalidCandidateThreshold { path: PathBuf },
 
     #[error(
         "invalid ast_grep_always_run rule id `{id}` in Flowdex config at {path}: id must be non-empty"
@@ -307,6 +334,68 @@ web_search = "disabled"
             let error = load_config(temp.path(), None).expect_err(source);
             assert!(error.to_string().contains(path.to_string_lossy().as_ref()));
             assert!(error.to_string().contains("ast_grep_always_run"));
+        }
+    }
+
+    #[test]
+    fn resolves_ast_grep_candidate_threshold_with_global_and_repository_precedence() {
+        let temp = tempdir().expect("temp dir");
+        let repository_root = temp.path().join("repo");
+        fs::create_dir_all(repository_root.join(".flowdex")).expect("repository config dir");
+
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).ast_grep_candidate_threshold,
+            DEFAULT_AST_GREP_CANDIDATE_THRESHOLD
+        );
+
+        fs::write(
+            temp.path().join("flowdex.toml"),
+            "ast_grep_candidate_threshold = 7\n",
+        )
+        .expect("global config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).ast_grep_candidate_threshold,
+            7
+        );
+
+        fs::write(
+            repository_root.join(".flowdex/config.toml"),
+            "ast_grep_candidate_threshold = 11\n",
+        )
+        .expect("repository config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).ast_grep_candidate_threshold,
+            11
+        );
+
+        fs::write(repository_root.join(".flowdex/config.toml"), "# omitted\n")
+            .expect("repository omission");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).ast_grep_candidate_threshold,
+            7
+        );
+    }
+
+    #[test]
+    fn rejects_non_positive_ast_grep_candidate_threshold() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("flowdex.toml");
+        for source in [
+            "ast_grep_candidate_threshold = 0",
+            "ast_grep_candidate_threshold = -1",
+        ] {
+            fs::write(&path, source).expect("global config");
+            let error = load_config(temp.path(), None).expect_err(source);
+            let message = error.to_string();
+            assert!(
+                message.contains("ast_grep_candidate_threshold"),
+                "{message}"
+            );
+            assert!(message.contains("value must be positive"), "{message}");
+            assert!(
+                message.contains(path.to_string_lossy().as_ref()),
+                "{message}"
+            );
         }
     }
 }

@@ -4,7 +4,38 @@ pub mod context;
 pub mod store;
 pub mod workflow;
 
+use serde::{Deserialize, Serialize};
+
+/// One resolved finding example supporting a rule candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCandidateEvidence {
+    pub file: String,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub reason: String,
+    pub source_commit: String,
+    pub integrated_commit: String,
+}
+
+/// A reviewer-provided rule key with enough resolved history to be proposed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCandidate {
+    pub rule_key: String,
+    pub resolved_occurrences: u64,
+    pub examples: Vec<RuleCandidateEvidence>,
+}
+
+/// Result returned by a repository-wide candidate scan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCandidateScanResult {
+    pub candidates: Vec<RuleCandidate>,
+}
+
 pub use ast_grep::{AstGrepError, AstGrepFinding, AstGrepResult, run_ast_grep_rules};
+pub use config::DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
@@ -1144,6 +1175,41 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn serializes_rule_candidate_scan_result_contract() {
+        let result = RuleCandidateScanResult {
+            candidates: vec![RuleCandidate {
+                rule_key: "avoid-unchecked-layout-cast".into(),
+                resolved_occurrences: 3,
+                examples: vec![RuleCandidateEvidence {
+                    file: "src/layout.rs".into(),
+                    line_start: 42,
+                    line_end: 44,
+                    reason: "The cast bypasses the checked layout helper.".into(),
+                    source_commit: "source".into(),
+                    integrated_commit: "integrated".into(),
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(result).expect("candidate result should serialize"),
+            json!({
+                "candidates": [{
+                    "ruleKey": "avoid-unchecked-layout-cast",
+                    "resolvedOccurrences": 3,
+                    "examples": [{
+                        "file": "src/layout.rs",
+                        "lineStart": 42,
+                        "lineEnd": 44,
+                        "reason": "The cast bypasses the checked layout helper.",
+                        "sourceCommit": "source",
+                        "integratedCommit": "integrated"
+                    }]
+                }]
+            })
+        );
+    }
 
     fn loader_with_workflow(source: &str) -> (tempfile::TempDir, WorkflowLoader) {
         let temp_dir = tempdir().expect("temp dir");
