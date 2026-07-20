@@ -494,9 +494,8 @@ async fn queue_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         .await
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
-    let _ = controller
-        .activity
-        .send(controller.activity_rx.borrow().wrapping_add(1));
+    let next_activity = controller.activity_rx.borrow().wrapping_add(1);
+    let _ = controller.activity.send(next_activity);
     Ok(task::JsonOutput(serde_json::json!({"taskId": task_id})))
 }
 
@@ -520,9 +519,8 @@ async fn seal_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
         .await
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
-    let _ = controller
-        .activity
-        .send(controller.activity_rx.borrow().wrapping_add(1));
+    let next_activity = controller.activity_rx.borrow().wrapping_add(1);
+    let _ = controller.activity.send(next_activity);
     Ok(task::JsonOutput(
         serde_json::json!({"runId": args.run_id, "phase": args.phase}),
     ))
