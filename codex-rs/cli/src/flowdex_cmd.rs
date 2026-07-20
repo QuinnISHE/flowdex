@@ -2,11 +2,63 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use codex_core::config::find_codex_home;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+
+const INSTALL_MANIFEST: &str = "flowdex/installed-assets-v1";
+
+struct BundledAsset {
+    relative_path: &'static str,
+    contents: &'static str,
+}
+
+const BUNDLED_ASSETS: &[BundledAsset] = &[
+    BundledAsset {
+        relative_path: "flowdex.toml",
+        contents: "# Flowdex global defaults. Repository-local .flowdex settings take precedence.\n\
+compaction_reminder_threshold_tokens = 150000\n\
+ast_grep_candidate_threshold = 3\n\
+ast_grep_always_run = []\n",
+    },
+    BundledAsset {
+        relative_path: "flowdex/workflows/defaults/research-rounds.js",
+        contents: include_str!("../../../.flowdex/workflows/defaults/research-rounds.js"),
+    },
+    BundledAsset {
+        relative_path: "flowdex/workflows/defaults/worker-reviewer.js",
+        contents: include_str!("../../../.flowdex/workflows/defaults/worker-reviewer.js"),
+    },
+    BundledAsset {
+        relative_path: "skills/collect-flowdex-context/SKILL.md",
+        contents: include_str!("../../../.codex/skills/collect-flowdex-context/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "skills/collect-flowdex-context/agents/openai.yaml",
+        contents: include_str!("../../../.codex/skills/collect-flowdex-context/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "skills/report-flowdex-review/SKILL.md",
+        contents: include_str!("../../../.codex/skills/report-flowdex-review/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "skills/report-flowdex-review/agents/openai.yaml",
+        contents: include_str!("../../../.codex/skills/report-flowdex-review/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "skills/run-flowdex-workflows/SKILL.md",
+        contents: include_str!("../../../.codex/skills/run-flowdex-workflows/SKILL.md"),
+    },
+    BundledAsset {
+        relative_path: "skills/run-flowdex-workflows/agents/openai.yaml",
+        contents: include_str!("../../../.codex/skills/run-flowdex-workflows/agents/openai.yaml"),
+    },
+];
 
 #[derive(Debug, clap::Args)]
 pub struct FlowdexCli {
@@ -27,7 +79,7 @@ pub struct InstallArgs {}
 
 #[derive(Debug, clap::Args)]
 pub struct UninstallArgs {
-    /// Also remove global Flowdex workflows, configuration, and runtime data.
+    /// Also remove global configuration, workflows, and skills created by the installer.
     #[arg(long)]
     pub purge: bool,
 }
@@ -94,6 +146,7 @@ async fn run_install() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let target = install_current_binary(BinaryValidation::Macos)?;
+        install_bundled_assets(find_codex_home()?.as_path())?;
         macos::install(&target)?;
         println!(
             "Flowdex installed at {}. Fully quit and restart the Codex app.",
@@ -105,6 +158,7 @@ async fn run_install() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let target = install_current_binary(BinaryValidation::Windows)?;
+        install_bundled_assets(find_codex_home()?.as_path())?;
         let mut writer = RegistryEnvironmentWriter;
         writer.set_codex_cli_path(&target)?;
         println!(
@@ -146,10 +200,11 @@ async fn run_uninstall(purge: bool) -> Result<()> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn remove_flowdex_files(purge: bool) -> Result<()> {
+    remove_installed_binary()?;
     if purge {
-        purge_flowdex_data(find_codex_home()?.as_path())
+        purge_installed_assets(find_codex_home()?.as_path())
     } else {
-        remove_installed_binary()
+        Ok(())
     }
 }
 
@@ -157,7 +212,7 @@ fn remove_flowdex_files(purge: bool) -> Result<()> {
 fn print_uninstall_result(purge: bool) {
     if purge {
         println!(
-            "Flowdex uninstalled and global Flowdex data removed. Fully quit and restart the Codex app."
+            "Flowdex uninstalled and installer-owned assets removed. Fully quit and restart the Codex app."
         );
     } else {
         println!("Flowdex uninstalled. Fully quit and restart the Codex app.");
@@ -284,25 +339,102 @@ fn remove_installed_binary() -> Result<()> {
     }
 }
 
-fn purge_flowdex_data(codex_home: &Path) -> Result<()> {
-    remove_path_if_exists(&codex_home.join("flowdex"))?;
-    remove_file_if_exists(&codex_home.join("flowdex.toml"))
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+fn install_bundled_assets(codex_home: &Path) -> Result<()> {
+    let manifest_path = codex_home.join(INSTALL_MANIFEST);
+    let known_paths = BUNDLED_ASSETS
+        .iter()
+        .map(|asset| asset.relative_path)
+        .collect::<BTreeSet<_>>();
+    let mut installed_paths = match fs::read_to_string(&manifest_path) {
+        Ok(manifest) => manifest
+            .lines()
+            .filter(|path| known_paths.contains(*path))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
         Err(error) => {
-            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+            return Err(error).with_context(|| format!("cannot read {}", manifest_path.display()));
         }
     };
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
+
+    for asset in BUNDLED_ASSETS {
+        let path = codex_home.join(asset.relative_path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundled asset path has no parent"))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot create {}", path.display()));
+            }
+        };
+        if let Err(error) = file.write_all(asset.contents.as_bytes()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error).with_context(|| format!("cannot write {}", path.display()));
+        }
+        installed_paths.insert(asset.relative_path.to_owned());
     }
-    .with_context(|| format!("cannot remove {}", path.display()))
+
+    if !installed_paths.is_empty() {
+        let contents = installed_paths.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(&manifest_path, contents)
+            .with_context(|| format!("cannot write {}", manifest_path.display()))?;
+    }
+    Ok(())
+}
+
+fn purge_installed_assets(codex_home: &Path) -> Result<()> {
+    let manifest_path = codex_home.join(INSTALL_MANIFEST);
+    let manifest = match fs::read_to_string(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", manifest_path.display()));
+        }
+    };
+    let known_paths = BUNDLED_ASSETS
+        .iter()
+        .map(|asset| asset.relative_path)
+        .collect::<BTreeSet<_>>();
+    for relative_path in manifest.lines().filter(|path| known_paths.contains(*path)) {
+        remove_file_if_exists(&codex_home.join(relative_path))?;
+    }
+    remove_file_if_exists(&manifest_path)?;
+
+    for relative_path in [
+        "flowdex/bin",
+        "flowdex/workflows/defaults",
+        "flowdex/workflows",
+        "flowdex",
+        "skills/collect-flowdex-context/agents",
+        "skills/collect-flowdex-context",
+        "skills/report-flowdex-review/agents",
+        "skills/report-flowdex-review",
+        "skills/run-flowdex-workflows/agents",
+        "skills/run-flowdex-workflows",
+    ] {
+        remove_empty_dir(&codex_home.join(relative_path))?;
+    }
+    Ok(())
+}
+
+fn remove_empty_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
+    }
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {
@@ -882,18 +1014,74 @@ mod tests {
     }
 
     #[test]
-    fn purge_removes_only_global_flowdex_data() {
+    fn install_bundled_assets_provisions_a_fresh_codex_home() {
         let codex_home = tempdir().expect("codex home");
-        let data = codex_home.path().join("flowdex");
-        fs::create_dir_all(data.join("workflows")).expect("workflow directory");
-        fs::write(data.join("workflows").join("review.js"), b"workflow").expect("workflow");
-        fs::write(codex_home.path().join("flowdex.toml"), b"config").expect("config");
+        install_bundled_assets(codex_home.path()).expect("install assets");
+
+        for asset in BUNDLED_ASSETS {
+            assert_eq!(
+                fs::read_to_string(codex_home.path().join(asset.relative_path))
+                    .expect("installed asset"),
+                asset.contents
+            );
+        }
+        let manifest =
+            fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("install manifest");
+        assert_eq!(manifest.lines().count(), BUNDLED_ASSETS.len());
+    }
+
+    #[test]
+    fn install_bundled_assets_preserves_existing_files() {
+        let codex_home = tempdir().expect("codex home");
+        let config = codex_home.path().join("flowdex.toml");
+        let workflow = codex_home
+            .path()
+            .join("flowdex/workflows/defaults/research-rounds.js");
+        fs::create_dir_all(workflow.parent().expect("workflow parent"))
+            .expect("workflow directory");
+        fs::write(&config, b"user config").expect("user config");
+        fs::write(&workflow, b"user workflow").expect("user workflow");
+
+        install_bundled_assets(codex_home.path()).expect("install assets");
+
+        assert_eq!(fs::read(&config).expect("config remains"), b"user config");
+        assert_eq!(
+            fs::read(&workflow).expect("workflow remains"),
+            b"user workflow"
+        );
+        let manifest =
+            fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("install manifest");
+        assert!(!manifest.lines().any(|path| path == "flowdex.toml"));
+        assert!(
+            !manifest
+                .lines()
+                .any(|path| path == "flowdex/workflows/defaults/research-rounds.js")
+        );
+    }
+
+    #[test]
+    fn purge_removes_only_installer_owned_assets() {
+        let codex_home = tempdir().expect("codex home");
+        let existing_workflow = codex_home
+            .path()
+            .join("flowdex/workflows/defaults/worker-reviewer.js");
+        fs::create_dir_all(existing_workflow.parent().expect("workflow parent"))
+            .expect("workflow directory");
+        fs::write(&existing_workflow, b"user workflow").expect("user workflow");
+        install_bundled_assets(codex_home.path()).expect("install assets");
+        let user_data = codex_home.path().join("flowdex/history.sqlite");
+        fs::write(&user_data, b"history").expect("runtime data");
         fs::write(codex_home.path().join("config.toml"), b"codex").expect("codex config");
 
-        purge_flowdex_data(codex_home.path()).expect("purge");
+        purge_installed_assets(codex_home.path()).expect("purge");
 
-        assert!(!data.exists());
         assert!(!codex_home.path().join("flowdex.toml").exists());
+        assert_eq!(
+            fs::read(&existing_workflow).expect("workflow remains"),
+            b"user workflow"
+        );
+        assert_eq!(fs::read(&user_data).expect("history remains"), b"history");
+        assert!(!codex_home.path().join(INSTALL_MANIFEST).exists());
         assert_eq!(
             fs::read(codex_home.path().join("config.toml")).expect("codex config remains"),
             b"codex"

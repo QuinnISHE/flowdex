@@ -19,10 +19,18 @@ binary and value. Uninstall removes both. Fully quit and restart the Codex app
 after either command.
 
 The installer does not modify `PATH`, machine-wide environment state, launchd,
-the Codex application bundle, or compatibility variables. It does not create a
-Flowdex config file; global and repository configuration remain optional.
-Normal uninstall leaves workflows, optional configuration, and runtime history
-intact. `uninstall --purge` also removes `$CODEX_HOME/flowdex/` and
-`$CODEX_HOME/flowdex.toml`, including global workflows, SQLite state, and task
-worktrees. It preserves repository `.flowdex/` directories because they are
-project-owned and may be committed.
+the Codex application bundle, or compatibility variables. The executable embeds
+and creates these files when they are missing:
+
+- `$CODEX_HOME/flowdex.toml` with documented global defaults
+- `$CODEX_HOME/flowdex/workflows/defaults/research-rounds.js`
+- `$CODEX_HOME/flowdex/workflows/defaults/worker-reviewer.js`
+- each skill's `SKILL.md` and `agents/openai.yaml` under
+  `$CODEX_HOME/skills/{collect-flowdex-context,report-flowdex-review,run-flowdex-workflows}/`
+
+Install never overwrites an existing config, workflow, or skill file. It records
+only the files it creates in `$CODEX_HOME/flowdex/installed-assets-v1`. Normal
+uninstall preserves all global assets and user data. `uninstall --purge` removes
+the installer-owned files recorded there, but preserves pre-existing or
+additional global files, runtime history, task worktrees, and repository
+`.flowdex/` directories.

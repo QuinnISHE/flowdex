@@ -10,14 +10,14 @@ const run = await flowdex.startRun({
   boundary: "continue",
   agents: {
     implementer: { profile: "implementation_worker", toolProfile: "development" },
-    fastFix: { model: "gpt-5.6-luna", reasoningEffort: "high" },
+    fast_fix: { model: "gpt-5.6-luna", reasoningEffort: "high" },
   },
   phases: [
     {
       name: "implementation",
       instructions: "Implement the record-layout changes and commit each task.",
       boundary: "continue",
-      review: { agent: "fastFix", instructions: "Review the integrated phase changes.", maxRounds: 2 },
+      review: { agent: "fast_fix", instructions: "Review the integrated phase changes.", maxRounds: 2 },
       verification: ["cargo test -p record-layout"],
       tasks: [
         {
@@ -28,7 +28,7 @@ const run = await flowdex.startRun({
           writeScope: ["src/parser/**"],
           verification: ["cargo test -p parser"],
           verificationRepairLimit: 2,
-          review: { agent: "fastFix", instructions: "Review this task's committed diff.", maxRounds: 2 },
+          review: { agent: "fast_fix", instructions: "Review this task's committed diff.", maxRounds: 2 },
           boundary: "continue",
         },
         {
@@ -40,7 +40,7 @@ const run = await flowdex.startRun({
         },
         {
           name: "round-trip",
-          agent: "fastFix",
+          agent: "fast_fix",
           instructions: "Add round-trip coverage after both changes integrate.",
           dependencies: ["parser", "serializer"],
           readScope: ["src/**"],
@@ -140,8 +140,8 @@ a review round only when the next report still has findings.
 Minimal non-review saved workflow (ordinary JavaScript and numeric budget):
 
 ```js
-const a = await flowdex.spawnAgent({ name: "research-a", instructions: "Research the question.", model: "gpt-5.6-luna" });
-const b = await flowdex.spawnAgent({ name: "research-b", instructions: "Research the question independently.", model: "gpt-5.6-luna" });
+const a = await flowdex.spawnAgent({ name: "research_a", instructions: "Research the question.", model: "gpt-5.6-luna" });
+const b = await flowdex.spawnAgent({ name: "research_b", instructions: "Research the question independently.", model: "gpt-5.6-luna" });
 for (let round = 0; round < 2; round++) {
   const result = await flowdex.resumeAgent(a, `Round ${round}: report findings.`);
   await flowdex.sendMessage(b, JSON.stringify(result), { delivery: "turn" });

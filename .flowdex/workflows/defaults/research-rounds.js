@@ -6,7 +6,7 @@ const input = flowdex.requireInput({
 });
 
 const first = await flowdex.spawnAgent({
-  name: "primary-researcher",
+  name: "primary_researcher",
   instructions: `Research ${input.topic}. Return concrete findings with file and line references.`,
   profile: "explorer",
 });

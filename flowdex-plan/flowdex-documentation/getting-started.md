@@ -17,7 +17,7 @@ Copy the release executable to `flowdex-package/flowdex.exe` on Windows or `flow
 flowdex install
 ```
 
-Flowdex detects the platform, validates and copies itself to `$CODEX_HOME/flowdex/bin`, and configures the desktop backend. No config file is required. Fully quit and restart the desktop app after installation. Use `flowdex uninstall` to remove the override and copied backend while preserving data, or `flowdex uninstall --purge` to also remove global workflows, configuration, databases, and worktrees. Repository `.flowdex/` directories remain project-owned. See [the installer contract](windows-app-installer.md).
+Flowdex detects the platform, validates and copies itself to `$CODEX_HOME/flowdex/bin`, configures the desktop backend, and creates missing global defaults, reusable workflows, and Flowdex skills without overwriting existing files. Fully quit and restart the desktop app after installation. Use `flowdex uninstall` to remove the override and copied backend while preserving data, or `flowdex uninstall --purge` to also remove the global assets created by the installer. Other global files, runtime history, task worktrees, and repository `.flowdex/` directories remain untouched. See [the installer contract](windows-app-installer.md).
 
 ## Save a workflow
 
