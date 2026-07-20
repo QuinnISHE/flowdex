@@ -2123,24 +2123,68 @@ fn remove_task_worktree(
 ) -> Result<(), FlowdexStoreError> {
     let canonical_root = fs::canonicalize(root)?;
     let canonical_path = fs::canonicalize(path)?;
-    if !canonical_path.starts_with(&canonical_root) {
+    if canonical_path == canonical_root || !canonical_path.starts_with(&canonical_root) {
         return Err(FlowdexStoreError::Integration(
             "refusing to remove worktree outside Flowdex root".to_string(),
         ));
     }
-    let registered = git_stdout(integration, ["worktree", "list", "--porcelain"])?
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .filter_map(|listed| fs::canonicalize(listed).ok())
-        .any(|listed| listed == canonical_path);
-    if !registered {
+    if !worktree_is_registered(integration, &canonical_path)? {
         return Err(FlowdexStoreError::Integration(
             "refusing to remove an unregistered task worktree".to_string(),
         ));
     }
     let mut args = vec!["worktree".into(), "remove".into(), "--force".into()];
     args.push(path.as_os_str().to_os_string());
-    git_status(integration, args)
+    let git_error = git_status(integration, args).err();
+    if worktree_is_registered(integration, &canonical_path)? {
+        return Err(git_error.unwrap_or_else(|| {
+            FlowdexStoreError::Integration("task worktree remained registered".to_string())
+        }));
+    }
+    if canonical_path.exists()
+        && let Err(cleanup_error) = remove_dir_all_with_retry(&canonical_path)
+    {
+        let git_error = git_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "git left the task directory behind".to_string());
+        return Err(FlowdexStoreError::Integration(format!(
+            "{git_error}; exact task directory cleanup failed: {cleanup_error}"
+        )));
+    }
+    if canonical_path.exists() {
+        return Err(FlowdexStoreError::Integration(
+            "task worktree directory still exists after cleanup".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn worktree_is_registered(
+    integration: &Path,
+    canonical_path: &Path,
+) -> Result<bool, FlowdexStoreError> {
+    Ok(
+        git_stdout(integration, ["worktree", "list", "--porcelain"])?
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .filter_map(|listed| fs::canonicalize(listed).ok())
+            .any(|listed| listed == canonical_path),
+    )
+}
+
+fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..50 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 49 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    Err(last_error.expect("directory removal retry records an error"))
 }
 
 fn git_operation_in_progress(worktree: &Path) -> Result<bool, FlowdexStoreError> {
@@ -2584,6 +2628,31 @@ mod tests {
         let bounded = bound_git_output(text);
         assert_eq!(bounded.len(), MAX_GIT_OUTPUT - 1);
         assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn task_directory_cleanup_retries_transient_windows_handles() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let task = root.path().join("task");
+        fs::create_dir(&task).unwrap();
+        let file = task.join("locked.txt");
+        fs::write(&file, "locked").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(locked);
+        });
+
+        remove_dir_all_with_retry(&task).unwrap();
+        releaser.join().unwrap();
+        assert!(!task.exists());
     }
 
     #[test]
