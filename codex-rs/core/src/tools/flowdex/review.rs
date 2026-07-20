@@ -96,7 +96,13 @@ impl ToolExecutor<ToolInvocation> for FlowdexReviewReportHandler {
                 ("lineStart".to_string(), JsonSchema::integer(None)),
                 ("lineEnd".to_string(), JsonSchema::integer(None)),
                 ("reason".to_string(), JsonSchema::string(None)),
-                ("ruleKey".to_string(), JsonSchema::string(None)),
+                (
+                    "ruleKey".to_string(),
+                    JsonSchema::any_of(
+                        vec![JsonSchema::string(None), JsonSchema::null(None)],
+                        None,
+                    ),
+                ),
                 ("astGrepSuitable".to_string(), JsonSchema::boolean(None)),
             ]),
             Some(vec![
@@ -104,6 +110,7 @@ impl ToolExecutor<ToolInvocation> for FlowdexReviewReportHandler {
                 "lineStart".to_string(),
                 "lineEnd".to_string(),
                 "reason".to_string(),
+                "ruleKey".to_string(),
                 "astGrepSuitable".to_string(),
             ]),
             Some(false.into()),
