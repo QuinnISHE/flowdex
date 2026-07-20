@@ -2297,6 +2297,18 @@ flowdex.output({ input, workflow: flowdex.workflowPath, agent });"#,
         responder.parent_requests.load(Ordering::SeqCst),
         requests.len(),
     );
+    let child_request = requests
+        .iter()
+        .find(|request| body_contains(request, "nested child instructions"))
+        .expect("nested child request should be sent");
+    assert!(
+        !child_request
+            .body_json::<Value>()
+            .expect("nested child request body should be JSON")
+            .to_string()
+            .contains(r#""encrypted_content":"nested child instructions""#),
+        "Flowdex plaintext instructions must not be sent as encrypted content"
+    );
     let follow_up_request = requests
         .iter()
         .find(|request| has_function_call_output(request, "call-nested-parent"))

@@ -631,7 +631,7 @@ pub(crate) async fn handle_run_with_review(
         .agent_control
         .spawn_agent_with_communication(
             config.clone(),
-            InterAgentCommunication::new_encrypted(
+            InterAgentCommunication::new(
                 author,
                 child_path.clone(),
                 Vec::new(),

@@ -255,7 +255,7 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = InterAgentCommunication::new_encrypted(
+    let communication = InterAgentCommunication::new(
         author,
         child_path,
         Vec::new(),
@@ -336,13 +336,8 @@ async fn handle_send(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = InterAgentCommunication::new_encrypted(
-        author,
-        receiver,
-        Vec::new(),
-        args.message,
-        trigger_turn,
-    );
+    let communication =
+        InterAgentCommunication::new(author, receiver, Vec::new(), args.message, trigger_turn);
     let context = AgentCommunicationContext::new(
         if trigger_turn {
             AgentCommunicationKind::Followup
@@ -652,13 +647,8 @@ async fn submit_trigger_turn(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = InterAgentCommunication::new_encrypted(
-        author,
-        receiver,
-        Vec::new(),
-        message.to_string(),
-        true,
-    );
+    let communication =
+        InterAgentCommunication::new(author, receiver, Vec::new(), message.to_string(), true);
     let context =
         AgentCommunicationContext::new(AgentCommunicationKind::Followup, session.thread_id);
     let operation = session
