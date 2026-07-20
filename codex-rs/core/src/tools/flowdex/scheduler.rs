@@ -863,7 +863,7 @@ async fn run_phase(
                     .cloned()
                     .ok_or_else(|| "agent missing".to_string())?;
                 let agent = AgentSpec {
-                    name: task_def.name.clone(),
+                    name: scheduler_agent_name("task", &task_def.name, &scheduled.task_id),
                     instructions: task_instructions,
                     profile: agent_def.profile,
                     model: agent_def.model,
@@ -1248,7 +1248,7 @@ async fn complete_task(
                     )
                 })?;
             let agent = AgentSpec {
-                name: task_def.name.clone(),
+                name: scheduler_agent_name("task", &task_def.name, task_id),
                 instructions: format!(
                     "Verification failed for this task. Repair the failure, rerun the declared verification commands, and commit the fix.\n\n{}",
                     task_def.instructions
@@ -1423,7 +1423,7 @@ async fn run_phase_review(
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         let reviewer_agent = AgentSpec {
-            name: format!("review-{}-{}", phase.name, round),
+            name: scheduler_agent_name("review", &phase.name, &operation_id),
             instructions: format!(
                 "{}\n\nReview the integrated phase diff below against the phase requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nPhase requirements:\n{}\n\nIntegrated diff:\n{}",
                 review.instructions, phase.instructions, diff
@@ -1788,7 +1788,7 @@ async fn review_task(
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
         let agent = AgentSpec {
-            name: format!("review-{}-{}", task_def.name, round),
+            name: scheduler_agent_name("review", &task_def.name, &operation_id),
             instructions: format!(
                 "{}\n\nReview the committed task diff below against the task requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nTask requirements:\n{}\n\nCommitted diff:\n{}",
                 review.instructions, task.instructions, diff
@@ -2019,6 +2019,30 @@ fn is_capacity_error(error: &FunctionCallError) -> bool {
         .contains("agent thread limit reached")
 }
 
+fn scheduler_agent_name(role: &str, display_name: &str, unique_id: &str) -> String {
+    let mut slug = String::new();
+    for ch in display_name.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            slug.push(ch);
+        } else if !slug.ends_with('_') {
+            slug.push('_');
+        }
+        if slug.len() == 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let slug = if slug.is_empty() { "unnamed" } else { slug };
+    let suffix: String = unique_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    format!("{role}_{slug}_{suffix}")
+}
+
 fn parse_effort(value: String) -> Option<ReasoningEffort> {
     Some(match value.as_str() {
         "none" => ReasoningEffort::None,
@@ -2193,6 +2217,20 @@ mod tests {
                 .map(|(finding, _)| finding.finding_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["f-beta", "f-beta-2"]
+        );
+    }
+
+    #[test]
+    fn scheduler_agent_names_are_valid_and_distinct() {
+        let first = scheduler_agent_name("task", "Use Context / Parser", "12345678-first");
+        let second = scheduler_agent_name("task", "Use Context / Parser", "87654321-second");
+
+        assert_eq!(first, "task_use_context_parser_12345678");
+        assert_eq!(second, "task_use_context_parser_87654321");
+        assert!(
+            first
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
         );
     }
 }
