@@ -1,6 +1,7 @@
 use super::agents::status_value;
 use super::agents::truncate_message;
 use super::verification::FlowdexVerifyHandler;
+use crate::agent::AgentStatus;
 use crate::agent::control::SpawnAgentCompletionDelivery;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::exceeds_thread_spawn_depth_limit;
@@ -651,6 +652,14 @@ pub(crate) async fn handle_run_with_review(
         .unwrap_or_else(|| invocation.turn.model_info.slug.clone());
     let reservation_id =
         reserve_task_operation(&invocation.session, &invocation.turn, &task.id, &model).await?;
+    let ui_event = super::agents::begin_spawn_ui_event(
+        &invocation.session,
+        &invocation.turn,
+        instructions.clone(),
+        model,
+        config.model_reasoning_effort.clone().unwrap_or_default(),
+    )
+    .await;
     let child = match invocation
         .session
         .services
@@ -680,6 +689,16 @@ pub(crate) async fn handle_run_with_review(
     {
         Ok(child) => child,
         Err(error) => {
+            super::agents::finish_spawn_ui_event(
+                &invocation.session,
+                &invocation.turn,
+                ui_event,
+                None,
+                None,
+                None,
+                AgentStatus::NotFound,
+            )
+            .await;
             cancel_task_operation_reservation(
                 &invocation.session,
                 &invocation.turn,
@@ -690,6 +709,16 @@ pub(crate) async fn handle_run_with_review(
             return Err(collab_spawn_error(error));
         }
     };
+    super::agents::finish_spawn_ui_event(
+        &invocation.session,
+        &invocation.turn,
+        ui_event,
+        Some(child.thread_id),
+        child.metadata.agent_nickname.clone(),
+        child.metadata.agent_role.clone(),
+        child.status.clone(),
+    )
+    .await;
     let id = child.thread_id;
     associate(id, &task.id);
     let operation_id = child.initial_submission_id.clone();

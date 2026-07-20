@@ -2037,16 +2037,27 @@ impl Session {
         .await;
     }
 
-    /// Delivers a Flowdex reasoning summary to live clients without recording it in the rollout.
-    pub(crate) async fn emit_flowdex_progress(&self, turn_context: &TurnContext, item: TurnItem) {
+    /// Delivers a Flowdex item start to live clients without recording it in the rollout.
+    pub(crate) async fn emit_flowdex_item_started(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) {
         let started = EventMsg::ItemStarted(ItemStartedEvent {
             thread_id: self.thread_id,
             turn_id: turn_context.sub_id.clone(),
-            item: item.clone(),
+            item,
             started_at_ms: now_unix_timestamp_ms(),
         });
         self.send_transient_event(turn_context, started).await;
+    }
 
+    /// Delivers a Flowdex item completion to live clients without recording it in the rollout.
+    pub(crate) async fn emit_flowdex_item_completed(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) {
         let completed = EventMsg::ItemCompleted(ItemCompletedEvent {
             thread_id: self.thread_id,
             turn_id: turn_context.sub_id.clone(),
@@ -2054,6 +2065,13 @@ impl Session {
             completed_at_ms: now_unix_timestamp_ms(),
         });
         self.send_transient_event(turn_context, completed).await;
+    }
+
+    /// Delivers a Flowdex reasoning summary to live clients without recording it in the rollout.
+    pub(crate) async fn emit_flowdex_progress(&self, turn_context: &TurnContext, item: TurnItem) {
+        self.emit_flowdex_item_started(turn_context, item.clone())
+            .await;
+        self.emit_flowdex_item_completed(turn_context, item).await;
     }
 
     async fn send_transient_event(&self, turn_context: &TurnContext, msg: EventMsg) {

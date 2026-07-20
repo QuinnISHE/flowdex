@@ -3,9 +3,11 @@ use codex_features::Feature;
 use codex_flowdex::{FlowdexStore, ReviewFinding, ReviewResolution, RunInfo, TaskDeclaration};
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::items::CollabAgentTool;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
@@ -21,8 +23,8 @@ use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event_match;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -1888,6 +1890,8 @@ text(JSON.stringify({ input, result }));"#,
         }
     };
     let mut reasoning = Vec::new();
+    let mut spawn_item_ids = HashSet::new();
+    let mut visible_child_ids = HashSet::new();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
             .await
@@ -1904,6 +1908,13 @@ text(JSON.stringify({ input, result }));"#,
                 item: TurnItem::Reasoning(item),
                 ..
             }) => reasoning.extend(item.summary_text),
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::CollabAgentToolCall(item),
+                ..
+            }) if item.tool == CollabAgentTool::SpawnAgent => {
+                spawn_item_ids.insert(item.id);
+                visible_child_ids.extend(item.receiver_thread_ids);
+            }
             EventMsg::TurnComplete(event) if event.turn_id == turn_id => break,
             _ => {}
         }
@@ -1924,6 +1935,12 @@ text(JSON.stringify({ input, result }));"#,
         reasoning
             .iter()
             .any(|summary| summary == "Running task: later")
+    );
+    assert_eq!(spawn_item_ids.len(), 4, "each child needs a distinct UI item");
+    assert_eq!(
+        visible_child_ids.len(),
+        4,
+        "every workflow child must be visible to app clients"
     );
 
     let requests = server.received_requests().await.unwrap_or_default();

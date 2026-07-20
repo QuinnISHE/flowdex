@@ -23,11 +23,16 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::items::CollabAgentTool;
+use codex_protocol::items::CollabAgentToolCallItem;
+use codex_protocol::items::CollabAgentToolCallStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus as ProtocolAgentStatus;
+use codex_protocol::protocol::CollabAgentRef;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use codex_tools::JsonSchema;
@@ -44,12 +49,97 @@ use codex_config::{
 };
 use codex_exec_server::LOCAL_FS;
 use toml::Value as TomlValue;
+use uuid::Uuid;
 
 const SPAWN_NAME: &str = "flowdex_spawn_agent";
 const SEND_NAME: &str = "flowdex_send_message";
 const WAIT_NAME: &str = "flowdex_wait_agent";
 const RESUME_NAME: &str = "flowdex_resume_agent";
 const HANDOFF_PROMPT: &str = "Produce only a concise structured handoff with completed work, current state, relevant files and decisions, remaining work, and verification. Do not modify files or continue implementation.";
+
+pub(super) struct FlowdexSpawnUiEvent {
+    id: String,
+    prompt: String,
+    model: String,
+    reasoning_effort: ReasoningEffort,
+}
+
+pub(super) async fn begin_spawn_ui_event(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    prompt: String,
+    model: String,
+    reasoning_effort: ReasoningEffort,
+) -> FlowdexSpawnUiEvent {
+    let event = FlowdexSpawnUiEvent {
+        id: Uuid::new_v4().to_string(),
+        prompt,
+        model,
+        reasoning_effort,
+    };
+    session
+        .emit_flowdex_item_started(
+            turn,
+            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: event.id.clone(),
+                tool: CollabAgentTool::SpawnAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: session.thread_id,
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                prompt: Some(event.prompt.clone()),
+                model: Some(event.model.clone()),
+                reasoning_effort: Some(event.reasoning_effort.clone()),
+                agents_states: Default::default(),
+            }),
+        )
+        .await;
+    event
+}
+
+pub(super) async fn finish_spawn_ui_event(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    event: FlowdexSpawnUiEvent,
+    agent_id: Option<ThreadId>,
+    nickname: Option<String>,
+    role: Option<String>,
+    agent_status: AgentStatus,
+) {
+    let receiver_thread_ids = agent_id.into_iter().collect();
+    let receiver_agents = agent_id
+        .map(|thread_id| CollabAgentRef {
+            thread_id,
+            agent_nickname: nickname,
+            agent_role: role,
+        })
+        .into_iter()
+        .collect();
+    let agents_states = agent_id
+        .map(|thread_id| [(thread_id, agent_status.clone())].into_iter().collect())
+        .unwrap_or_default();
+    session
+        .emit_flowdex_item_completed(
+            turn,
+            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: event.id,
+                tool: CollabAgentTool::SpawnAgent,
+                status: if agent_id.is_some() {
+                    CollabAgentToolCallStatus::Completed
+                } else {
+                    CollabAgentToolCallStatus::Failed
+                },
+                sender_thread_id: session.thread_id,
+                receiver_thread_ids,
+                receiver_agents,
+                prompt: Some(event.prompt),
+                model: Some(event.model),
+                reasoning_effort: Some(event.reasoning_effort),
+                agents_states,
+            }),
+        )
+        .await;
+}
 
 pub(crate) struct FlowdexSpawnAgentHandler;
 pub(crate) struct FlowdexSendMessageHandler;
@@ -263,7 +353,20 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
         true,
     );
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-    let child = session
+    let model = config
+        .model
+        .clone()
+        .unwrap_or_else(|| turn.model_info.slug.clone());
+    let reasoning_effort = config.model_reasoning_effort.clone().unwrap_or_default();
+    let ui_event = begin_spawn_ui_event(
+        &session,
+        &turn,
+        instructions.to_string(),
+        model,
+        reasoning_effort,
+    )
+    .await;
+    let child = match session
         .services
         .agent_control
         .spawn_agent_with_communication(
@@ -279,7 +382,32 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             },
         )
         .await
-        .map_err(collab_spawn_error)?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            finish_spawn_ui_event(
+                &session,
+                &turn,
+                ui_event,
+                None,
+                None,
+                None,
+                AgentStatus::NotFound,
+            )
+            .await;
+            return Err(collab_spawn_error(error));
+        }
+    };
+    finish_spawn_ui_event(
+        &session,
+        &turn,
+        ui_event,
+        Some(child.thread_id),
+        child.metadata.agent_nickname.clone(),
+        child.metadata.agent_role.clone(),
+        child.status.clone(),
+    )
+    .await;
     Ok(JsonOutput::new(Value::String(child.thread_id.to_string())))
 }
 
@@ -533,6 +661,17 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             ),
             None => None,
         };
+        let ui_event = begin_spawn_ui_event(
+            &session,
+            &turn,
+            prompt.clone(),
+            config
+                .model
+                .clone()
+                .unwrap_or_else(|| turn.model_info.slug.clone()),
+            config.model_reasoning_effort.clone().unwrap_or_default(),
+        )
+        .await;
         let child = match session
             .services
             .agent_control
@@ -554,6 +693,16 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         {
             Ok(child) => child,
             Err(error) => {
+                finish_spawn_ui_event(
+                    &session,
+                    &turn,
+                    ui_event,
+                    None,
+                    None,
+                    None,
+                    AgentStatus::NotFound,
+                )
+                .await;
                 if let (Some(task_id), Some(reservation_id)) =
                     (task_id.as_deref(), replacement_reservation.as_deref())
                 {
@@ -568,6 +717,16 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 return Err(collab_spawn_error(error));
             }
         };
+        finish_spawn_ui_event(
+            &session,
+            &turn,
+            ui_event,
+            Some(child.thread_id),
+            child.metadata.agent_nickname.clone(),
+            child.metadata.agent_role.clone(),
+            child.status.clone(),
+        )
+        .await;
         let replacement_id = child.thread_id;
         if let (Some(task_id), Some(reservation_id)) =
             (task_id.as_deref(), replacement_reservation.as_deref())
