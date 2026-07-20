@@ -472,6 +472,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       },
       wait: async () => {
         const result = await tools.flowdex_wait_run({ run_id: id });
+        if (result.status === "failed") throw new Error(result.error);
         return result;
       },
     };

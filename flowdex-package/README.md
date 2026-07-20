@@ -1,8 +1,10 @@
 # Flowdex package
 
-Place one release binary in this directory:
+Place the release package files in this directory:
 
-- Windows: copy `codex-rs/target/release/codex.exe` here as `flowdex.exe`.
+- Windows: copy `codex-rs/target/release/codex.exe` here as `flowdex.exe`, plus
+  `codex-windows-sandbox-setup.exe` and `codex-command-runner.exe` from the same
+  release directory. Flowdex installs all three together so sandboxed agents work.
 - macOS: copy `codex-rs/target/release/codex` here as `flowdex` and keep it executable.
 
 Install or uninstall from this directory:

@@ -13,6 +13,12 @@ use std::path::PathBuf;
 
 const INSTALL_MANIFEST: &str = "flowdex/installed-assets-v1";
 
+#[cfg(windows)]
+const WINDOWS_HELPERS: &[&str] = &[
+    "codex-windows-sandbox-setup.exe",
+    "codex-command-runner.exe",
+];
+
 struct BundledAsset {
     relative_path: &'static str,
     contents: &'static str,
@@ -157,7 +163,9 @@ async fn run_install() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        let helpers = windows_package_helpers()?;
         let target = install_current_binary(BinaryValidation::Windows)?;
+        install_windows_helpers(&helpers, &target)?;
         install_bundled_assets(find_codex_home()?.as_path())?;
         let mut writer = RegistryEnvironmentWriter;
         writer.set_codex_cli_path(&target)?;
@@ -187,6 +195,7 @@ async fn run_uninstall(purge: bool) -> Result<()> {
     {
         let mut writer = RegistryEnvironmentWriter;
         writer.remove_codex_cli_path()?;
+        remove_installed_windows_helpers()?;
         remove_flowdex_files(purge)?;
         print_uninstall_result(purge);
         Ok(())
@@ -237,6 +246,81 @@ fn install_current_binary(validation: BinaryValidation) -> Result<PathBuf> {
     let source = std::env::current_exe().context("cannot locate the running Flowdex binary")?;
     let target = installed_binary_path()?;
     install_binary(&source, &target, run_version_check, validation)
+}
+
+#[cfg(windows)]
+fn windows_package_helpers() -> Result<Vec<PathBuf>> {
+    let package = std::env::current_exe().context("cannot locate the running Flowdex package")?;
+    let directory = package
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Flowdex package path has no parent"))?;
+    WINDOWS_HELPERS
+        .iter()
+        .map(|name| {
+            let path = directory.join(name);
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("Flowdex package is missing {name}"))?;
+            if !canonical.is_file() {
+                anyhow::bail!(
+                    "Flowdex package helper is not a regular file: {}",
+                    canonical.display()
+                );
+            }
+            Ok(canonical)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn install_windows_helpers(helpers: &[PathBuf], binary: &Path) -> Result<()> {
+    let directory = binary
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed Flowdex path has no parent"))?;
+    for (name, source) in WINDOWS_HELPERS.iter().zip(helpers) {
+        install_package_file(source, &directory.join(name))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_installed_windows_helpers() -> Result<()> {
+    let binary = installed_binary_path()?;
+    let directory = binary
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed Flowdex path has no parent"))?;
+    for name in WINDOWS_HELPERS {
+        remove_file_if_exists(&directory.join(name))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_package_file(source: &Path, target: &Path) -> Result<()> {
+    if source == target {
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed package file has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".flowdex-install-{}-helper", std::process::id()));
+    let _ = fs::remove_file(&temp);
+    let result = (|| {
+        fs::copy(source, &temp)
+            .with_context(|| format!("cannot copy {} to {}", source.display(), temp.display()))?;
+        if target.exists() {
+            fs::remove_file(target)
+                .with_context(|| format!("cannot replace {}", target.display()))?;
+        }
+        fs::rename(&temp, target)
+            .with_context(|| format!("cannot install {}", target.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn install_binary<V>(

@@ -570,7 +570,11 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
             }
             RunStatus::Failed(error) => {
                 remove_run_controller(&args.run_id).await;
-                return Err(FunctionCallError::RespondToModel(error));
+                return Ok(task::JsonOutput(serde_json::json!({
+                    "runId": args.run_id,
+                    "status": "failed",
+                    "error": error,
+                })));
             }
         }
     }
