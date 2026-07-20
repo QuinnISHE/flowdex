@@ -75,6 +75,7 @@ pub(crate) async fn execute_source(
         yield_time_ms,
         max_output_tokens,
         None,
+        None,
     )
     .await
 }
@@ -86,6 +87,7 @@ pub(crate) async fn execute_source_with_cell_hook(
     nested_tool_specs: &[ToolSpec],
     yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
+    dispatch_parent_cell: Option<codex_code_mode::CellId>,
     cell_started: Option<Box<dyn FnOnce(&codex_code_mode::CellId) + Send>>,
 ) -> Result<
     (
@@ -127,7 +129,7 @@ pub(crate) async fn execute_source_with_cell_hook(
     exec.session
         .services
         .code_mode_service
-        .mark_cell_ready_for_dispatch(&cell_id);
+        .mark_cell_ready_for_dispatch(&cell_id, dispatch_parent_cell.as_ref())?;
     let response = started_cell.initial_response().await?;
     code_cell_trace.record_initial_response(&response);
     if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {

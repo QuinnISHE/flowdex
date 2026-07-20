@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
@@ -10,7 +12,6 @@ use codex_code_mode::ToolInvocationFuture;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value as JsonValue;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -23,27 +24,48 @@ use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
 pub(super) struct CodeModeDispatchBroker {
-    dispatch_tx: async_channel::Sender<DispatchMessage>,
-    dispatch_rx: async_channel::Receiver<DispatchMessage>,
     dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    active_host: Arc<Mutex<Option<(u64, Arc<CoreTurnHost>)>>>,
+    cell_hosts: Arc<Mutex<HashMap<CellId, Arc<CoreTurnHost>>>>,
+    next_host_id: AtomicU64,
 }
 
 impl CodeModeDispatchBroker {
     pub(super) fn new() -> Self {
-        let (dispatch_tx, dispatch_rx) = async_channel::unbounded();
         Self {
-            dispatch_tx,
-            dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            active_host: Arc::new(Mutex::new(None)),
+            cell_hosts: Arc::new(Mutex::new(HashMap::new())),
+            next_host_id: AtomicU64::new(0),
         }
     }
 
-    pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId) {
+    pub(super) fn mark_cell_ready_for_dispatch(
+        &self,
+        cell_id: &CellId,
+        parent_cell_id: Option<&CellId>,
+    ) -> Result<(), String> {
+        let host = if let Some(parent_cell_id) = parent_cell_id {
+            lock_or_recover(&self.cell_hosts)
+                .get(parent_cell_id)
+                .map(|host| Arc::new(host.fork_dispatch_context()))
+                .ok_or_else(|| {
+                    format!("code mode parent cell {parent_cell_id} has no dispatch host")
+                })?
+        } else {
+            lock_or_recover(&self.active_host)
+                .as_ref()
+                .map(|(_, host)| Arc::clone(host))
+                .ok_or_else(|| "code mode turn has no dispatch host".to_string())?
+        };
+        lock_or_recover(&self.cell_hosts).insert(cell_id.clone(), host);
         dispatch_gate(&self.dispatch_gates, cell_id).send_replace(true);
+        Ok(())
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
         remove_dispatch_gate(&self.dispatch_gates, cell_id);
+        lock_or_recover(&self.cell_hosts).remove(cell_id);
     }
 
     pub(super) fn start_turn_worker(
@@ -56,75 +78,26 @@ impl CodeModeDispatchBroker {
         let tool_runtime =
             ToolCallRuntime::new(router, Arc::clone(&exec.session), step_context, tracker);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
-        let dispatch_rx = self.dispatch_rx.clone();
-        let dispatch_gates = Arc::clone(&self.dispatch_gates);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            loop {
-                let message = tokio::select! {
-                    _ = &mut shutdown_rx => break,
-                    message = dispatch_rx.recv() => message.ok(),
-                };
-                let Some(message) = message else {
-                    break;
-                };
-                match message {
-                    DispatchMessage::Notify {
-                        call_id,
-                        cell_id,
-                        text,
-                        cancellation_token,
-                        response_tx,
-                    } => {
-                        let response = if wait_until_cell_ready_for_dispatch(
-                            &dispatch_gates,
-                            &cell_id,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            host.notify(call_id, cell_id, text).await
-                        } else {
-                            remove_dispatch_gate(&dispatch_gates, &cell_id);
-                            Err("code mode notification cancelled".to_string())
-                        };
-                        let _ = response_tx.send(response);
-                    }
-                    DispatchMessage::InvokeTool {
-                        invocation,
-                        cancellation_token,
-                        response_tx,
-                    } => {
-                        let cell_id = invocation.cell_id.clone();
-                        if !wait_until_cell_ready_for_dispatch(
-                            &dispatch_gates,
-                            &cell_id,
-                            &cancellation_token,
-                        )
-                        .await
-                        {
-                            remove_dispatch_gate(&dispatch_gates, &cell_id);
-                            continue;
-                        }
-                        let host = Arc::clone(&host);
-                        tokio::spawn(async move {
-                            let response = tokio::select! {
-                                response = host.invoke_tool(
-                                    invocation,
-                                    cancellation_token.clone(),
-                                ) => response,
-                                _ = cancellation_token.cancelled() => return,
-                            };
-                            let _ = response_tx.send(response);
-                        });
-                    }
-                }
-            }
-        });
+        let host_id = self.next_host_id.fetch_add(1, Ordering::Relaxed);
+        *lock_or_recover(&self.active_host) = Some((host_id, host));
         CodeModeDispatchWorker {
-            shutdown_tx: Some(shutdown_tx),
+            active_host: Arc::clone(&self.active_host),
+            host_id,
         }
     }
+
+    fn cell_host(&self, cell_id: &CellId) -> Result<Arc<CoreTurnHost>, String> {
+        lock_or_recover(&self.cell_hosts)
+            .get(cell_id)
+            .cloned()
+            .ok_or_else(|| format!("code mode cell {cell_id} has no dispatch host"))
+    }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn dispatch_gate(
@@ -186,21 +159,21 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
             if cancellation_token.is_cancelled() {
                 return Err("code mode nested tool call cancelled".to_string());
             }
-            let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_tx
-                .send(DispatchMessage::InvokeTool {
-                    invocation,
-                    cancellation_token: cancellation_token.clone(),
-                    response_tx,
-                })
-                .await
-                .map_err(|_| "code mode nested tool dispatcher is unavailable".to_string())?;
+            let cell_id = invocation.cell_id.clone();
+            if !wait_until_cell_ready_for_dispatch(
+                &self.dispatch_gates,
+                &cell_id,
+                &cancellation_token,
+            )
+            .await
+            {
+                self.close_cell(&cell_id);
+                return Err("code mode nested tool call cancelled".to_string());
+            }
+            let host = self.cell_host(&cell_id)?;
             tokio::select! {
-                response = response_rx => response
-                    .map_err(|_| "code mode nested tool dispatcher stopped".to_string())?,
-                _ = cancellation_token.cancelled() => {
-                    Err("code mode nested tool call cancelled".to_string())
-                }
+                response = host.invoke_tool(invocation, cancellation_token.clone()) => response,
+                _ = cancellation_token.cancelled() => Err("code mode nested tool call cancelled".to_string()),
             }
         })
     }
@@ -216,23 +189,20 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
             if cancellation_token.is_cancelled() {
                 return Err("code mode notification cancelled".to_string());
             }
-            let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_tx
-                .send(DispatchMessage::Notify {
-                    call_id,
-                    cell_id,
-                    text,
-                    cancellation_token: cancellation_token.clone(),
-                    response_tx,
-                })
-                .await
-                .map_err(|_| "code mode notification dispatcher is unavailable".to_string())?;
+            if !wait_until_cell_ready_for_dispatch(
+                &self.dispatch_gates,
+                &cell_id,
+                &cancellation_token,
+            )
+            .await
+            {
+                self.close_cell(&cell_id);
+                return Err("code mode notification cancelled".to_string());
+            }
+            let host = self.cell_host(&cell_id)?;
             tokio::select! {
-                response = response_rx => response
-                    .map_err(|_| "code mode notification dispatcher stopped".to_string())?,
-                _ = cancellation_token.cancelled() => {
-                    Err("code mode notification cancelled".to_string())
-                }
+                response = host.notify(call_id, cell_id, text) => response,
+                _ = cancellation_token.cancelled() => Err("code mode notification cancelled".to_string()),
             }
         })
     }
@@ -242,29 +212,19 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
     }
 }
 
-enum DispatchMessage {
-    InvokeTool {
-        invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
-        response_tx: oneshot::Sender<Result<JsonValue, String>>,
-    },
-    Notify {
-        call_id: String,
-        cell_id: CellId,
-        text: String,
-        cancellation_token: CancellationToken,
-        response_tx: oneshot::Sender<Result<(), String>>,
-    },
-}
-
 pub(crate) struct CodeModeDispatchWorker {
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    active_host: Arc<Mutex<Option<(u64, Arc<CoreTurnHost>)>>>,
+    host_id: u64,
 }
 
 impl Drop for CodeModeDispatchWorker {
     fn drop(&mut self) {
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        let mut active_host = lock_or_recover(&self.active_host);
+        if active_host
+            .as_ref()
+            .is_some_and(|(host_id, _)| *host_id == self.host_id)
+        {
+            *active_host = None;
         }
     }
 }
@@ -275,6 +235,13 @@ struct CoreTurnHost {
 }
 
 impl CoreTurnHost {
+    fn fork_dispatch_context(&self) -> Self {
+        Self {
+            exec: self.exec.clone(),
+            tool_runtime: self.tool_runtime.fork_dispatch_context(),
+        }
+    }
+
     async fn invoke_tool(
         &self,
         invocation: CodeModeNestedToolCall,

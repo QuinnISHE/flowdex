@@ -241,7 +241,9 @@ fn parse(payload: ToolPayload, message: &str) -> Result<String, FunctionCallErro
 }
 pub(crate) fn runtime_id(invocation: &ToolInvocation) -> Result<String, FunctionCallError> {
     match &invocation.source {
-        crate::tools::context::ToolCallSource::CodeMode { cell_id, .. } => Ok(cell_id.clone()),
+        crate::tools::context::ToolCallSource::CodeMode { cell_id, .. } => {
+            Ok(super::workflow_store_run_id(cell_id))
+        }
         _ => Err(FunctionCallError::RespondToModel(
             "Flowdex task tools are available only inside a workflow".into(),
         )),

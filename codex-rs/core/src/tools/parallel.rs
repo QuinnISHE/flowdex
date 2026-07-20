@@ -71,6 +71,16 @@ impl ToolCallRuntime {
         self.router.create_diff_consumer(tool_name)
     }
 
+    pub(crate) fn fork_dispatch_context(&self) -> Self {
+        Self {
+            router: Arc::clone(&self.router),
+            session: Arc::clone(&self.session),
+            step_context: Arc::clone(&self.step_context),
+            tracker: Arc::clone(&self.tracker),
+            parallel_execution: Arc::new(RwLock::new(())),
+        }
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn handle_tool_call(
         self,

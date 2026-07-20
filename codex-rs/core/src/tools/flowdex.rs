@@ -230,16 +230,68 @@ struct WorkflowInvocation {
 }
 
 static WORKFLOW_CHAINS: OnceLock<Mutex<HashMap<String, WorkflowInvocation>>> = OnceLock::new();
+static WORKFLOW_RUN_IDS: OnceLock<Mutex<WorkflowRunIds>> = OnceLock::new();
+
+#[derive(Default)]
+struct WorkflowRunIds {
+    by_cell: HashMap<String, String>,
+    by_run: HashMap<String, String>,
+}
 
 fn workflow_chains() -> &'static Mutex<HashMap<String, WorkflowInvocation>> {
     WORKFLOW_CHAINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn workflow_run_ids() -> &'static Mutex<WorkflowRunIds> {
+    WORKFLOW_RUN_IDS.get_or_init(|| Mutex::new(WorkflowRunIds::default()))
+}
+
+fn register_workflow_run(cell_id: &codex_code_mode::CellId) -> String {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut ids = workflow_run_ids()
+        .lock()
+        .expect("workflow run id mutex poisoned");
+    ids.by_cell.insert(cell_id.to_string(), run_id.clone());
+    ids.by_run.insert(run_id.clone(), cell_id.to_string());
+    run_id
+}
+
+pub(super) fn workflow_store_run_id(cell_id: &str) -> String {
+    workflow_run_ids()
+        .lock()
+        .expect("workflow run id mutex poisoned")
+        .by_cell
+        .get(cell_id)
+        .cloned()
+        .unwrap_or_else(|| cell_id.to_string())
+}
+
+fn workflow_cell_id(run_id: &str) -> codex_code_mode::CellId {
+    let cell_id = workflow_run_ids()
+        .lock()
+        .expect("workflow run id mutex poisoned")
+        .by_run
+        .get(run_id)
+        .cloned()
+        .unwrap_or_else(|| run_id.to_string());
+    codex_code_mode::CellId::new(cell_id)
+}
+
+fn remove_workflow_run(cell_id: &str) {
+    let mut ids = workflow_run_ids()
+        .lock()
+        .expect("workflow run id mutex poisoned");
+    if let Some(run_id) = ids.by_cell.remove(cell_id) {
+        ids.by_run.remove(&run_id);
+    }
+}
+
 pub(super) fn workflow_run_identity(cell_id: &str) -> (Option<String>, Option<String>) {
+    let cell_id = workflow_cell_id(cell_id);
     workflow_chains()
         .lock()
         .expect("workflow chain mutex poisoned")
-        .get(cell_id)
+        .get(cell_id.as_str())
         .map(|invocation| {
             (
                 invocation.parent_run_id.clone(),
@@ -347,12 +399,13 @@ impl ToolExecutor<ToolInvocation> for FlowdexSignalHandler {
                     "flowdex.signal is available only inside saved workflows".into(),
                 ));
             };
-            let Some(store) = signal_store(&cell_id).await else {
+            let run_id = workflow_store_run_id(&cell_id);
+            let Some(store) = signal_store(&run_id).await else {
                 return Err(FunctionCallError::RespondToModel(
                     "Flowdex workflow is not active".into(),
                 ));
             };
-            publish_flowdex_signal(store, cell_id, args.signal)
+            publish_flowdex_signal(store, run_id, args.signal)
                 .await
                 .map_err(FunctionCallError::RespondToModel)?;
             Ok(boxed_tool_output(FunctionToolOutput::from_text(
@@ -507,7 +560,7 @@ impl WaitFlowdexWorkflowHandler {
             ));
         };
         let args: WaitArgs = parse_arguments(&arguments)?;
-        let cell_id = codex_code_mode::CellId::new(args.run_id.clone());
+        let cell_id = workflow_cell_id(&args.run_id);
         let turn_state = session
             .input_queue
             .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
@@ -564,6 +617,7 @@ impl WaitFlowdexWorkflowHandler {
                             .lock()
                             .expect("workflow chain mutex poisoned")
                             .remove(runtime_cell_id.as_str());
+                        remove_workflow_run(runtime_cell_id.as_str());
                     }
                     let (result, terminal) = flowdex_result(args.run_id.clone(), wait_response.into());
                     if terminal {
@@ -805,7 +859,8 @@ impl FlowdexRunWorkflowHandler {
         let exec = ExecContext { session, turn };
         let chain_for_registration = child_chain.clone();
         let identity_for_registration = identity.clone();
-        let parent_for_registration = parent_cell.clone();
+        let parent_run_id = workflow_store_run_id(&parent_cell);
+        let inherited_store = signal_store(&parent_run_id).await;
         let started_child = Arc::new(Mutex::new(None));
         let started_child_for_registration = Arc::clone(&started_child);
         let (response, child_cell, _) = tokio::select! {
@@ -834,7 +889,9 @@ impl FlowdexRunWorkflowHandler {
                 &self.nested_tool_specs,
                 None,
                 None,
+                Some(codex_code_mode::CellId::new(parent_cell.clone())),
                 Some(Box::new(move |child_cell| {
+                    let child_run_id = register_workflow_run(child_cell);
                     *started_child_for_registration
                         .lock()
                         .expect("child cell mutex poisoned") = Some(child_cell.clone());
@@ -845,10 +902,13 @@ impl FlowdexRunWorkflowHandler {
                             child_cell.to_string(),
                             WorkflowInvocation {
                                 chain: chain_for_registration,
-                                parent_run_id: Some(parent_for_registration),
+                                parent_run_id: Some(parent_run_id),
                                 workflow_identity: Some(identity_for_registration),
                             },
                         );
+                    if let Some(store) = inherited_store {
+                        register_flowdex_boundary_run(child_run_id, store);
+                    }
                 })),
             ) => result.map_err(FunctionCallError::RespondToModel)?,
         };
@@ -858,6 +918,7 @@ impl FlowdexRunWorkflowHandler {
             .lock()
             .expect("workflow chain mutex poisoned")
             .remove(child_cell.as_str());
+        remove_workflow_run(child_cell.as_str());
         let value = result.map_err(FunctionCallError::RespondToModel)?;
         Ok(boxed_tool_output(task::JsonOutput(value)))
     }
@@ -1157,12 +1218,33 @@ impl StartFlowdexWorkflowHandler {
                 .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?
         };
         let exec = ExecContext { session, turn };
+        let root_store = match reference.as_ref().map(WorkflowRef::scope) {
+            Some(WorkflowScope::Repo) => Some(Arc::new(
+                task::open_store(&exec.session, &exec.turn).await?.0,
+            )),
+            Some(WorkflowScope::Global)
+                if exec.turn.config.active_project.is_trusted()
+                    && exec
+                        .turn
+                        .environments
+                        .single_local_environment_cwd()
+                        .is_some() =>
+            {
+                task::open_store(&exec.session, &exec.turn)
+                    .await
+                    .ok()
+                    .map(|(store, _, _)| Arc::new(store))
+            }
+            _ => None,
+        };
         let workflow_metadata = reference.as_ref().map(|reference| {
             (
                 reference.normalized_display(),
                 reference.normalized_display(),
             )
         });
+        let run_id = Arc::new(Mutex::new(None));
+        let run_id_for_registration = Arc::clone(&run_id);
         let (response, cell_id, _started_at) = execute_source_with_cell_hook(
             &exec,
             call_id,
@@ -1170,8 +1252,13 @@ impl StartFlowdexWorkflowHandler {
             &self.nested_tool_specs,
             None,
             None,
-            workflow_metadata.map(|(identity, chain_identity)| {
-                Box::new(move |cell_id: &codex_code_mode::CellId| {
+            None,
+            Some(Box::new(move |cell_id: &codex_code_mode::CellId| {
+                let public_run_id = register_workflow_run(cell_id);
+                *run_id_for_registration
+                    .lock()
+                    .expect("workflow run id result mutex poisoned") = Some(public_run_id.clone());
+                if let Some((identity, chain_identity)) = workflow_metadata {
                     workflow_chains()
                         .lock()
                         .expect("workflow chain mutex poisoned")
@@ -1183,8 +1270,11 @@ impl StartFlowdexWorkflowHandler {
                                 workflow_identity: Some(identity),
                             },
                         );
-                }) as Box<dyn FnOnce(&codex_code_mode::CellId) + Send>
-            }),
+                }
+                if let Some(store) = root_store {
+                    register_flowdex_boundary_run(public_run_id, store);
+                }
+            })),
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
@@ -1197,8 +1287,14 @@ impl StartFlowdexWorkflowHandler {
                 .lock()
                 .expect("workflow chain mutex poisoned")
                 .remove(cell_id.as_str());
+            remove_workflow_run(cell_id.as_str());
         }
-        let (result, _) = flowdex_result(cell_id.to_string(), response);
+        let run_id = run_id
+            .lock()
+            .expect("workflow run id result mutex poisoned")
+            .clone()
+            .expect("workflow run id should be registered before execution");
+        let (result, _) = flowdex_result(run_id, response);
         let success = result.get("status").and_then(Value::as_str) != Some("failed");
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
             result.to_string(),

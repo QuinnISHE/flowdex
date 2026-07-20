@@ -494,6 +494,13 @@ struct NestedWorkflowResponder {
 
 impl Respond for NestedWorkflowResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if body_contains(request, "nested child instructions") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-nested-agent"),
+                ev_assistant_message("msg-nested-agent", "nested child output"),
+                ev_completed("resp-nested-agent"),
+            ]));
+        }
         if body_contains(request, "run nested workflow")
             && self.parent_requests.fetch_add(1, Ordering::SeqCst) == 0
         {
@@ -2197,8 +2204,9 @@ async fn flowdex_nested_workflow_runs_scheduler_child_without_parent_model_turn(
     let mut builder = test_codex()
         .with_model("gpt-5.2")
         .with_config(|config| {
-            config.features.enable(Feature::CodeMode).unwrap();
             config.features.enable(Feature::Collab).unwrap();
+            config.flowdex_config.multi_agent_version =
+                Some(codex_flowdex::FlowdexMultiAgentVersion::V1);
             config.agent_max_threads = Some(4);
             config.active_project.trust_level = Some(TrustLevel::Trusted);
         })
@@ -2221,7 +2229,13 @@ flowdex.output({ child });"#,
   properties: { files: { type: 'array', items: { type: 'string' } } },
   required: ['files'],
 });
-flowdex.output({ input, workflow: flowdex.workflowPath });"#,
+const agentId = await flowdex.spawnAgent({
+  name: 'nested_worker',
+  instructions: 'nested child instructions',
+  model: 'gpt-5.4',
+});
+const agent = await flowdex.waitAgent(agentId);
+flowdex.output({ input, workflow: flowdex.workflowPath, agent });"#,
             )?;
             fs::write(cwd.join("README.md"), "nested workflow fixture\n")?;
             let run_git = |args: &[&str]| -> Result<()> {
@@ -2300,6 +2314,8 @@ flowdex.output({ input, workflow: flowdex.workflowPath });"#,
         "workflow output: {workflow_output}"
     );
     assert_eq!(child["workflow"], "repo:child");
+    assert_eq!(child["agent"]["status"], "completed");
+    assert_eq!(child["agent"]["message"], "nested child output");
     assert_eq!(
         responder.parent_requests.load(Ordering::SeqCst),
         2,

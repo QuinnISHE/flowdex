@@ -129,8 +129,13 @@ impl CodeModeService {
         }
     }
 
-    pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
-        self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
+    pub(crate) fn mark_cell_ready_for_dispatch(
+        &self,
+        cell_id: &codex_code_mode::CellId,
+        parent_cell_id: Option<&codex_code_mode::CellId>,
+    ) -> Result<(), String> {
+        self.dispatch_broker
+            .mark_cell_ready_for_dispatch(cell_id, parent_cell_id)
     }
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
