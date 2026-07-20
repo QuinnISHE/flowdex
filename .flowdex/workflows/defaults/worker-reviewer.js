@@ -17,7 +17,7 @@ const run = await flowdex.startRun({
   phases: [
     {
       name: "implementation",
-      instructions: "Implement the request and commit each modification with a brief summary.",
+      instructions: "Implement the request and finish with a brief summary.",
       tasks: [
         {
           name: "implement",

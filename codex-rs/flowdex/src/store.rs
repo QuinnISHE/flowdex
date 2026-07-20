@@ -1621,6 +1621,57 @@ impl FlowdexStore {
         Ok(commits)
     }
 
+    pub fn commit_operation_changes(
+        &self,
+        task_id: &str,
+        operation_id: &str,
+        summary: &str,
+    ) -> Result<Option<String>, FlowdexStoreError> {
+        let task = self.task(task_id)?;
+        let active: Option<String> = self.runtime.block_on(
+            sqlx::query_scalar(
+                "SELECT operation_id FROM task_operations WHERE task_id=? AND operation_id=? AND terminal_state IS NULL",
+            )
+            .bind(task_id)
+            .bind(operation_id)
+            .fetch_optional(&self.pool),
+        )?;
+        if active.is_none() {
+            return Err(FlowdexStoreError::Operation(operation_id.to_string()));
+        }
+        if worktree_clean(&task.worktree_path)? {
+            return Ok(None);
+        }
+        if git_operation_in_progress(&task.worktree_path)? {
+            return Err(FlowdexStoreError::Operation(
+                "task worktree has an active Git operation".to_string(),
+            ));
+        }
+        git_status(&task.worktree_path, ["add", "--all"])?;
+        let summary = summary.trim();
+        let summary = if summary.is_empty() {
+            "flowdex: complete task"
+        } else {
+            summary
+        };
+        git_status(
+            &task.worktree_path,
+            [
+                "-c",
+                "user.name=Flowdex",
+                "-c",
+                "user.email=flowdex@local",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "-m",
+                summary,
+            ],
+        )?;
+        git_stdout(&task.worktree_path, ["rev-parse", "HEAD"]).map(Some)
+    }
+
     pub fn record_verification(
         &self,
         task_id: &str,
@@ -2301,6 +2352,44 @@ mod tests {
         assert!(!task.worktree_path.exists());
         assert!(repo.path().join("x").exists());
         assert!(repo.path().join("y").exists());
+    }
+
+    #[test]
+    fn host_commits_task_changes_before_attribution() {
+        let (repo, _home, store, run) = store();
+        let task = store
+            .create_task(
+                &run,
+                &TaskDeclaration {
+                    id: "task".into(),
+                    name: "write result".into(),
+                    instructions: "i".into(),
+                    read_scope: vec![],
+                    write_scope: vec![],
+                    verification: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .start_operation("task", "op", "agent", "model")
+            .unwrap();
+        fs::write(task.worktree_path.join("result.txt"), "done\n").unwrap();
+
+        let committed = store
+            .commit_operation_changes("task", "op", "flowdex: write result")
+            .unwrap();
+        assert!(committed.is_some());
+        let commits = store.finish_operation("task", "op", "completed").unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].summary, "flowdex: write result");
+
+        store.integrate("task").unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.path().join("result.txt"))
+                .unwrap()
+                .trim(),
+            "done"
+        );
     }
 
     #[test]

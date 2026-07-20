@@ -433,15 +433,26 @@ pub(crate) async fn finish_task_operation(
     task_id: &str,
     operation_id: &str,
     terminal: &str,
+    commit_changes: bool,
 ) -> Result<(), FunctionCallError> {
     let (store, _, _) = open_store(session, turn).await?;
     let task_id = task_id.to_string();
     let operation_id = operation_id.to_string();
     let terminal = terminal.to_string();
-    tokio::task::spawn_blocking(move || store.finish_operation(&task_id, &operation_id, &terminal))
-        .await
-        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-        .map_err(task_error)?;
+    tokio::task::spawn_blocking(move || {
+        if terminal == "completed" && commit_changes {
+            let task = store.task(&task_id)?;
+            store.commit_operation_changes(
+                &task_id,
+                &operation_id,
+                &format!("flowdex: {}", task.name.trim()),
+            )?;
+        }
+        store.finish_operation(&task_id, &operation_id, &terminal)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+    .map_err(task_error)?;
     Ok(())
 }
 fn task_error(error: FlowdexStoreError) -> FunctionCallError {
@@ -542,7 +553,7 @@ pub(crate) async fn handle_run_with_review(
             "runAgent requires profile, model, or reasoningEffort".into(),
         ));
     }
-    let (store, _cwd, repository_git_dir) = task_store(&invocation).await?;
+    let (store, _cwd, _) = task_store(&invocation).await?;
     let task = tokio::task::spawn_blocking({
         let id = args.task_id.clone();
         move || store.task(&id)
@@ -589,19 +600,15 @@ pub(crate) async fn handle_run_with_review(
         .unwrap_or(&task.worktree_path);
     let task_cwd = AbsolutePathBuf::from_absolute_path(execution_worktree)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
-    let git_dir = AbsolutePathBuf::from_absolute_path(PathBuf::from(repository_git_dir))
-        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
-    let workspace_roots = vec![task_cwd.clone(), git_dir.clone()];
     config.cwd = task_cwd.clone();
-    config.workspace_roots = workspace_roots.clone();
-    config.permissions.set_workspace_roots(workspace_roots);
+    config.workspace_roots = vec![task_cwd.clone()];
+    config
+        .permissions
+        .set_workspace_roots(vec![task_cwd.clone()]);
     let mut environments = invocation.turn.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
-        environment.workspace_roots = vec![
-            PathUri::from_abs_path(&task_cwd),
-            PathUri::from_abs_path(&git_dir),
-        ];
+        environment.workspace_roots = vec![PathUri::from_abs_path(&task_cwd)];
     }
     let depth = next_thread_spawn_depth(&invocation.turn.session_source);
     if exceeds_thread_spawn_depth_limit(depth, invocation.turn.config.agent_max_depth) {
@@ -635,7 +642,7 @@ pub(crate) async fn handle_run_with_review(
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
     let instructions = format!(
-        "Task requirements:\n{}\n\nRead scope (advisory): {:?}\nWrite scope (advisory): {:?}\n\n{}\n\nCommit any modifications before finishing with a brief useful summary.",
+        "Task requirements:\n{}\n\nRead scope (advisory): {:?}\nWrite scope (advisory): {:?}\n\n{}\n\nFinish with a brief useful summary. Flowdex commits successful task changes automatically.",
         task.instructions, task.read_scope, task.write_scope, supplied
     );
     let model = config
@@ -711,6 +718,7 @@ pub(crate) async fn handle_run_with_review(
                         &task.id,
                         &operation_id,
                         "cancelled",
+                        false,
                     )
                     .await;
                     return Err(FunctionCallError::RespondToModel(
@@ -739,6 +747,7 @@ pub(crate) async fn handle_run_with_review(
                         &task.id,
                         &operation_id,
                         "cancelled",
+                        false,
                     )
                     .await;
                     return Err(FunctionCallError::RespondToModel(
@@ -754,12 +763,15 @@ pub(crate) async fn handle_run_with_review(
     } else {
         "errored"
     };
-    let (store, _, _) = task_store(&invocation).await?;
-    let task_id = task.id.clone();
-    tokio::task::spawn_blocking(move || store.finish_operation(&task_id, &operation_id, terminal))
-        .await
-        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
-        .map_err(task_error)?;
+    finish_task_operation(
+        &invocation.session,
+        &invocation.turn,
+        &task.id,
+        &operation_id,
+        terminal,
+        review.is_none(),
+    )
+    .await?;
     Ok(JsonOutput(status_value(id, status)))
 }
 

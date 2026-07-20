@@ -1250,7 +1250,7 @@ async fn complete_task(
             let agent = AgentSpec {
                 name: scheduler_agent_name("task", &task_def.name, task_id),
                 instructions: format!(
-                    "Verification failed for this task. Repair the failure, rerun the declared verification commands, and commit the fix.\n\n{}",
+                    "Verification failed for this task. Repair the failure and rerun the declared verification commands.\n\n{}",
                     task_def.instructions
                 ),
                 profile: agent_def.profile,
@@ -1593,7 +1593,7 @@ async fn repair_phase_task(
         controller,
         agent_id,
         format!(
-            "Repair these phase review findings, rerun verification, and commit:\n{repair}\n\n{}",
+            "Repair these phase review findings and rerun verification:\n{repair}\n\n{}",
             task_def.instructions
         ),
     )
@@ -1905,7 +1905,7 @@ async fn review_task(
             controller,
             &agent_id,
             format!(
-                "Repair these review findings, rerun verification, and commit:\n{repair}\n\n{}",
+                "Repair these review findings and rerun verification:\n{repair}\n\n{}",
                 task_def.instructions
             ),
         )

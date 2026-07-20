@@ -17,7 +17,7 @@ Check `.flowdex/workflows` before authoring. Reuse `repo:defaults/worker-reviewe
 
 ## Author a run
 
-Declare strict input, agents, phases, and tasks. Agents that change files must commit every modification with a brief summary.
+Declare strict input, agents, phases, and tasks. Agents finish with a brief summary; Flowdex commits successful task changes and records attribution.
 
 ```js
 const input = flowdex.requireInput({

@@ -6,7 +6,7 @@ current commit. The returned handle has exactly four operations:
 ```js
 const task = await flowdex.createTask({
   name: "update-parser",
-  instructions: "Update the parser and commit the change.",
+  instructions: "Update the parser.",
   readScope: ["codex-rs/parser/**"],
   writeScope: ["codex-rs/parser/**"],
   verification: ["cargo test -p codex-parser"],
@@ -14,7 +14,7 @@ const task = await flowdex.createTask({
 
 const result = await task.runAgent({
   name: "parser-implementer",
-  instructions: "Implement the task and commit modifications with a brief summary.",
+  instructions: "Implement the task and finish with a brief summary.",
   profile: "implementation_worker",
 });
 const checked = await task.verify();
@@ -30,8 +30,9 @@ const integrated = await task.integrate();
 { agentId, status: "notFound" }
 ```
 
-The agent must commit modifications before finishing; an unchanged task needs
-no commit. Scopes are advisory declarations, not access controls. Roles and
+After a successful task turn, Flowdex commits modifications from the isolated
+worktree and attributes that commit to the agent operation. An unchanged task
+needs no commit. Scopes are advisory declarations, not access controls. Roles and
 repair loops remain defined by workflow instructions. A task-associated agent
 can be continued through the existing `flowdex.resumeAgent` operation, which
 also preserves task serialization and attribution:
@@ -39,7 +40,7 @@ also preserves task serialization and attribution:
 ```js
 if (result.status !== "completed") {
   await flowdex.resumeAgent(result.agentId,
-    "Repair the task, commit every modification, then finish.",
+    "Repair the task, then finish with a brief summary.",
     { contextMode: "keep" });
 }
 ```

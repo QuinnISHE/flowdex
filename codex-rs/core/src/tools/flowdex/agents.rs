@@ -458,6 +458,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 task_id,
                 &submission_id,
                 terminal_state(&status),
+                true,
             )
             .await?;
         }
@@ -481,6 +482,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 task_id,
                 &handoff_submission_id,
                 terminal_state(&handoff_status),
+                false,
             )
             .await?;
         }
@@ -598,6 +600,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 &task_id,
                 &child.initial_submission_id,
                 terminal_state(&replacement_status),
+                true,
             )
             .await?;
         }
@@ -623,6 +626,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             task_id,
             &submission_id,
             terminal_state(&status),
+            true,
         )
         .await?;
     }

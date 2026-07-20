@@ -15,7 +15,7 @@ const run = await flowdex.startRun({
   phases: [
     {
       name: "implementation",
-      instructions: "Implement the record-layout changes and commit each task.",
+      instructions: "Implement the record-layout changes.",
       boundary: "continue",
       review: { agent: "fast_fix", instructions: "Review the integrated phase changes.", maxRounds: 2 },
       verification: ["cargo test -p record-layout"],
@@ -79,7 +79,7 @@ const run = await flowdex.startRun({
   agents: { implementer: { profile: "implementation_worker" } },
   phases: [{
     name: "work",
-    instructions: "Resolve the reported issue and commit the change.",
+    instructions: "Resolve the reported issue.",
     open: true,
     tasks: [],
   }],

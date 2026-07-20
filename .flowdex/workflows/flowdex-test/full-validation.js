@@ -79,7 +79,7 @@ const run = await flowdex.startRun({
           name: "review-repair",
           agent: "worker_a",
           instructions:
-            "The required final value is answer: blue. For the first implementation, deliberately create flowdex-test/results/review-target.md with exactly one incorrect line: answer: red, then commit it. When the reviewer reports that defect, replace red with blue and commit the repair.",
+            "The required final value is answer: blue. For the first implementation, deliberately create flowdex-test/results/review-target.md with exactly one incorrect line: answer: red. When the reviewer reports that defect, replace red with blue.",
           writeScope: ["flowdex-test/results/review-target.md"],
           verification: ["git diff --check"],
           verificationRepairLimit: 1,

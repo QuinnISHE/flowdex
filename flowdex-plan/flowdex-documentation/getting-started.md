@@ -43,7 +43,7 @@ const run = await flowdex.startRun({
   },
   phases: [{
     name: "inspect",
-    instructions: "Inspect the requested files and commit changes.",
+    instructions: "Inspect the requested files and make the required changes.",
     open: true,
     tasks: [
       { name: "scan", agent: "editor", instructions: `Check ${input.files.join(", ")}.`, context: ["conventions"], verification: ["git diff --check"] },
