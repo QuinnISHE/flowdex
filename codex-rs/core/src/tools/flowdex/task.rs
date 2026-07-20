@@ -72,6 +72,21 @@ fn associate(id: ThreadId, task: &str) {
         map.insert(id, task.to_string());
     }
 }
+pub(crate) fn agents_for_task(task: &str) -> Vec<ThreadId> {
+    associations()
+        .lock()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(id, associated)| (associated == task).then_some(*id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+pub(crate) fn forget_task_agents(task: &str) {
+    if let Ok(mut map) = associations().lock() {
+        map.retain(|_, associated| associated != task);
+    }
+}
 async fn task_gate(task: &str) -> OwnedMutexGuard<()> {
     let gate = gates()
         .lock()

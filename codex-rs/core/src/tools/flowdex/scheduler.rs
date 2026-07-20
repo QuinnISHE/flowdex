@@ -578,7 +578,8 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
 
 async fn remove_run_controller(run_id: &str) {
     if let Some(controller) = runs().lock().await.remove(run_id) {
-        let _ = tokio::task::spawn_blocking(move || drop(controller)).await;
+        // Terminal delivery must not wait for potentially blocking store disposal.
+        let _ = tokio::task::spawn_blocking(move || drop(controller));
     }
 }
 
@@ -763,6 +764,7 @@ async fn run_phase(
             .await?;
             if phase.review.is_some() {
                 for task in &all {
+                    close_task_agents(controller, &task.task_id).await?;
                     let store = Arc::clone(&controller.store);
                     let task_id = task.task_id.clone();
                     tokio::task::spawn_blocking(move || store.cleanup_task_worktree(&task_id))
@@ -1088,9 +1090,14 @@ async fn collect_context(
         tool_profile: agent_definition.tool_profile,
     };
     let result = run_task_handler(controller.invocation.clone(), task_id.clone(), agent).await;
-    let cleanup = task::integrate_task(controller.invocation.clone(), task_id)
-        .await
-        .map_err(|e| format!("context collector cleanup failed for {pack}: {e}"));
+    let cleanup = match close_task_agents(controller, &task_id).await {
+        Ok(()) => task::integrate_task(controller.invocation.clone(), task_id)
+            .await
+            .map_err(|e| format!("context collector cleanup failed for {pack}: {e}")),
+        Err(error) => Err(format!(
+            "context collector cleanup failed for {pack}: {error}"
+        )),
+    };
     match result {
         Ok(_) => {
             cleanup?;
@@ -1100,6 +1107,21 @@ async fn collect_context(
             return Err(format!("context collector failed for {pack}: {error}"));
         }
     }
+    Ok(())
+}
+
+async fn close_task_agents(controller: &RunController, task_id: &str) -> Result<(), String> {
+    for agent_id in task::agents_for_task(task_id) {
+        controller
+            .invocation
+            .session
+            .services
+            .agent_control
+            .close_agent(agent_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    task::forget_task_agents(task_id);
     Ok(())
 }
 
@@ -1233,6 +1255,11 @@ async fn complete_task(
         format!("Integrating task: {}", task_def.name),
     )
     .await;
+    if !retain_worktree {
+        close_task_agents(controller, task_id)
+            .await
+            .map_err(|error| ("integration".to_string(), error))?;
+    }
     run_integrate_handler(
         controller.invocation.clone(),
         task_id.to_string(),
