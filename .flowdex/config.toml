@@ -1,0 +1,2 @@
+# The validation workflow deliberately mixes Sol and Luna agents.
+multi_agent_version = "v1"

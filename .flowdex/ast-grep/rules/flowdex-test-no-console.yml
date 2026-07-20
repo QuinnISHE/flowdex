@@ -1,0 +1,6 @@
+id: flowdex-test-no-console
+language: JavaScript
+rule:
+  pattern: console.log($$$ARGS)
+message: Flowdex validation detected the intentional console call
+severity: warning
