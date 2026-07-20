@@ -1,5 +1,7 @@
 flowdex
 flowdex.exe
 codex.exe
+codex-command-runner.exe
+codex-windows-sandbox-setup.exe
 *.zip
 *.tar.gz

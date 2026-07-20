@@ -587,6 +587,28 @@ async fn remove_run_controller(run_id: &str) {
     }
 }
 
+pub(super) async fn wait_for_run_failure(run_id: String) -> String {
+    let Some(controller) = runs().lock().await.get(&run_id).cloned() else {
+        return std::future::pending().await;
+    };
+    let mut status = controller.status_rx.clone();
+    loop {
+        let current = status.borrow_and_update().clone();
+        match current {
+            RunStatus::Running => {
+                if status.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+            RunStatus::Completed => return std::future::pending().await,
+            RunStatus::Failed(error) => {
+                remove_run_controller(&run_id).await;
+                return error;
+            }
+        }
+    }
+}
+
 async fn run_scheduler(controller: Arc<RunController>) {
     let result = tokio::select! {
         _ = controller.invocation.cancellation_token.cancelled() => {

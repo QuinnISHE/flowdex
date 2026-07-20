@@ -578,6 +578,8 @@ impl WaitFlowdexWorkflowHandler {
 
         let mut boundary_wait = Box::pin(wait_for_flowdex_boundary(args.run_id.clone()));
         let mut signal_wait = Box::pin(signal_waiter(args.run_id.clone()));
+        let mut scheduler_failure_wait =
+            Box::pin(scheduler::wait_for_run_failure(args.run_id.clone()));
         if matches!(pending_activity, Some(InputQueueActivity::Mailbox))
             && session.input_queue.has_trigger_turn_mailbox_items().await
         {
@@ -587,7 +589,12 @@ impl WaitFlowdexWorkflowHandler {
             )));
         }
 
-        let mut cell_wait = Box::pin(session.services.code_mode_service.wait_until_yield(cell_id));
+        let mut cell_wait = Box::pin(
+            session
+                .services
+                .code_mode_service
+                .wait_until_yield(cell_id.clone()),
+        );
         loop {
             tokio::select! {
                 biased;
@@ -624,6 +631,36 @@ impl WaitFlowdexWorkflowHandler {
                         session.services.elicitations.wait_until_clear().await;
                     }
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(result.to_string(), Some(true))));
+                }
+                error = &mut scheduler_failure_wait => {
+                    if let Ok(codex_code_mode::WaitOutcome::LiveCell(response)) = session
+                        .services
+                        .code_mode_service
+                        .terminate(cell_id.clone())
+                        .await
+                    {
+                        session
+                            .services
+                            .rollout_thread_trace
+                            .code_cell_trace_context(&turn.sub_id, cell_id.as_str())
+                            .record_ended(&response);
+                    }
+                    session.services.code_mode_service.finish_cell_dispatch(&cell_id);
+                    workflow_chains()
+                        .lock()
+                        .expect("workflow chain mutex poisoned")
+                        .remove(cell_id.as_str());
+                    remove_workflow_run(cell_id.as_str());
+                    session.services.elicitations.wait_until_clear().await;
+                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        serde_json::json!({
+                            "runId": args.run_id,
+                            "status": "failed",
+                            "error": agents::truncate_message(&error),
+                        })
+                        .to_string(),
+                        Some(false),
+                    )));
                 }
                 pending = &mut signal_wait => {
                     let pending_steer = match turn_state.as_deref() {
