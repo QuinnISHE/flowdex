@@ -951,12 +951,14 @@ async fn start_flowdex_workflow_bounds_javascript_errors() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flowdex_workflow_spawns_and_waits_without_parent_completion_notification() -> Result<()> {
+async fn flowdex_workflow_spawns_in_default_tool_mode_without_parent_completion_notification()
+-> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex()
         .with_model("gpt-5.2")
         .with_config(|config| {
-            config.features.enable(Feature::CodeMode).unwrap();
+            config.flowdex_config.multi_agent_version =
+                Some(codex_flowdex::FlowdexMultiAgentVersion::V1);
         })
         .with_workspace_setup(|cwd, _fs| async move {
             let workflow_dir = cwd.join(".flowdex/workflows");

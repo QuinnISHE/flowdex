@@ -31,12 +31,10 @@ use crate::tools::ToolRouter;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolPayload;
-use crate::tools::effective_tool_mode;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::unified_exec::resolve_max_tokens;
-use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
@@ -145,21 +143,17 @@ impl CodeModeService {
         step_context: Arc<StepContext>,
         router: Arc<ToolRouter>,
         tracker: SharedTurnDiffTracker,
-    ) -> Option<CodeModeDispatchWorker> {
+    ) -> CodeModeDispatchWorker {
         let turn = &step_context.turn;
-        let tool_mode = effective_tool_mode(turn);
-        if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
-            return None;
-        }
-
+        // Saved Flowdex workflows use the code-mode runtime even when the
+        // parent model is using ordinary tools, so every turn must be able to
+        // service a live workflow cell's hidden tool calls.
         let exec = ExecContext {
             session: Arc::clone(session),
             turn: Arc::clone(turn),
         };
-        Some(
-            self.dispatch_broker
-                .start_turn_worker(exec, router, step_context, tracker),
-        )
+        self.dispatch_broker
+            .start_turn_worker(exec, router, step_context, tracker)
     }
 
     async fn session(&self) -> Result<Arc<dyn CodeModeSession>, String> {
