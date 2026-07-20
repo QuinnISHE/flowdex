@@ -11,6 +11,14 @@ use thiserror::Error;
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 150_000;
 pub const DEFAULT_AST_GREP_CANDIDATE_THRESHOLD: i64 = 3;
 
+/// Multi-agent backend version selected by Flowdex configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowdexMultiAgentVersion {
+    V1,
+    V2,
+}
+
 /// Resolved Flowdex settings used by a session.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowdexConfig {
@@ -18,6 +26,7 @@ pub struct FlowdexConfig {
     pub ast_grep_candidate_threshold: i64,
     pub ast_grep_always_run: Vec<String>,
     pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
+    pub multi_agent_version: Option<FlowdexMultiAgentVersion>,
 }
 
 /// Tool-related configuration that can be selected by a Flowdex agent.
@@ -45,6 +54,7 @@ pub fn load_config(
     let mut ast_grep_candidate_threshold = DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
+    let mut multi_agent_version = None;
 
     if let Some(config) = read_partial(&global_path)? {
         if let Some(value) = config.compaction_reminder_threshold_tokens {
@@ -60,6 +70,9 @@ pub fn load_config(
             ast_grep_always_run = value;
         }
         tool_profiles.extend(config.tool_profiles);
+        if let Some(value) = config.multi_agent_version {
+            multi_agent_version = Some(value);
+        }
     }
 
     if let Some(repository_root) = trusted_repository_root {
@@ -78,6 +91,9 @@ pub fn load_config(
                 ast_grep_always_run = value;
             }
             tool_profiles.extend(config.tool_profiles);
+            if let Some(value) = config.multi_agent_version {
+                multi_agent_version = Some(value);
+            }
         }
     }
 
@@ -86,6 +102,7 @@ pub fn load_config(
         ast_grep_candidate_threshold,
         ast_grep_always_run,
         tool_profiles,
+        multi_agent_version,
     })
 }
 
@@ -95,6 +112,7 @@ struct PartialFlowdexConfig {
     compaction_reminder_threshold_tokens: Option<i64>,
     ast_grep_candidate_threshold: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
+    multi_agent_version: Option<FlowdexMultiAgentVersion>,
     #[serde(default)]
     tool_profiles: BTreeMap<String, ToolProfileConfig>,
 }
@@ -249,6 +267,62 @@ mod tests {
         assert_eq!(
             config(temp.path(), Some(&repository_root)).ast_grep_always_run,
             ["global-rule"]
+        );
+    }
+
+    #[test]
+    fn parses_and_merges_multi_agent_version_with_repository_precedence() {
+        let temp = tempdir().expect("temp dir");
+        let repository_root = temp.path().join("repo");
+        fs::create_dir_all(repository_root.join(".flowdex")).expect("repository config dir");
+
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).multi_agent_version,
+            None
+        );
+
+        fs::write(
+            temp.path().join("flowdex.toml"),
+            "multi_agent_version = \"v1\"\n",
+        )
+        .expect("global config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).multi_agent_version,
+            Some(FlowdexMultiAgentVersion::V1)
+        );
+
+        fs::write(repository_root.join(".flowdex/config.toml"), "# omitted\n")
+            .expect("repository omission");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).multi_agent_version,
+            Some(FlowdexMultiAgentVersion::V1)
+        );
+
+        fs::write(
+            repository_root.join(".flowdex/config.toml"),
+            "multi_agent_version = \"v2\"\n",
+        )
+        .expect("repository config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).multi_agent_version,
+            Some(FlowdexMultiAgentVersion::V2)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_multi_agent_version_with_path() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("flowdex.toml");
+        fs::write(&path, "multi_agent_version = \"v3\"\n").expect("global config");
+
+        let error = load_config(temp.path(), None).expect_err("invalid multi-agent version");
+        let message = error.to_string();
+        assert!(message.contains("invalid Flowdex config"), "{message}");
+        assert!(message.contains("multi_agent_version"), "{message}");
+        assert!(message.contains("v3"), "{message}");
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
         );
     }
 

@@ -41,6 +41,7 @@ pub use config::DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
 pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
+pub use config::FlowdexMultiAgentVersion;
 pub use config::load_config;
 pub use context::ContextError;
 pub use context::ContextFragment;

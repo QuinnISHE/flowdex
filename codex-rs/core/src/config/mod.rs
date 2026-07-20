@@ -1435,6 +1435,19 @@ impl ConfigBuilder {
 
 impl Config {
     pub(crate) fn multi_agent_version_override(&self) -> Option<MultiAgentVersion> {
+        if self.flowdex_config.multi_agent_version.is_some() {
+            if !self.agents_enabled {
+                return Some(MultiAgentVersion::Disabled);
+            }
+            return self
+                .flowdex_config
+                .multi_agent_version
+                .as_ref()
+                .map(|version| match version {
+                    codex_flowdex::FlowdexMultiAgentVersion::V1 => MultiAgentVersion::V1,
+                    codex_flowdex::FlowdexMultiAgentVersion::V2 => MultiAgentVersion::V2,
+                });
+        }
         if self.features.enabled(Feature::MultiAgentV2) {
             Some(MultiAgentVersion::V2)
         } else if !self.agents_enabled {
@@ -4477,6 +4490,58 @@ pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
 /// that the directory exists.
 pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
     Ok(cfg.log_dir.clone())
+}
+
+#[cfg(test)]
+mod flowdex_multi_agent_version_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn flowdex_v1_overrides_v2_model_metadata() {
+        let mut config = test_config().await;
+        config.flowdex_config.multi_agent_version =
+            Some(codex_flowdex::FlowdexMultiAgentVersion::V1);
+
+        assert_eq!(
+            config.multi_agent_version_for_model(Some(MultiAgentVersion::V2)),
+            MultiAgentVersion::V1
+        );
+    }
+
+    #[tokio::test]
+    async fn flowdex_v2_overrides_v1_model_metadata() {
+        let mut config = test_config().await;
+        config.flowdex_config.multi_agent_version =
+            Some(codex_flowdex::FlowdexMultiAgentVersion::V2);
+
+        assert_eq!(
+            config.multi_agent_version_for_model(Some(MultiAgentVersion::V1)),
+            MultiAgentVersion::V2
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_flowdex_override_preserves_model_resolution() {
+        let config = test_config().await;
+
+        assert_eq!(
+            config.multi_agent_version_for_model(Some(MultiAgentVersion::V2)),
+            MultiAgentVersion::V2
+        );
+    }
+
+    #[tokio::test]
+    async fn flowdex_override_does_not_enable_unavailable_agents() {
+        let mut config = test_config().await;
+        config.agents_enabled = false;
+        config.flowdex_config.multi_agent_version =
+            Some(codex_flowdex::FlowdexMultiAgentVersion::V1);
+
+        assert_eq!(
+            config.multi_agent_version_for_model(Some(MultiAgentVersion::V2)),
+            MultiAgentVersion::Disabled
+        );
+    }
 }
 
 #[cfg(test)]
