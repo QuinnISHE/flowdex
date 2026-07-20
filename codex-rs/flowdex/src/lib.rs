@@ -765,7 +765,7 @@ fn build_loaded_workflow(
         serde_json::to_string(workflow_path).map_err(WorkflowLoadError::serialize_bootstrap)?;
     Ok(LoadedWorkflow {
         source: format!(
-            "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => {{\n    if (spec === null || typeof spec !== \"object\" || Array.isArray(spec)) throw new TypeError(\"flowdex.spawnAgent expects an object\");\n    const {{ reasoningEffort, toolProfile, ...fields }} = spec;\n    return tools.flowdex_spawn_agent({{ ...fields, reasoning_effort: reasoningEffort, tool_profile: toolProfile }});\n  }},\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
+            "{OUTPUT_TRACKING_BOOTSTRAP}\nconst flowdex = Object.freeze({{\n  input: {input},\n  workflowPath: {workflow_path},\n  spawnAgent: async (spec) => {{\n    if (spec === null || typeof spec !== \"object\" || Array.isArray(spec)) throw new TypeError(\"flowdex.spawnAgent expects an object\");\n    const {{ reasoningEffort, toolProfile, ...fields }} = spec;\n    return tools.flowdex_spawn_agent({{ ...fields, reasoning_effort: reasoningEffort, tool_profile: toolProfile }});\n  }},\n  sendMessage: async (agentId, message, options = {{}}) => tools.flowdex_send_message({{\n    agent_id: agentId,\n    message,\n    delivery: options.delivery ?? \"queue\",\n  }}),\n  waitAgent: async (agentId) => tools.flowdex_wait_agent({{ agent_id: agentId }}),\n{CHECK_RULES_BOOTSTRAP}{RESUME_AGENT_BOOTSTRAP}{TASK_BOOTSTRAP}{START_RUN_BOOTSTRAP}{INPUT_OUTPUT_BOOTSTRAP}  verify: async (commands, options = {{}}) => tools.flowdex_verify({{\n    commands,\n    workdir: options.workdir,\n    timeout_ms: options.timeoutMs,\n  }}),\n}});\n\n{source}"
         ),
     })
 }
@@ -1356,6 +1356,7 @@ mod tests {
                 .source
                 .contains("workflowPath: \"global:checks/lint\"")
         );
+        assert!(loaded.source.contains("checkRules: async"));
     }
 
     #[cfg(unix)]
