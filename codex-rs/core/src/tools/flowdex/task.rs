@@ -542,7 +542,7 @@ pub(crate) async fn handle_run_with_review(
             "runAgent requires profile, model, or reasoningEffort".into(),
         ));
     }
-    let (store, _cwd, _) = task_store(&invocation).await?;
+    let (store, _cwd, repository_git_dir) = task_store(&invocation).await?;
     let task = tokio::task::spawn_blocking({
         let id = args.task_id.clone();
         move || store.task(&id)
@@ -589,15 +589,19 @@ pub(crate) async fn handle_run_with_review(
         .unwrap_or(&task.worktree_path);
     let task_cwd = AbsolutePathBuf::from_absolute_path(execution_worktree)
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let git_dir = AbsolutePathBuf::from_absolute_path(PathBuf::from(repository_git_dir))
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+    let workspace_roots = vec![task_cwd.clone(), git_dir.clone()];
     config.cwd = task_cwd.clone();
-    config.workspace_roots = vec![task_cwd.clone()];
-    config
-        .permissions
-        .set_workspace_roots(vec![task_cwd.clone()]);
+    config.workspace_roots = workspace_roots.clone();
+    config.permissions.set_workspace_roots(workspace_roots);
     let mut environments = invocation.turn.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
-        environment.workspace_roots = vec![PathUri::from_abs_path(&task_cwd)];
+        environment.workspace_roots = vec![
+            PathUri::from_abs_path(&task_cwd),
+            PathUri::from_abs_path(&git_dir),
+        ];
     }
     let depth = next_thread_spawn_depth(&invocation.turn.session_source);
     if exceeds_thread_spawn_depth_limit(depth, invocation.turn.config.agent_max_depth) {
