@@ -2,6 +2,8 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use codex_core::config::find_codex_home;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -58,10 +60,19 @@ fn is_flowdex_executable(path: &Path) -> bool {
 }
 
 pub async fn run_standalone() -> Result<()> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if is_standalone_version_request(&args[1..]) {
+        println!("codex-cli {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     run(FlowdexCli {
-        subcommand: StandaloneFlowdexCli::parse().subcommand,
+        subcommand: StandaloneFlowdexCli::parse_from(args).subcommand,
     })
     .await
+}
+
+fn is_standalone_version_request(args: &[OsString]) -> bool {
+    args.len() == 1 && args[0] == OsStr::new("--version")
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -657,8 +668,8 @@ fn validate_version_output(success: bool, stdout: &[u8], _stderr: &[u8]) -> Resu
     let output = std::str::from_utf8(stdout).context("version output was not UTF-8")?;
     let output = output.strip_suffix('\n').unwrap_or(output);
     let output = output.strip_suffix('\r').unwrap_or(output);
-    let Some(version) = output.strip_prefix("codex ") else {
-        anyhow::bail!("version output does not match `codex <version>`");
+    let Some(version) = output.strip_prefix("codex-cli ") else {
+        anyhow::bail!("version output does not match `codex-cli <version>`");
     };
     if version.is_empty()
         || version.chars().any(char::is_whitespace)
@@ -666,7 +677,7 @@ fn validate_version_output(success: bool, stdout: &[u8], _stderr: &[u8]) -> Resu
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || ".+-".contains(character))
     {
-        anyhow::bail!("version output does not match `codex <version>`");
+        anyhow::bail!("version output does not match `codex-cli <version>`");
     }
     Ok(())
 }
@@ -811,12 +822,13 @@ mod tests {
 
     #[test]
     fn version_output_must_succeed_and_identify_codex() {
-        assert!(validate_version_output(true, b"codex 1.2.3", b"").is_ok());
-        assert!(validate_version_output(true, b"codex 1.2.3\n", b"").is_ok());
-        assert!(validate_version_output(false, b"codex 1.2.3", b"").is_err());
+        assert!(validate_version_output(true, b"codex-cli 1.2.3", b"").is_ok());
+        assert!(validate_version_output(true, b"codex-cli 1.2.3\n", b"").is_ok());
+        assert!(validate_version_output(false, b"codex-cli 1.2.3", b"").is_err());
         assert!(validate_version_output(true, b"not a codex-compatible tool", b"").is_err());
-        assert!(validate_version_output(true, b"", b"codex 1.2.3").is_err());
-        assert!(validate_version_output(true, b"codex", b"").is_err());
+        assert!(validate_version_output(true, b"", b"codex-cli 1.2.3").is_err());
+        assert!(validate_version_output(true, b"codex 1.2.3", b"").is_err());
+        assert!(validate_version_output(true, b"codex-cli", b"").is_err());
     }
 
     #[test]
@@ -844,6 +856,13 @@ mod tests {
         assert!(is_flowdex_executable(Path::new("/tmp/Flowdex")));
         assert!(!is_flowdex_executable(Path::new("codex.exe")));
         assert!(StandaloneFlowdexCli::try_parse_from(["flowdex", "install"]).is_ok());
+        assert!(is_standalone_version_request(&[OsString::from(
+            "--version"
+        )]));
+        assert!(!is_standalone_version_request(&[
+            OsString::from("--version"),
+            OsString::from("install")
+        ]));
         let uninstall =
             StandaloneFlowdexCli::try_parse_from(["flowdex", "uninstall"]).expect("uninstall");
         assert!(matches!(
