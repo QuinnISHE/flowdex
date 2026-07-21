@@ -117,7 +117,7 @@ impl ToolExecutor<ToolInvocation> for FlowdexReviewReportHandler {
         );
         ToolSpec::Function(ResponsesApiTool {
             name: REPORT.to_string(),
-            description: "Submit exactly one structured Flowdex review report.".to_string(),
+            description: "Submit the active Flowdex review's single durable result. Use findings: [] to pass. For each defect, point to the smallest current inclusive line range and explain the broken behavior and required correction. Set astGrepSuitable only for a repeatable syntax-shaped defect and provide a stable ruleKey. Do not guess attribution, message the worker, or finish with a separate prose verdict; Flowdex routes accepted findings automatically.".to_string(),
             strict: true,
             defer_loading: None,
             parameters: JsonSchema::object(

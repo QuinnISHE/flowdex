@@ -1,4 +1,0 @@
-interface:
-  display_name: "Collect Flowdex Context"
-  short_description: "Publish and consume durable context packs"
-  default_prompt: "Use $collect-flowdex-context to collect a Flowdex context pack for this task."

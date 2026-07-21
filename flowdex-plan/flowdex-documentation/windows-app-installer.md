@@ -29,10 +29,9 @@ and creates these files when they are missing:
 - `$CODEX_HOME/flowdex.toml` with every global option populated at its default (`185000` compaction reminder tokens, multi-agent V1, AST-grep candidate threshold `3`, no always-run rules, and no tool profiles). Reinstall adds missing options to a valid existing config without replacing existing values.
 - `$CODEX_HOME/flowdex/workflows/defaults/research-rounds.js`
 - `$CODEX_HOME/flowdex/workflows/defaults/worker-reviewer.js`
-- each skill's `SKILL.md` and `agents/openai.yaml` under
-  `$CODEX_HOME/skills/{collect-flowdex-context,report-flowdex-review,run-flowdex-workflows}/`
+- the `run-flowdex-workflows` skill, UI metadata, and standalone JavaScript examples under `$CODEX_HOME/skills/run-flowdex-workflows/`
 
-Install never overwrites an existing config, workflow, or skill file. It records
+Install preserves existing config values, workflows, and user-owned skill files. It adds missing config options, updates its own workflow skill, and removes retired skills only when its manifest owns them. It records
 only the files it creates in `$CODEX_HOME/flowdex/installed-assets-v1`. Normal
 uninstall preserves all global assets and user data. `uninstall --purge` removes
 the installer-owned files recorded there, but preserves pre-existing or

@@ -62,7 +62,7 @@ impl CoreToolRuntime for ReadFlowdexContextHandler {}
 fn publish_spec() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: PUBLISH.into(),
-        description: "Publish a source-backed Flowdex context fragment.".into(),
+        description: "Publish one bounded source-backed fragment for the active Flowdex context collection. Use a stable descriptive key, a repository-relative path, and the smallest complete inclusive line range that proves one fact. Publish separate facts separately; publishing the same pack/key supersedes its prior version. The collection is incomplete until at least one fresh fragment is accepted. Do not paste source contents into a prose response.".into(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -90,7 +90,7 @@ fn publish_spec() -> ToolSpec {
 fn read_spec() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: READ.into(),
-        description: "Read the resolved Flowdex context pack.".into(),
+        description: "Inspect the active Flowdex context pack associated with this task agent. Returns fresh, missing, or stale status and bounded source fragments. Normal dependent-task injection is automatic; use this only to diagnose or verify collection state.".into(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

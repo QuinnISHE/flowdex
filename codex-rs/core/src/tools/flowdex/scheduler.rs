@@ -1112,7 +1112,7 @@ async fn collect_context(
         )
     };
     let instructions = format!(
-        "Collect context pack `{pack}`.\n\n{}{}\n\nPublish fresh source-backed fragments with publish_flowdex_context({{pack,key,path,line_start,line_end,summary?}}). Do not return source context through the orchestrator.",
+        "Collect context pack `{pack}`.\n\n{}{}\n\nUse publish_flowdex_context to publish one or more fresh, bounded source-backed fragments. The collection is incomplete until the tool accepts a fresh fragment. Do not return source context through the orchestrator or finish with prose only.",
         pack_definition.instructions, stale
     );
     let collector_suffix = Uuid::new_v4().simple().to_string();
@@ -1140,7 +1140,9 @@ async fn collect_context(
     let agent = AgentSpec {
         name: format!("context_collector_{collector_suffix}"),
         display_name: Some(format!("{} context", pack)),
-        instructions: "Collect and publish the context pack described above.".into(),
+        instructions:
+            "Publish the requested bounded context with publish_flowdex_context before finishing."
+                .into(),
         profile: agent_definition.profile,
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
@@ -1463,7 +1465,7 @@ async fn run_phase_review_rounds(
             name: scheduler_agent_name("review", &phase.name, &operation_id),
             display_name: Some(format!("{} reviewer", phase.name)),
             instructions: format!(
-                "{}\n\nReview the integrated phase diff below against the phase requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nPhase requirements:\n{}\n\nIntegrated diff:\n{}",
+                "{}\n\nReview the integrated phase diff below against the phase requirements and verification result. Your review is incomplete until report_flowdex_review accepts exactly one report; submit an empty findings array when it passes. Do not finish with prose only or message a worker directly.\n\nPhase requirements:\n{}\n\nIntegrated diff:\n{}",
                 review.instructions, phase.instructions, diff
             ),
             profile: reviewer.profile.clone(),
@@ -1869,7 +1871,7 @@ async fn review_task_rounds(
             name: scheduler_agent_name("review", &task_def.name, &operation_id),
             display_name: Some(format!("{} reviewer", task_def.name)),
             instructions: format!(
-                "{}\n\nReview the committed task diff below against the task requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nTask requirements:\n{}\n\nCommitted diff:\n{}",
+                "{}\n\nReview the committed task diff below against the task requirements and verification result. Your review is incomplete until report_flowdex_review accepts exactly one report; submit an empty findings array when it passes. Do not finish with prose only or message the worker directly.\n\nTask requirements:\n{}\n\nCommitted diff:\n{}",
                 review.instructions, task.instructions, diff
             ),
             profile: reviewer.profile.clone(),

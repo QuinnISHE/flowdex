@@ -28,6 +28,21 @@ const WINDOWS_HELPERS: &[&str] = &[
     "codex-command-runner.exe",
 ];
 
+const RETIRED_BUNDLED_ASSETS: &[&str] = &[
+    "skills/collect-flowdex-context/SKILL.md",
+    "skills/collect-flowdex-context/agents/openai.yaml",
+    "skills/report-flowdex-review/SKILL.md",
+    "skills/report-flowdex-review/agents/openai.yaml",
+];
+
+const UPDATED_BUNDLED_ASSETS: &[&str] = &[
+    "skills/run-flowdex-workflows/SKILL.md",
+    "skills/run-flowdex-workflows/agents/openai.yaml",
+    "skills/run-flowdex-workflows/examples/implementation-run.js",
+    "skills/run-flowdex-workflows/examples/agent-rounds.js",
+    "skills/run-flowdex-workflows/examples/reusable-workflow.js",
+];
+
 struct BundledAsset {
     relative_path: &'static str,
     contents: &'static str,
@@ -47,28 +62,30 @@ const BUNDLED_ASSETS: &[BundledAsset] = &[
         contents: include_str!("../../../.flowdex/workflows/defaults/worker-reviewer.js"),
     },
     BundledAsset {
-        relative_path: "skills/collect-flowdex-context/SKILL.md",
-        contents: include_str!("../../../.codex/skills/collect-flowdex-context/SKILL.md"),
-    },
-    BundledAsset {
-        relative_path: "skills/collect-flowdex-context/agents/openai.yaml",
-        contents: include_str!("../../../.codex/skills/collect-flowdex-context/agents/openai.yaml"),
-    },
-    BundledAsset {
-        relative_path: "skills/report-flowdex-review/SKILL.md",
-        contents: include_str!("../../../.codex/skills/report-flowdex-review/SKILL.md"),
-    },
-    BundledAsset {
-        relative_path: "skills/report-flowdex-review/agents/openai.yaml",
-        contents: include_str!("../../../.codex/skills/report-flowdex-review/agents/openai.yaml"),
-    },
-    BundledAsset {
         relative_path: "skills/run-flowdex-workflows/SKILL.md",
         contents: include_str!("../../../.codex/skills/run-flowdex-workflows/SKILL.md"),
     },
     BundledAsset {
         relative_path: "skills/run-flowdex-workflows/agents/openai.yaml",
         contents: include_str!("../../../.codex/skills/run-flowdex-workflows/agents/openai.yaml"),
+    },
+    BundledAsset {
+        relative_path: "skills/run-flowdex-workflows/examples/implementation-run.js",
+        contents: include_str!(
+            "../../../.codex/skills/run-flowdex-workflows/examples/implementation-run.js"
+        ),
+    },
+    BundledAsset {
+        relative_path: "skills/run-flowdex-workflows/examples/agent-rounds.js",
+        contents: include_str!(
+            "../../../.codex/skills/run-flowdex-workflows/examples/agent-rounds.js"
+        ),
+    },
+    BundledAsset {
+        relative_path: "skills/run-flowdex-workflows/examples/reusable-workflow.js",
+        contents: include_str!(
+            "../../../.codex/skills/run-flowdex-workflows/examples/reusable-workflow.js"
+        ),
     },
 ];
 
@@ -434,6 +451,7 @@ fn install_bundled_assets(codex_home: &Path) -> Result<()> {
     let known_paths = BUNDLED_ASSETS
         .iter()
         .map(|asset| asset.relative_path)
+        .chain(RETIRED_BUNDLED_ASSETS.iter().copied())
         .collect::<BTreeSet<_>>();
     let mut installed_paths = match fs::read_to_string(&manifest_path) {
         Ok(manifest) => manifest
@@ -447,6 +465,20 @@ fn install_bundled_assets(codex_home: &Path) -> Result<()> {
         }
     };
 
+    for relative_path in RETIRED_BUNDLED_ASSETS {
+        if installed_paths.remove(*relative_path) {
+            remove_file_if_exists(&codex_home.join(relative_path))?;
+        }
+    }
+    for relative_path in [
+        "skills/collect-flowdex-context/agents",
+        "skills/collect-flowdex-context",
+        "skills/report-flowdex-review/agents",
+        "skills/report-flowdex-review",
+    ] {
+        remove_empty_dir(&codex_home.join(relative_path))?;
+    }
+
     for asset in BUNDLED_ASSETS {
         let path = codex_home.join(asset.relative_path);
         let parent = path
@@ -454,6 +486,13 @@ fn install_bundled_assets(codex_home: &Path) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("bundled asset path has no parent"))?;
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
+        if installed_paths.contains(asset.relative_path)
+            && UPDATED_BUNDLED_ASSETS.contains(&asset.relative_path)
+        {
+            fs::write(&path, asset.contents)
+                .with_context(|| format!("cannot update {}", path.display()))?;
+            continue;
+        }
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -471,7 +510,9 @@ fn install_bundled_assets(codex_home: &Path) -> Result<()> {
 
     complete_existing_flowdex_config(&codex_home.join(FLOWDEX_CONFIG_PATH))?;
 
-    if !installed_paths.is_empty() {
+    if installed_paths.is_empty() {
+        remove_file_if_exists(&manifest_path)?;
+    } else {
         let contents = installed_paths.into_iter().collect::<Vec<_>>().join("\n") + "\n";
         fs::write(&manifest_path, contents)
             .with_context(|| format!("cannot write {}", manifest_path.display()))?;
@@ -538,6 +579,7 @@ fn purge_installed_assets(codex_home: &Path) -> Result<()> {
     let known_paths = BUNDLED_ASSETS
         .iter()
         .map(|asset| asset.relative_path)
+        .chain(RETIRED_BUNDLED_ASSETS.iter().copied())
         .collect::<BTreeSet<_>>();
     for relative_path in manifest.lines().filter(|path| known_paths.contains(*path)) {
         remove_file_if_exists(&codex_home.join(relative_path))?;
@@ -553,6 +595,7 @@ fn purge_installed_assets(codex_home: &Path) -> Result<()> {
         "skills/collect-flowdex-context",
         "skills/report-flowdex-review/agents",
         "skills/report-flowdex-review",
+        "skills/run-flowdex-workflows/examples",
         "skills/run-flowdex-workflows/agents",
         "skills/run-flowdex-workflows",
     ] {
@@ -1120,19 +1163,18 @@ mod tests {
         assert!(config.contains("multi_agent_version = \"v1\""));
         assert!(config.contains("compaction_reminder_threshold_tokens = 185000"));
         assert!(config.contains("[tool_profiles]"));
-        for skill in [
-            "collect-flowdex-context",
-            "report-flowdex-review",
-            "run-flowdex-workflows",
+        for relative_path in [
+            "skills/run-flowdex-workflows/SKILL.md",
+            "skills/run-flowdex-workflows/agents/openai.yaml",
+            "skills/run-flowdex-workflows/examples/implementation-run.js",
+            "skills/run-flowdex-workflows/examples/agent-rounds.js",
+            "skills/run-flowdex-workflows/examples/reusable-workflow.js",
         ] {
             assert!(
                 BUNDLED_ASSETS
                     .iter()
-                    .any(|asset| { asset.relative_path == format!("skills/{skill}/SKILL.md") })
+                    .any(|asset| asset.relative_path == relative_path)
             );
-            assert!(BUNDLED_ASSETS.iter().any(|asset| {
-                asset.relative_path == format!("skills/{skill}/agents/openai.yaml")
-            }));
         }
         assert!(!research.contains("profile:"));
         assert!(research.contains("flowdex.sendMessage("));
@@ -1202,6 +1244,68 @@ mod tests {
         let manifest =
             fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("manifest");
         assert!(!manifest.lines().any(|path| path == FLOWDEX_CONFIG_PATH));
+    }
+
+    #[test]
+    fn reinstall_removes_only_installer_owned_retired_skills() {
+        let codex_home = tempdir().expect("codex home");
+        let retired = codex_home.path().join(RETIRED_BUNDLED_ASSETS[0]);
+        let preserved = codex_home.path().join(RETIRED_BUNDLED_ASSETS[2]);
+        fs::create_dir_all(retired.parent().expect("retired parent")).expect("retired directory");
+        fs::create_dir_all(preserved.parent().expect("preserved parent"))
+            .expect("preserved directory");
+        fs::write(&retired, "installed").expect("retired skill");
+        fs::write(&preserved, "user owned").expect("preserved skill");
+        fs::create_dir_all(codex_home.path().join("flowdex")).expect("manifest directory");
+        fs::write(
+            codex_home.path().join(INSTALL_MANIFEST),
+            format!("{}\n", RETIRED_BUNDLED_ASSETS[0]),
+        )
+        .expect("manifest");
+
+        install_bundled_assets(codex_home.path()).expect("reinstall assets");
+
+        assert!(!retired.exists());
+        assert_eq!(
+            fs::read_to_string(preserved).expect("user skill remains"),
+            "user owned"
+        );
+        let manifest =
+            fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("manifest");
+        assert!(
+            !manifest
+                .lines()
+                .any(|path| RETIRED_BUNDLED_ASSETS.contains(&path))
+        );
+    }
+
+    #[test]
+    fn reinstall_updates_only_installer_owned_workflow_skill() {
+        let codex_home = tempdir().expect("codex home");
+        install_bundled_assets(codex_home.path()).expect("initial install");
+        let installed = codex_home.path().join(UPDATED_BUNDLED_ASSETS[0]);
+        fs::write(&installed, "old installed skill").expect("stale installed skill");
+
+        let user_home = tempdir().expect("user codex home");
+        let user_skill = user_home.path().join(UPDATED_BUNDLED_ASSETS[0]);
+        fs::create_dir_all(user_skill.parent().expect("skill parent")).expect("skill directory");
+        fs::write(&user_skill, "user skill").expect("user skill");
+
+        install_bundled_assets(codex_home.path()).expect("reinstall");
+        install_bundled_assets(user_home.path()).expect("install around user skill");
+
+        assert_eq!(
+            fs::read_to_string(installed).expect("updated installed skill"),
+            BUNDLED_ASSETS
+                .iter()
+                .find(|asset| asset.relative_path == UPDATED_BUNDLED_ASSETS[0])
+                .expect("bundled skill")
+                .contents
+        );
+        assert_eq!(
+            fs::read_to_string(user_skill).expect("user skill remains"),
+            "user skill"
+        );
     }
 
     #[test]

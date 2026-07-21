@@ -21,9 +21,9 @@ Install copies the backend to `$CODEX_HOME/flowdex/bin/codex[.exe]`, configures 
 
 - `$CODEX_HOME/flowdex.toml`, populated with all global defaults (including a `185000`-token compaction reminder and multi-agent V1)
 - `$CODEX_HOME/flowdex/workflows/defaults/{research-rounds,worker-reviewer}.js`
-- `$CODEX_HOME/skills/{collect-flowdex-context,report-flowdex-review,run-flowdex-workflows}/`
+- `$CODEX_HOME/skills/run-flowdex-workflows/`, including standalone JavaScript examples
 
-Existing config, workflow, and skill files are never overwritten. The package itself can then be moved or archived. Keep a copy if you want the same `flowdex uninstall` command later.
+Existing config values, workflows, and user-owned skill files are preserved. Install adds missing config options, updates its own workflow skill, and removes retired skills only when the installer manifest owns them. The package itself can then be moved or archived. Keep a copy if you want the same `flowdex uninstall` command later.
 
 Uninstall removes the copied backend and app override while preserving all user data and global assets. Add `--purge` to also remove only the global config, default workflows, and skills that this installer created. Pre-existing or additional global files, Flowdex runtime history, and repository-owned `.flowdex/` directories are preserved.
 
