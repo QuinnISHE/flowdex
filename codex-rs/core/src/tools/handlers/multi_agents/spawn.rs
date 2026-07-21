@@ -123,6 +123,7 @@ async fn handle_spawn_agent(
             child_depth,
             role_name,
             /*task_name*/ None,
+            /*agent_nickname*/ None,
         )?),
         SpawnAgentOptions {
             fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),

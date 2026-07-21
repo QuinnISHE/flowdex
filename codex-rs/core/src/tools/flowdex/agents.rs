@@ -337,6 +337,7 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
         child_depth,
         profile,
         Some(name.to_string()),
+        Some(name.to_string()),
     )?;
     let child_path = spawn_source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel("spawned agent is missing an agent path".into())
@@ -641,12 +642,18 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         let parent_id = session.thread_id;
         let depth = next_thread_spawn_depth(&turn.session_source);
         let replacement_name = format!("handoff_{}", ThreadId::new().to_string().replace('-', ""));
+        let replacement_nickname = session
+            .services
+            .agent_control
+            .get_agent_metadata(id)
+            .and_then(|metadata| metadata.agent_nickname);
         let source = thread_spawn_source(
             parent_id,
             &turn.session_source,
             depth,
             None,
             Some(replacement_name),
+            replacement_nickname,
         )?;
         let prompt = format!(
             "Handoff:\n{}\n\nInstructions:\n{}",

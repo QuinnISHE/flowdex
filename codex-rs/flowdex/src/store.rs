@@ -17,11 +17,13 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -1587,7 +1589,7 @@ impl FlowdexStore {
         let model: String = op.get(1);
         let start_commit: String = op.get(2);
         let sequence: i64 = op.get(3);
-        let head = git_stdout(&task.worktree_path, ["rev-parse", "HEAD"])?;
+        let mut head = git_stdout(&task.worktree_path, ["rev-parse", "HEAD"])?;
         let commits = if head == start_commit {
             Vec::new()
         } else {
@@ -1597,9 +1599,10 @@ impl FlowdexStore {
             )
             .is_err()
             {
-                return Err(FlowdexStoreError::Operation(
-                    "task history was rewritten".to_string(),
-                ));
+                head = normalize_amended_tip(&task.worktree_path, &start_commit, &head)?
+                    .ok_or_else(|| {
+                        FlowdexStoreError::Operation("task history was rewritten".to_string())
+                    })?;
             }
             enumerate_commits(&task.worktree_path, &start_commit, &head)?
                 .into_iter()
@@ -2065,6 +2068,86 @@ where
 {
     let output = Command::new("git").current_dir(dir).args(args).output()?;
     Ok(output)
+}
+
+fn normalize_amended_tip(
+    worktree: &Path,
+    start_commit: &str,
+    rewritten_head: &str,
+) -> Result<Option<String>, FlowdexStoreError> {
+    // A tip amend has the same parent; replay only its delta on the attributed commit.
+    if !worktree_clean(worktree)? || git_operation_in_progress(worktree)? {
+        return Ok(None);
+    }
+    let start_parent = match git_stdout(worktree, ["rev-parse", &format!("{start_commit}^")]) {
+        Ok(parent) => parent,
+        Err(_) => return Ok(None),
+    };
+    let rewritten_parent = match git_stdout(worktree, ["rev-parse", &format!("{rewritten_head}^")])
+    {
+        Ok(parent) => parent,
+        Err(_) => return Ok(None),
+    };
+    if start_parent != rewritten_parent {
+        return Ok(None);
+    }
+
+    let summary = git_stdout(worktree, ["show", "-s", "--format=%s", rewritten_head])?;
+    let patch = run_git(
+        worktree,
+        [
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            start_commit,
+            rewritten_head,
+        ],
+    )?;
+    if !patch.status.success() {
+        return Err(FlowdexStoreError::Git(format_git_error(&patch)));
+    }
+    git_status(worktree, ["reset", "--hard", start_commit])?;
+    if patch.stdout.is_empty() {
+        return Ok(Some(start_commit.to_string()));
+    }
+
+    let result = (|| {
+        let mut child = Command::new("git")
+            .current_dir(worktree)
+            .args(["apply", "--index", "--binary", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| FlowdexStoreError::Git("git apply stdin unavailable".to_string()))?
+            .write_all(&patch.stdout)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(FlowdexStoreError::Git(format_git_error(&output)));
+        }
+        git_status(
+            worktree,
+            [
+                "-c",
+                "user.name=Flowdex",
+                "-c",
+                "user.email=flowdex@local",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                &summary,
+            ],
+        )?;
+        git_stdout(worktree, ["rev-parse", "HEAD"])
+    })();
+    if result.is_err() {
+        let _ = git_status(worktree, ["reset", "--hard", rewritten_head]);
+    }
+    result.map(Some)
 }
 fn format_git_error(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2561,6 +2644,62 @@ mod tests {
         assert_eq!(commits[0].summary, "fast");
         assert_eq!(commits[0].agent_id, "agent");
     }
+
+    #[test]
+    fn amended_repair_is_restored_as_an_append_only_commit() {
+        let (_repo, _home, store, run) = store();
+        let task = store
+            .create_task(
+                &run,
+                &TaskDeclaration {
+                    id: "task".into(),
+                    name: "n".into(),
+                    instructions: "i".into(),
+                    read_scope: vec![],
+                    write_scope: vec![],
+                    verification: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .start_operation("task", "initial", "agent", "model")
+            .unwrap();
+        fs::write(task.worktree_path.join("answer.txt"), "red\n").unwrap();
+        git(&task.worktree_path, &["add", "answer.txt"]);
+        git(&task.worktree_path, &["commit", "-qm", "initial answer"]);
+        let initial = store
+            .finish_operation("task", "initial", "completed")
+            .unwrap()[0]
+            .source_commit
+            .clone();
+
+        store
+            .start_operation("task", "repair", "agent", "model")
+            .unwrap();
+        fs::write(task.worktree_path.join("answer.txt"), "blue\n").unwrap();
+        git(&task.worktree_path, &["add", "answer.txt"]);
+        git(
+            &task.worktree_path,
+            &["commit", "--amend", "-qm", "repair answer"],
+        );
+        let repair = store
+            .finish_operation("task", "repair", "completed")
+            .unwrap();
+
+        assert_eq!(repair.len(), 1);
+        assert_eq!(repair[0].summary, "repair answer");
+        assert_eq!(
+            git_stdout(&task.worktree_path, ["rev-parse", "HEAD^"]).unwrap(),
+            initial
+        );
+        assert_eq!(
+            fs::read_to_string(task.worktree_path.join("answer.txt"))
+                .unwrap()
+                .trim(),
+            "blue"
+        );
+    }
+
     #[test]
     fn conflict_preserves_task_and_rolls_back() {
         let (repo, _home, store, run) = store();

@@ -94,6 +94,7 @@ async fn handle_spawn_agent(
         child_depth,
         role_name,
         Some(args.task_name.clone()),
+        /*agent_nickname*/ None,
     )?;
     let new_agent_path = spawn_source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel(

@@ -44,6 +44,45 @@ fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
 }
 
+fn request_cwd(request: &wiremock::Request) -> std::path::PathBuf {
+    fn find(value: &Value) -> Option<&str> {
+        match value {
+            Value::String(text) => text
+                .split_once("<cwd>")
+                .and_then(|(_, rest)| rest.split_once("</cwd>"))
+                .map(|(cwd, _)| cwd),
+            Value::Array(values) => values.iter().find_map(find),
+            Value::Object(values) => values.values().find_map(find),
+            _ => None,
+        }
+    }
+    let body: Value = serde_json::from_slice(&request.body).expect("request JSON");
+    find(&body)
+        .map(std::path::PathBuf::from)
+        .expect("agent request cwd")
+}
+
+fn commit_joined_change(request: &wiremock::Request, content: &str, summary: &str) {
+    let cwd = request_cwd(request);
+    fs::write(cwd.join("reviewed.txt"), content).expect("write reviewed fixture");
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["add", "reviewed.txt"])
+        .output()
+        .expect("git add reviewed fixture");
+    assert!(output.status.success(), "git add failed");
+    let output = Command::new("git")
+        .current_dir(request_cwd(request))
+        .args(["commit", "-m", summary])
+        .output()
+        .expect("git commit reviewed fixture");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn input_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body)
         .ok()
@@ -711,6 +750,7 @@ impl Respond for OrchestratorBoundaryResponder {
 #[derive(Clone, Default)]
 struct JoinedFlowResponder {
     alpha_requests: Arc<AtomicUsize>,
+    review_repairs: Arc<AtomicUsize>,
     beta_requests: Arc<AtomicUsize>,
     collector_requests: Arc<AtomicUsize>,
     reviewer_requests: Arc<AtomicUsize>,
@@ -763,6 +803,26 @@ impl Respond for JoinedFlowResponder {
                 ev_completed("resp-joined-done"),
             ]));
         }
+        if self.reviewer_requests.load(Ordering::SeqCst) == 1
+            && has_function_call_output(request, "call-joined-review-1")
+        {
+            self.reviewer_requests.store(2, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-joined-review-1-done"),
+                ev_assistant_message("msg-joined-review-1", "repair required"),
+                ev_completed("resp-joined-review-1-done"),
+            ]));
+        }
+        if self.reviewer_requests.load(Ordering::SeqCst) == 3
+            && has_function_call_output(request, "call-joined-review-2")
+        {
+            self.reviewer_requests.store(4, Ordering::SeqCst);
+            return sse_response(sse(vec![
+                ev_response_created("resp-joined-review-2-done"),
+                ev_assistant_message("msg-joined-review-2", "review accepted"),
+                ev_completed("resp-joined-review-2-done"),
+            ]));
+        }
         if body_contains(request, "Collect context pack") {
             if has_function_call_output(request, "call-joined-publish") {
                 return sse_response(sse(vec![
@@ -793,22 +853,37 @@ impl Respond for JoinedFlowResponder {
             request,
             "Submit exactly one report with report_flowdex_review",
         ) {
-            if has_function_call_output(request, "call-joined-review") {
+            let state = self.reviewer_requests.load(Ordering::SeqCst);
+            if state == 0 {
+                self.reviewer_requests.store(1, Ordering::SeqCst);
                 return sse_response(sse(vec![
-                    ev_response_created("resp-joined-review-done"),
-                    ev_assistant_message("msg-joined-review", "review accepted"),
-                    ev_completed("resp-joined-review-done"),
+                    ev_response_created("resp-joined-review-1"),
+                    ev_function_call(
+                        "call-joined-review-1",
+                        "report_flowdex_review",
+                        r#"{"findings":[{"file":"reviewed.txt","lineStart":1,"lineEnd":1,"reason":"answer must be blue","ruleKey":null,"astGrepSuitable":false}]}"#,
+                    ),
+                    ev_completed("resp-joined-review-1"),
                 ]));
             }
-            self.reviewer_requests.fetch_add(1, Ordering::SeqCst);
+            self.reviewer_requests.store(3, Ordering::SeqCst);
             return sse_response(sse(vec![
-                ev_response_created("resp-joined-review"),
+                ev_response_created("resp-joined-review-2"),
                 ev_function_call(
-                    "call-joined-review",
+                    "call-joined-review-2",
                     "report_flowdex_review",
                     r#"{"findings":[]}"#,
                 ),
-                ev_completed("resp-joined-review"),
+                ev_completed("resp-joined-review-2"),
+            ]));
+        }
+        if body_contains(request, "Repair these review findings") {
+            self.review_repairs.fetch_add(1, Ordering::SeqCst);
+            commit_joined_change(request, "blue\n", "repair review target");
+            return sse_response(sse(vec![
+                ev_response_created("resp-joined-reviewed-repair"),
+                ev_assistant_message("msg-joined-reviewed-repair", "review target repaired"),
+                ev_completed("resp-joined-reviewed-repair"),
             ]));
         }
         let task = if body_contains(request, "alpha joined instructions") {
@@ -821,6 +896,13 @@ impl Respond for JoinedFlowResponder {
             Some(("resp-joined-dependent", "msg-joined-dependent", false))
         } else if body_contains(request, "later joined instructions") {
             Some(("resp-joined-later", "msg-joined-later", false))
+        } else if body_contains(request, "reviewed joined instructions") {
+            commit_joined_change(request, "red\n", "initial review target");
+            return sse_response(sse(vec![
+                ev_response_created("resp-joined-reviewed"),
+                ev_assistant_message("msg-joined-reviewed", "review target complete"),
+                ev_completed("resp-joined-reviewed"),
+            ]));
         } else {
             None
         };
@@ -1843,6 +1925,7 @@ const run = await flowdex.startRun({
   agents: {
     worker: { model: 'gpt-5.4' },
     collector: { model: 'gpt-5.4' },
+    reviewer: { model: 'gpt-5.4' },
   },
   verification: ['git status --porcelain'],
   phases: [{
@@ -1853,6 +1936,7 @@ const run = await flowdex.startRun({
       { name: 'beta', agent: 'worker', instructions: 'beta joined instructions', writeScope: ['beta.txt'], verification: ['git status --porcelain'] },
       { name: 'dependent', agent: 'worker', instructions: 'dependent joined instructions', dependencies: ['alpha', 'beta'], writeScope: ['dependent.txt'], verification: ['git status --porcelain'] },
       { name: 'later', agent: 'worker', instructions: 'later joined instructions', dependencies: ['dependent'], writeScope: ['later.txt'], verification: ['git status --porcelain'] },
+      { name: 'reviewed', agent: 'worker', instructions: 'reviewed joined instructions', dependencies: ['later'], writeScope: ['reviewed.txt'], verification: ['git status --porcelain'], review: { agent: 'reviewer', instructions: 'Require reviewed.txt to contain blue.', maxRounds: 2 } },
     ],
   }],
 });
@@ -1902,17 +1986,37 @@ text(JSON.stringify({ input, result }));"#,
     let mut reasoning = Vec::new();
     let mut spawn_item_ids = HashSet::new();
     let mut visible_child_ids = HashSet::new();
+    let mut visible_child_names = HashSet::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "joined event timeout: alpha={} beta={} parent_steps={} reasoning={reasoning:?}",
+        let event = match tokio::time::timeout(Duration::from_secs(30), test.codex.next_event()).await
+        {
+            Ok(event) => event?,
+            Err(_) => {
+                let requests = server.received_requests().await.unwrap_or_default();
+                let calls = requests
+                    .iter()
+                    .map(|request| {
+                        [
+                            "call-joined-reviewed-write",
+                            "call-joined-reviewed-repair",
+                            "call-joined-review-1",
+                            "call-joined-review-2",
+                        ]
+                        .into_iter()
+                        .filter(|call| has_function_call_output(request, call))
+                        .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::bail!(
+                    "joined event timeout: alpha={} repair={} reviewer={} beta={} parent_steps={} reasoning={reasoning:?} calls={calls:?}",
                     responder.alpha_requests.load(Ordering::SeqCst),
+                    responder.review_repairs.load(Ordering::SeqCst),
+                    responder.reviewer_requests.load(Ordering::SeqCst),
                     responder.beta_requests.load(Ordering::SeqCst),
                     responder.parent_steps.load(Ordering::SeqCst),
-                )
-            })??;
+                );
+            }
+        };
         match event.msg {
             EventMsg::ItemStarted(ItemStartedEvent {
                 item: TurnItem::Reasoning(item),
@@ -1924,12 +2028,19 @@ text(JSON.stringify({ input, result }));"#,
             }) if item.tool == CollabAgentTool::SpawnAgent => {
                 spawn_item_ids.insert(item.id);
                 visible_child_ids.extend(item.receiver_thread_ids);
+                visible_child_names.extend(
+                    item.receiver_agents
+                        .into_iter()
+                        .filter_map(|agent| agent.agent_nickname),
+                );
             }
             EventMsg::TurnComplete(event) if event.turn_id == turn_id => break,
             _ => {}
         }
     }
     assert_eq!(responder.alpha_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(responder.review_repairs.load(Ordering::SeqCst), 1);
+    assert_eq!(responder.reviewer_requests.load(Ordering::SeqCst), 4);
     assert_eq!(responder.beta_requests.load(Ordering::SeqCst), 1);
     assert!(
         reasoning
@@ -1946,12 +2057,15 @@ text(JSON.stringify({ input, result }));"#,
             .iter()
             .any(|summary| summary == "Running task: later")
     );
-    assert_eq!(spawn_item_ids.len(), 4, "each child needs a distinct UI item");
+    assert_eq!(spawn_item_ids.len(), 6, "each child needs a distinct UI item");
     assert_eq!(
         visible_child_ids.len(),
-        4,
+        6,
         "every workflow child must be visible to app clients"
     );
+    assert!(visible_child_names.contains("Alpha"));
+    assert!(visible_child_names.contains("Reviewed"));
+    assert!(visible_child_names.contains("Reviewed reviewer"));
 
     let requests = server.received_requests().await.unwrap_or_default();
     let dependent = requests
@@ -1967,7 +2081,7 @@ text(JSON.stringify({ input, result }));"#,
     assert!(!body_contains(follow_up, "task complete with no changes"));
 
     let mut child_count = 0;
-    while child_count < 4 {
+    while child_count < 6 {
         match tokio::time::timeout(Duration::from_secs(10), created.recv()).await {
             Ok(Ok(_)) => child_count += 1,
             Ok(Err(error)) => return Err(error.into()),

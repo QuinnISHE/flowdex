@@ -118,6 +118,8 @@ struct CreateArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AgentSpec {
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) display_name: Option<String>,
     pub(crate) instructions: String,
     pub(crate) profile: Option<String>,
     pub(crate) model: Option<String>,
@@ -623,6 +625,7 @@ pub(crate) async fn handle_run_with_review(
         depth,
         args.agent.profile.as_deref(),
         Some(name.to_string()),
+        args.agent.display_name.clone(),
     )?;
     let child_path = source.get_agent_path().ok_or_else(|| {
         FunctionCallError::RespondToModel("spawned agent is missing an agent path".into())
@@ -653,8 +656,11 @@ pub(crate) async fn handle_run_with_review(
         .model
         .clone()
         .unwrap_or_else(|| invocation.turn.model_info.slug.clone());
-    let reservation_id =
-        reserve_task_operation(&invocation.session, &invocation.turn, &task.id, &model).await?;
+    let reservation_id = if review.is_none() {
+        Some(reserve_task_operation(&invocation.session, &invocation.turn, &task.id, &model).await?)
+    } else {
+        None
+    };
     let ui_event = super::agents::begin_spawn_ui_event(
         &invocation.session,
         &invocation.turn,
@@ -702,13 +708,15 @@ pub(crate) async fn handle_run_with_review(
                 AgentStatus::NotFound,
             )
             .await;
-            cancel_task_operation_reservation(
-                &invocation.session,
-                &invocation.turn,
-                &task.id,
-                &reservation_id,
-            )
-            .await?;
+            if let Some(reservation_id) = reservation_id.as_deref() {
+                cancel_task_operation_reservation(
+                    &invocation.session,
+                    &invocation.turn,
+                    &task.id,
+                    reservation_id,
+                )
+                .await?;
+            }
             return Err(collab_spawn_error(error));
         }
     };
@@ -723,17 +731,19 @@ pub(crate) async fn handle_run_with_review(
     )
     .await;
     let id = child.thread_id;
-    associate(id, &task.id);
     let operation_id = child.initial_submission_id.clone();
-    bind_task_operation(
-        &invocation.session,
-        &invocation.turn,
-        &task.id,
-        &reservation_id,
-        &operation_id,
-        &id.to_string(),
-    )
-    .await?;
+    if let Some(reservation_id) = reservation_id.as_deref() {
+        associate(id, &task.id);
+        bind_task_operation(
+            &invocation.session,
+            &invocation.turn,
+            &task.id,
+            reservation_id,
+            &operation_id,
+            &id.to_string(),
+        )
+        .await?;
+    }
     let status = match child.initial_operation {
         Some(operation) => {
             tokio::select! {
@@ -744,15 +754,17 @@ pub(crate) async fn handle_run_with_review(
                         .agent_control
                         .interrupt_agent(id)
                         .await;
-                    let _ = finish_task_operation(
-                        &invocation.session,
-                        &invocation.turn,
-                        &task.id,
-                        &operation_id,
-                        "cancelled",
-                        false,
-                    )
-                    .await;
+                    if reservation_id.is_some() {
+                        let _ = finish_task_operation(
+                            &invocation.session,
+                            &invocation.turn,
+                            &task.id,
+                            &operation_id,
+                            "cancelled",
+                            false,
+                        )
+                        .await;
+                    }
                     return Err(FunctionCallError::RespondToModel(
                         "Flowdex task cancelled".to_string(),
                     ));
@@ -773,15 +785,17 @@ pub(crate) async fn handle_run_with_review(
                         .agent_control
                         .interrupt_agent(id)
                         .await;
-                    let _ = finish_task_operation(
-                        &invocation.session,
-                        &invocation.turn,
-                        &task.id,
-                        &operation_id,
-                        "cancelled",
-                        false,
-                    )
-                    .await;
+                    if reservation_id.is_some() {
+                        let _ = finish_task_operation(
+                            &invocation.session,
+                            &invocation.turn,
+                            &task.id,
+                            &operation_id,
+                            "cancelled",
+                            false,
+                        )
+                        .await;
+                    }
                     return Err(FunctionCallError::RespondToModel(
                         "Flowdex task cancelled".to_string(),
                     ));
@@ -795,15 +809,17 @@ pub(crate) async fn handle_run_with_review(
     } else {
         "errored"
     };
-    finish_task_operation(
-        &invocation.session,
-        &invocation.turn,
-        &task.id,
-        &operation_id,
-        terminal,
-        review.is_none(),
-    )
-    .await?;
+    if reservation_id.is_some() {
+        finish_task_operation(
+            &invocation.session,
+            &invocation.turn,
+            &task.id,
+            &operation_id,
+            terminal,
+            true,
+        )
+        .await?;
+    }
     Ok(JsonOutput(status_value(id, status)))
 }
 
@@ -833,6 +849,7 @@ pub(crate) async fn run_task_agent_with_review(
             "task_id": task_id,
             "agent": {
                 "name": agent.name,
+                "display_name": agent.display_name,
                 "instructions": agent.instructions,
                 "profile": agent.profile,
                 "tool_profile": agent.tool_profile,

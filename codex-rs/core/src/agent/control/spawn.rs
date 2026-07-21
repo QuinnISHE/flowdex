@@ -414,8 +414,8 @@ impl AgentControl {
                 parent_thread_id,
                 depth,
                 agent_path,
+                agent_nickname,
                 agent_role,
-                ..
             })) => {
                 let (session_source, agent_metadata) = self.prepare_thread_spawn(
                     &mut reservation,
@@ -424,7 +424,7 @@ impl AgentControl {
                     depth,
                     agent_path,
                     agent_role,
-                    /*preferred_agent_nickname*/ None,
+                    agent_nickname,
                 )?;
                 (Some(session_source), agent_metadata)
             }

@@ -19,6 +19,7 @@ use codex_flowdex::workflow::ContextPackDefinition;
 use codex_flowdex::{
     Boundary, PhaseDefinition, ReviewDefinition, TaskDefinition, WorkflowDefinition,
 };
+use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
@@ -851,6 +852,7 @@ async fn run_phase(
                     .ok_or_else(|| "agent missing".to_string())?;
                 let agent = AgentSpec {
                     name: scheduler_agent_name("task", &task_def.name, &scheduled.task_id),
+                    display_name: Some(task_def.name.clone()),
                     instructions: "Implement the task requirements above.".into(),
                     profile: agent_def.profile,
                     model: agent_def.model,
@@ -1128,6 +1130,7 @@ async fn collect_context(
         .ok_or_else(|| format!("context pack agent {} is missing", pack_definition.agent))?;
     let agent = AgentSpec {
         name: format!("context_collector_{collector_suffix}"),
+        display_name: Some(format!("{} context", pack)),
         instructions: "Collect and publish the context pack described above.".into(),
         profile: agent_definition.profile,
         model: agent_definition.model,
@@ -1260,7 +1263,7 @@ async fn complete_task(
             resume_task_agent(
                 controller,
                 task_agent_id,
-                "Verification failed for this task. Repair the failure while preserving the original requirements, then rerun the declared verification commands."
+                "Verification failed for this task. Repair the failure while preserving the original requirements, then rerun the declared verification commands. Create a new commit; do not amend, rebase, reset, or rewrite existing commits."
                     .into(),
             )
             .await
@@ -1369,6 +1372,23 @@ async fn run_phase_review(
     review: &ReviewDefinition,
     tasks: &[codex_flowdex::store::ScheduledTask],
 ) -> Result<(), String> {
+    let mut reviewer_thread_id = None;
+    let result =
+        run_phase_review_rounds(controller, phase, review, tasks, &mut reviewer_thread_id).await;
+    let close = close_review_agent(controller, reviewer_thread_id.as_deref()).await;
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => close,
+    }
+}
+
+async fn run_phase_review_rounds(
+    controller: &Arc<RunController>,
+    phase: &PhaseDefinition,
+    review: &ReviewDefinition,
+    tasks: &[codex_flowdex::store::ScheduledTask],
+    reviewer_thread_id: &mut Option<String>,
+) -> Result<(), String> {
     let first = tasks
         .first()
         .ok_or_else(|| "phase review requires a task".to_string())?;
@@ -1416,7 +1436,7 @@ async fn run_phase_review(
             scope_kind: "phase".into(),
             scope_id: phase.name.clone(),
             round: round as i64,
-            reviewer_thread_id: String::new(),
+            reviewer_thread_id: reviewer_thread_id.clone().unwrap_or_default(),
             state: "pending".into(),
         };
         let operation_id = operation.operation_id.clone();
@@ -1428,6 +1448,7 @@ async fn run_phase_review(
             .map_err(|e| e.to_string())?;
         let reviewer_agent = AgentSpec {
             name: scheduler_agent_name("review", &phase.name, &operation_id),
+            display_name: Some(format!("{} reviewer", phase.name)),
             instructions: format!(
                 "{}\n\nReview the integrated phase diff below against the phase requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nPhase requirements:\n{}\n\nIntegrated diff:\n{}",
                 review.instructions, phase.instructions, diff
@@ -1437,30 +1458,42 @@ async fn run_phase_review(
             reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
             tool_profile: reviewer.tool_profile.clone(),
         };
-        let reviewer_result = task::run_task_agent_with_review(
-            controller.invocation.clone(),
-            first.task_id.clone(),
-            reviewer_agent,
-            task::ReviewDispatch {
-                operation: operation.clone(),
-                store: Arc::clone(&controller.store),
-                worktree: Some(controller.info.integration_worktree.clone()),
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let reviewer_thread_id = reviewer_result
-            .code_mode_result(&ToolPayload::Function {
-                arguments: serde_json::json!({"task_id": first.task_id}).to_string(),
-            })
-            .get("agentId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if !reviewer_thread_id.is_empty() {
+        if let Some(existing_id) = reviewer_thread_id.as_deref() {
+            resume_review_agent(
+                controller,
+                existing_id,
+                reviewer_agent.instructions,
+                operation.clone(),
+            )
+            .await?;
+        } else {
+            let reviewer_result = task::run_task_agent_with_review(
+                controller.invocation.clone(),
+                first.task_id.clone(),
+                reviewer_agent,
+                task::ReviewDispatch {
+                    operation: operation.clone(),
+                    store: Arc::clone(&controller.store),
+                    worktree: Some(controller.info.integration_worktree.clone()),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let spawned_id = reviewer_result
+                .code_mode_result(&ToolPayload::Function {
+                    arguments: serde_json::json!({"task_id": first.task_id}).to_string(),
+                })
+                .get("agentId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if spawned_id.is_empty() {
+                return Err("review agent did not return an id".into());
+            }
+            *reviewer_thread_id = Some(spawned_id.clone());
             let store = Arc::clone(&controller.store);
             let mut accepted = operation.clone();
-            accepted.reviewer_thread_id = reviewer_thread_id;
+            accepted.reviewer_thread_id = spawned_id;
             accepted.state = "pending".into();
             tokio::task::spawn_blocking(move || store.record_review_operation(&accepted))
                 .await
@@ -1724,6 +1757,35 @@ async fn review_task(
     scope_kind: &str,
     scope_id: &str,
 ) -> Result<(), String> {
+    let mut reviewer_thread_id = None;
+    let result = review_task_rounds(
+        controller,
+        task_id,
+        task_def,
+        review,
+        review_worktree,
+        scope_kind,
+        scope_id,
+        &mut reviewer_thread_id,
+    )
+    .await;
+    let close = close_review_agent(controller, reviewer_thread_id.as_deref()).await;
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => close,
+    }
+}
+
+async fn review_task_rounds(
+    controller: &Arc<RunController>,
+    task_id: &str,
+    task_def: &TaskDefinition,
+    review: &ReviewDefinition,
+    review_worktree: Option<std::path::PathBuf>,
+    scope_kind: &str,
+    scope_id: &str,
+    reviewer_thread_id: &mut Option<String>,
+) -> Result<(), String> {
     let reviewer = controller
         .definition
         .lock()
@@ -1778,7 +1840,7 @@ async fn review_task(
             scope_kind: scope_kind.into(),
             scope_id: scope_id.into(),
             round: round as i64,
-            reviewer_thread_id: String::new(),
+            reviewer_thread_id: reviewer_thread_id.clone().unwrap_or_default(),
             state: "pending".into(),
         };
         let operation_id = operation.operation_id.clone();
@@ -1792,6 +1854,7 @@ async fn review_task(
         .map_err(|e| e.to_string())?;
         let agent = AgentSpec {
             name: scheduler_agent_name("review", &task_def.name, &operation_id),
+            display_name: Some(format!("{} reviewer", task_def.name)),
             instructions: format!(
                 "{}\n\nReview the committed task diff below against the task requirements and verification result. Submit exactly one report with report_flowdex_review, including an empty findings array when it passes.\n\nTask requirements:\n{}\n\nCommitted diff:\n{}",
                 review.instructions, task.instructions, diff
@@ -1801,33 +1864,45 @@ async fn review_task(
             reasoning_effort: reviewer.reasoning_effort.clone().and_then(parse_effort),
             tool_profile: reviewer.tool_profile.clone(),
         };
-        let reviewer_result = task::run_task_agent_with_review(
-            controller.invocation.clone(),
-            task_id.to_string(),
-            agent,
-            task::ReviewDispatch {
-                operation: codex_flowdex::store::ReviewOperation {
-                    operation_id: operation_id.clone(),
-                    ..operation.clone()
+        if let Some(existing_id) = reviewer_thread_id.as_deref() {
+            resume_review_agent(
+                controller,
+                existing_id,
+                agent.instructions,
+                operation.clone(),
+            )
+            .await?;
+        } else {
+            let reviewer_result = task::run_task_agent_with_review(
+                controller.invocation.clone(),
+                task_id.to_string(),
+                agent,
+                task::ReviewDispatch {
+                    operation: codex_flowdex::store::ReviewOperation {
+                        operation_id: operation_id.clone(),
+                        ..operation.clone()
+                    },
+                    store: Arc::clone(&controller.store),
+                    worktree: review_worktree.clone(),
                 },
-                store: Arc::clone(&controller.store),
-                worktree: review_worktree.clone(),
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let reviewer_thread_id = reviewer_result
-            .code_mode_result(&ToolPayload::Function {
-                arguments: serde_json::json!({"task_id": task_id}).to_string(),
-            })
-            .get("agentId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if !reviewer_thread_id.is_empty() {
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let spawned_id = reviewer_result
+                .code_mode_result(&ToolPayload::Function {
+                    arguments: serde_json::json!({"task_id": task_id}).to_string(),
+                })
+                .get("agentId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if spawned_id.is_empty() {
+                return Err("review agent did not return an id".into());
+            }
+            *reviewer_thread_id = Some(spawned_id.clone());
             let store = Arc::clone(&controller.store);
             let mut updated = operation.clone();
-            updated.reviewer_thread_id = reviewer_thread_id;
+            updated.reviewer_thread_id = spawned_id;
             updated.state = "pending".to_string();
             tokio::task::spawn_blocking(move || store.record_review_operation(&updated))
                 .await
@@ -1908,7 +1983,7 @@ async fn review_task(
             controller,
             &agent_id,
             format!(
-                "Repair these review findings while preserving the original task requirements, then rerun verification:\n{repair}"
+                "Repair these review findings while preserving the original task requirements, then rerun verification. Create a new commit; do not amend, rebase, reset, or rewrite existing commits:\n{repair}"
             ),
         )
         .await?;
@@ -1991,6 +2066,52 @@ async fn resume_task_agent(
         .map_err(|e| e.to_string())
 }
 
+async fn resume_review_agent(
+    controller: &Arc<RunController>,
+    agent_id: &str,
+    instructions: String,
+    operation: codex_flowdex::store::ReviewOperation,
+) -> Result<(), String> {
+    let thread_id = ThreadId::from_string(agent_id).map_err(|error| error.to_string())?;
+    let agent_path = controller
+        .invocation
+        .session
+        .services
+        .agent_control
+        .get_agent_metadata(thread_id)
+        .and_then(|metadata| metadata.agent_path)
+        .ok_or_else(|| format!("review agent {agent_id} has no agent path"))?;
+    super::review::activate_review_agent(
+        agent_path.clone(),
+        operation,
+        Arc::clone(&controller.store),
+    );
+    let result = resume_task_agent(controller, agent_id, instructions).await;
+    super::review::deactivate_review_agent(&agent_path);
+    result
+}
+
+async fn close_review_agent(
+    controller: &RunController,
+    agent_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(agent_id) = agent_id else {
+        return Ok(());
+    };
+    let thread_id = ThreadId::from_string(agent_id).map_err(|error| error.to_string())?;
+    match controller
+        .invocation
+        .session
+        .services
+        .agent_control
+        .close_agent(thread_id)
+        .await
+    {
+        Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn task_source_commits(
     worktree: &std::path::Path,
     base_commit: &str,
@@ -2069,6 +2190,7 @@ async fn run_task_handler(
             "task_id": task_id,
             "agent": {
                 "name": agent.name,
+                "display_name": agent.display_name,
                 "instructions": agent.instructions,
                 "profile": agent.profile,
                 "tool_profile": agent.tool_profile,

@@ -110,6 +110,7 @@ pub(crate) fn thread_spawn_source(
     depth: i32,
     agent_role: Option<&str>,
     task_name: Option<String>,
+    agent_nickname: Option<String>,
 ) -> Result<SessionSource, FunctionCallError> {
     let agent_path = task_name
         .as_deref()
@@ -125,9 +126,17 @@ pub(crate) fn thread_spawn_source(
         parent_thread_id,
         depth,
         agent_path,
-        agent_nickname: None,
+        agent_nickname: agent_nickname.map(|name| format_agent_nickname(&name)),
         agent_role: agent_role.map(str::to_string),
     }))
+}
+
+fn format_agent_nickname(name: &str) -> String {
+    let mut text = name.replace(['_', '-'], " ");
+    if let Some(first) = text.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    text
 }
 
 pub(crate) fn parse_collab_input(
