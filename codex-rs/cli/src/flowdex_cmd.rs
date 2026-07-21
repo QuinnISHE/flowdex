@@ -29,6 +29,7 @@ const BUNDLED_ASSETS: &[BundledAsset] = &[
         relative_path: "flowdex.toml",
         contents: "# Flowdex global defaults. Repository-local .flowdex settings take precedence.\n\
 compaction_reminder_threshold_tokens = 150000\n\
+multi_agent_version = \"v1\"\n\
 ast_grep_candidate_threshold = 3\n\
 ast_grep_always_run = []\n",
     },
@@ -558,153 +559,93 @@ mod macos {
     use std::io::Write;
     use std::path::Path;
     use std::path::PathBuf;
+    const LABEL: &str = "com.openai.flowdex-codex-cli-path";
 
-    const START_MARKER: &[u8] = b"# >>> flowdex managed CODEX_CLI_PATH >>>";
-    const END_MARKER: &[u8] = b"# <<< flowdex managed CODEX_CLI_PATH <<<";
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Shell {
-        Zsh,
-        Bash,
-        Fish,
-    }
-
-    pub fn shell_and_profile(shell: &str, home: &Path) -> Result<(Shell, PathBuf)> {
+    fn launch_agent_path(home: &Path) -> Result<PathBuf> {
         if !home.is_absolute() && !home.to_string_lossy().starts_with('/') {
             anyhow::bail!("HOME must be an absolute path");
         }
-        let name = Path::new(shell)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("SHELL is not set to a supported login shell"))?;
-        match name {
-            "zsh" => Ok((Shell::Zsh, home.join(".zprofile"))),
-            "bash" => Ok((Shell::Bash, home.join(".bash_profile"))),
-            "fish" => Ok((
-                Shell::Fish,
-                home.join(".config")
-                    .join("fish")
-                    .join("conf.d")
-                    .join("flowdex.fish"),
-            )),
-            _ => anyhow::bail!("unsupported login shell `{shell}`"),
-        }
+        Ok(home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LABEL}.plist")))
     }
 
-    fn quote_path(path: &Path) -> String {
-        let path = path.to_string_lossy();
-        format!("'{}'", path.replace('\'', "'\"'\"'"))
+    fn xml_escape(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
     }
 
-    pub fn managed_block(shell: Shell, path: &Path) -> Vec<u8> {
-        let assignment = match shell {
-            Shell::Zsh | Shell::Bash => format!("export CODEX_CLI_PATH={}", quote_path(path)),
-            Shell::Fish => format!("set -gx CODEX_CLI_PATH {}", quote_path(path)),
-        };
-        format!(
-            "# >>> flowdex managed CODEX_CLI_PATH >>>\n{assignment}\n# <<< flowdex managed CODEX_CLI_PATH <<<"
+    fn launch_agent_plist(canonical: &Path) -> Result<Vec<u8>> {
+        let canonical = canonical
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("installed Flowdex path is not valid UTF-8"))?;
+        Ok(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n<dict>\n\
+  <key>Label</key>\n  <string>{LABEL}</string>\n\
+  <key>ProgramArguments</key>\n  <array>\n\
+    <string>/bin/launchctl</string>\n    <string>setenv</string>\n\
+    <string>CODEX_CLI_PATH</string>\n    <string>{}</string>\n\
+  </array>\n  <key>RunAtLoad</key>\n  <true/>\n\
+</dict>\n</plist>\n",
+            xml_escape(canonical)
         )
-        .into_bytes()
+        .into_bytes())
     }
 
-    fn marker_positions(contents: &[u8], marker: &[u8]) -> Vec<usize> {
-        let mut positions = Vec::new();
-        let mut offset = 0;
-        while let Some(relative) = contents[offset..]
-            .windows(marker.len())
-            .position(|window| window == marker)
-        {
-            let position = offset + relative;
-            positions.push(position);
-            offset = position + marker.len();
-        }
-        positions
-    }
-
-    fn line_start(contents: &[u8], position: usize) -> usize {
-        contents[..position]
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1)
-    }
-
-    fn line_end(contents: &[u8], position: usize) -> usize {
-        contents[position..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(contents.len(), |index| position + index + 1)
-    }
-
-    pub fn replace_managed_block(contents: &[u8], block: &[u8]) -> Result<Vec<u8>> {
-        let starts = marker_positions(contents, START_MARKER);
-        let ends = marker_positions(contents, END_MARKER);
-        if starts.len() > 1 || ends.len() > 1 {
-            anyhow::bail!("profile contains duplicate Flowdex CODEX_CLI_PATH markers");
-        }
-        if starts.is_empty() != ends.is_empty() {
-            anyhow::bail!("profile contains malformed Flowdex CODEX_CLI_PATH markers");
-        }
-        if starts.is_empty() {
-            if block.is_empty() {
-                return Ok(contents.to_vec());
-            }
-            let mut result = contents.to_vec();
-            if !result.is_empty() && !result.ends_with(b"\n") {
-                result.push(b'\n');
-            }
-            result.extend_from_slice(block);
-            return Ok(result);
-        }
-
-        let start = starts[0];
-        let end = ends[0];
-        let start_line = line_start(contents, start);
-        let start_line_end = line_end(contents, start);
-        let end_line_start = line_start(contents, end);
-        let end_line = line_end(contents, end + END_MARKER.len());
-        if start != start_line
-            || end < start
-            || trim_line(&contents[start..start_line_end]) != START_MARKER
-            || trim_line(&contents[end_line_start..end_line]) != END_MARKER
-        {
-            anyhow::bail!("profile contains malformed Flowdex CODEX_CLI_PATH markers");
-        }
-        let mut result = Vec::with_capacity(contents.len() + block.len());
-        result.extend_from_slice(&contents[..start_line]);
-        result.extend_from_slice(block);
-        if !block.is_empty() && end_line > end + END_MARKER.len() {
-            result.push(b'\n');
-        }
-        result.extend_from_slice(&contents[end_line..]);
-        Ok(result)
-    }
-
-    pub fn remove_managed_block(contents: &[u8]) -> Result<Vec<u8>> {
-        replace_managed_block(contents, b"")
-    }
-
-    pub fn install_profile_with_writer<F>(
-        shell: Shell,
-        profile: &Path,
+    fn install_with<W, R>(
+        home: &Path,
+        uid: u32,
         canonical: &Path,
-        existing: &[u8],
-        writer: F,
+        writer: W,
+        mut run: R,
     ) -> Result<()>
     where
-        F: FnOnce(&Path, &[u8]) -> Result<()>,
+        W: FnOnce(&Path, &[u8]) -> Result<()>,
+        R: FnMut(&[String], bool) -> Result<()>,
     {
-        let contents = replace_managed_block(existing, &managed_block(shell, canonical))?;
-        writer(profile, &contents)
+        let plist = launch_agent_path(home)?;
+        writer(&plist, &launch_agent_plist(canonical)?)?;
+        let domain = format!("gui/{uid}");
+        let plist = plist.to_string_lossy().into_owned();
+        run(&["bootout".into(), domain.clone(), plist.clone()], true)?;
+        run(&["bootstrap".into(), domain, plist], false)?;
+        run(
+            &[
+                "setenv".into(),
+                "CODEX_CLI_PATH".into(),
+                canonical.to_string_lossy().into_owned(),
+            ],
+            false,
+        )
     }
 
-    fn trim_line(line: &[u8]) -> &[u8] {
-        let line = line.strip_suffix(b"\n").unwrap_or(line);
-        line.strip_suffix(b"\r").unwrap_or(line)
+    fn uninstall_with<R, D>(home: &Path, uid: u32, mut run: R, remove: D) -> Result<()>
+    where
+        R: FnMut(&[String], bool) -> Result<()>,
+        D: FnOnce(&Path) -> Result<()>,
+    {
+        let plist = launch_agent_path(home)?;
+        run(
+            &[
+                "bootout".into(),
+                format!("gui/{uid}"),
+                plist.to_string_lossy().into_owned(),
+            ],
+            true,
+        )?;
+        remove(&plist)?;
+        run(&["unsetenv".into(), "CODEX_CLI_PATH".into()], false)
     }
 
     #[cfg(target_os = "macos")]
-    pub fn write_profile_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    fn write_launch_agent_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("profile path has no parent directory"))?;
@@ -724,7 +665,7 @@ mod macos {
         let mut file = None;
         for attempt in 0..16 {
             let candidate = parent.join(format!(
-                ".flowdex-profile-{}-{nonce}-{attempt}",
+                ".flowdex-launch-agent-{}-{nonce}-{attempt}",
                 std::process::id()
             ));
             match fs::OpenOptions::new()
@@ -738,10 +679,10 @@ mod macos {
                     break;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error).context("cannot create temporary profile"),
+                Err(error) => return Err(error).context("cannot create temporary LaunchAgent"),
             }
         }
-        let temp = temp.ok_or_else(|| anyhow::anyhow!("cannot allocate temporary profile"))?;
+        let temp = temp.ok_or_else(|| anyhow::anyhow!("cannot allocate temporary LaunchAgent"))?;
         let result = (|| {
             let mut file = file.take().expect("temporary profile file");
             use std::os::unix::fs::PermissionsExt;
@@ -750,7 +691,7 @@ mod macos {
             file.sync_all()?;
             drop(file);
             fs::rename(&temp, path)
-                .with_context(|| format!("cannot replace profile {}", path.display()))
+                .with_context(|| format!("cannot replace LaunchAgent {}", path.display()))
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
@@ -759,47 +700,57 @@ mod macos {
     }
 
     #[cfg(target_os = "macos")]
+    fn uid() -> Result<u32> {
+        let output = std::process::Command::new("id").arg("-u").output()?;
+        if !output.status.success() {
+            anyhow::bail!("`id -u` failed");
+        }
+        std::str::from_utf8(&output.stdout)?
+            .trim()
+            .parse()
+            .context("`id -u` returned an invalid user ID")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_launchctl(args: &[String], ignore_failure: bool) -> Result<()> {
+        let status = std::process::Command::new("launchctl")
+            .args(args)
+            .status()?;
+        if status.success() || ignore_failure {
+            Ok(())
+        } else {
+            anyhow::bail!("launchctl {} failed", args.join(" "))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn install(canonical: &Path) -> Result<()> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate the login profile"))?;
-        let shell = std::env::var("SHELL").map_err(|_| anyhow::anyhow!("SHELL is not set"))?;
-        let (shell, profile) = shell_and_profile(&shell, &home)?;
-        let existing = match fs::read(&profile) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                return Err(error).with_context(|| format!("cannot read {}", profile.display()));
-            }
-        };
-        install_profile_with_writer(shell, &profile, canonical, &existing, write_profile_atomic)?;
-        Ok(())
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate LaunchAgents"))?;
+        install_with(
+            &home,
+            uid()?,
+            canonical,
+            write_launch_agent_atomic,
+            run_launchctl,
+        )
     }
 
     #[cfg(target_os = "macos")]
     pub fn uninstall() -> Result<()> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate the login profile"))?;
-        let shell_name = std::env::var("SHELL").map_err(|_| anyhow::anyhow!("SHELL is not set"))?;
-        let (shell, profile) = shell_and_profile(&shell_name, &home)?;
-        let existing = match fs::read(&profile) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(error).with_context(|| format!("cannot read {}", profile.display()));
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate LaunchAgents"))?;
+        uninstall_with(&home, uid()?, run_launchctl, |path| {
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("cannot remove {}", path.display()))
+                }
             }
-        };
-        let contents = remove_managed_block(&existing)?;
-        if contents == existing {
-            return Ok(());
-        }
-        if shell == Shell::Fish && contents.is_empty() {
-            fs::remove_file(&profile)?;
-        } else {
-            write_profile_atomic(&profile, &contents)?;
-        }
-        Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -807,72 +758,60 @@ mod macos {
         use super::*;
 
         #[test]
-        fn maps_supported_shells() {
-            let home = Path::new("/Users/test");
-            assert_eq!(shell_and_profile("/bin/zsh", home).unwrap().0, Shell::Zsh);
+        fn launch_agent_install_is_idempotent_and_updates_current_session() {
+            let mut writes = Vec::new();
+            let mut commands = Vec::new();
+            for _ in 0..2 {
+                install_with(
+                    Path::new("/Users/test"),
+                    501,
+                    Path::new("/tmp/a&b/codex"),
+                    |path, contents| {
+                        writes.push((path.to_path_buf(), contents.to_vec()));
+                        Ok(())
+                    },
+                    |args, ignored| {
+                        commands.push((args.to_vec(), ignored));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(writes[0], writes[1]);
+            assert!(String::from_utf8_lossy(&writes[0].1).contains("/tmp/a&amp;b/codex"));
+            assert_eq!(commands[0].0[0], "bootout");
+            assert!(commands[0].1);
+            assert_eq!(commands[1].0[0], "bootstrap");
             assert_eq!(
-                shell_and_profile("/bin/bash", home).unwrap().1,
-                home.join(".bash_profile")
+                commands[2].0,
+                ["setenv", "CODEX_CLI_PATH", "/tmp/a&b/codex"]
             );
-            assert_eq!(
-                shell_and_profile("/usr/bin/fish", home).unwrap().1,
-                home.join(".config/fish/conf.d/flowdex.fish")
-            );
-            assert!(shell_and_profile("/bin/tcsh", home).is_err());
-            assert!(shell_and_profile("/bin/zsh", Path::new("relative-home")).is_err());
         }
 
         #[test]
-        fn quotes_path_as_data() {
-            let block =
-                String::from_utf8(managed_block(Shell::Zsh, Path::new("/tmp/a'b"))).unwrap();
-            assert!(block.contains("export CODEX_CLI_PATH='/tmp/a'\"'\"'b'"));
-            assert!(!block.contains(";"));
-        }
-
-        #[test]
-        fn inserts_and_replaces_without_touching_unrelated_bytes() {
-            let path = Path::new("/tmp/codex");
-            let block = managed_block(Shell::Bash, path);
-            let original = b"# keep this\n";
-            let inserted = replace_managed_block(original, &block).unwrap();
-            assert!(inserted.starts_with(original));
-            let replaced = replace_managed_block(
-                &inserted,
-                &managed_block(Shell::Bash, Path::new("/tmp/new")),
-            )
-            .unwrap();
-            assert!(replaced.starts_with(original));
-            assert!(String::from_utf8(replaced).unwrap().contains("/tmp/new"));
-            assert_eq!(remove_managed_block(&inserted).unwrap(), original);
-        }
-
-        #[test]
-        fn rejects_malformed_and_duplicate_markers() {
-            let block = managed_block(Shell::Fish, Path::new("/tmp/codex"));
-            let duplicate = [block.as_slice(), b"\n", block.as_slice()].concat();
-            assert!(replace_managed_block(&duplicate, &block).is_err());
-            assert!(replace_managed_block(START_MARKER, &block).is_err());
-        }
-
-        #[test]
-        fn profile_install_uses_injected_writer() {
-            let profile = Path::new("/Users/test/.zprofile");
-            let mut written = None;
-            install_profile_with_writer(
-                Shell::Zsh,
-                profile,
-                Path::new("/tmp/codex"),
-                b"# unrelated\n",
-                |path, contents| {
-                    written = Some((path.to_path_buf(), contents.to_vec()));
+        fn launch_agent_uninstall_unloads_removes_and_unsets() {
+            let mut commands = Vec::new();
+            let mut removed = None;
+            uninstall_with(
+                Path::new("/Users/test"),
+                501,
+                |args, ignored| {
+                    commands.push((args.to_vec(), ignored));
+                    Ok(())
+                },
+                |path| {
+                    removed = Some(path.to_path_buf());
                     Ok(())
                 },
             )
             .unwrap();
-            let (path, contents) = written.expect("writer called");
-            assert_eq!(path, profile);
-            assert!(contents.starts_with(b"# unrelated\n"));
+            assert_eq!(commands[0].0[0], "bootout");
+            assert!(commands[0].1);
+            assert_eq!(commands[1].0, ["unsetenv", "CODEX_CLI_PATH"]);
+            assert_eq!(
+                removed.unwrap(),
+                launch_agent_path(Path::new("/Users/test")).unwrap()
+            );
         }
     }
 }
@@ -1112,6 +1051,27 @@ mod tests {
         let manifest =
             fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("install manifest");
         assert_eq!(manifest.lines().count(), BUNDLED_ASSETS.len());
+    }
+
+    #[test]
+    fn bundled_defaults_use_packaged_agent_selectors_and_exact_round_operations() {
+        let config = BUNDLED_ASSETS
+            .iter()
+            .find(|asset| asset.relative_path == "flowdex.toml")
+            .unwrap()
+            .contents;
+        let research = include_str!("../../../.flowdex/workflows/defaults/research-rounds.js");
+        let worker = include_str!("../../../.flowdex/workflows/defaults/worker-reviewer.js");
+
+        assert!(config.contains("multi_agent_version = \"v1\""));
+        assert!(!research.contains("profile:"));
+        assert!(research.contains("flowdex.sendMessage("));
+        assert!(research.contains("flowdex.resumeAgent("));
+        assert!(research.contains("contextMode: \"keep\""));
+        assert!(!research.contains("delivery: \"turn\""));
+        assert!(!worker.contains("profile:"));
+        assert!(worker.contains("model: \"gpt-5.6-sol\""));
+        assert!(worker.contains("model: \"gpt-5.6-luna\""));
     }
 
     #[test]
