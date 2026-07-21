@@ -148,8 +148,12 @@ const a = await flowdex.spawnAgent({ name: "research_a", instructions: "Research
 const b = await flowdex.spawnAgent({ name: "research_b", instructions: "Research the question independently.", model: "gpt-5.6-luna" });
 for (let round = 0; round < 2; round++) {
   const result = await flowdex.resumeAgent(a, `Round ${round}: report findings.`);
-  await flowdex.sendMessage(b, JSON.stringify(result), { delivery: "turn" });
-  const reply = await flowdex.waitAgent(b);
+  await flowdex.sendMessage(b, JSON.stringify(result));
+  const reply = await flowdex.resumeAgent(
+    b,
+    "Respond to the queued peer report.",
+    { contextMode: "keep" },
+  );
   if (reply.status !== "completed") break;
 }
 ```

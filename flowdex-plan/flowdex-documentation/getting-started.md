@@ -11,7 +11,10 @@ cd codex-rs
 cargo build --release -p codex-cli --bin codex
 ```
 
-Copy the release executable to `flowdex-package/flowdex.exe` on Windows or `flowdex-package/flowdex` on macOS. Then run:
+On Windows, also build `codex-windows-sandbox-setup` and
+`codex-command-runner`, then place both helper executables beside
+`flowdex-package/flowdex.exe`. On macOS, copy the executable to
+`flowdex-package/flowdex`. Then run:
 
 ```text
 flowdex install
@@ -81,8 +84,8 @@ const a = await flowdex.spawnAgent({ name: "a", instructions: "Investigate one a
 const b = await flowdex.spawnAgent({ name: "b", instructions: "Investigate another angle.", model: "gpt-5.6-luna" });
 await Promise.all([flowdex.waitAgent(a), flowdex.waitAgent(b)]);
 const note = await flowdex.resumeAgent(a, "Share your findings.");
-await flowdex.sendMessage(b, JSON.stringify(note), { delivery: "turn" });
-await flowdex.waitAgent(b);
+await flowdex.sendMessage(b, JSON.stringify(note));
+await flowdex.resumeAgent(b, "Respond to the queued peer report.", { contextMode: "keep" });
 ```
 
 For detailed contracts, see [executable workflows](workflows.md), [reusable workflows](reusable-workflows.md), [agents](agents.md), [context packs](context-packs.md), [verification](verification.md), [review findings](reviews.md), and [event-driven waits](waiting.md).

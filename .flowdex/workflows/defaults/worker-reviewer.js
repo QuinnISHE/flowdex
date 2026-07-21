@@ -11,7 +11,7 @@ const input = flowdex.requireInput({
 const run = await flowdex.startRun({
   name: input.name,
   agents: {
-    worker: { profile: "implementation_worker" },
+    worker: { model: "gpt-5.6-sol", reasoningEffort: "high" },
     reviewer: { model: "gpt-5.6-luna", reasoningEffort: "xhigh" },
   },
   phases: [

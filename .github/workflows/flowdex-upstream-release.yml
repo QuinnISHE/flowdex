@@ -105,14 +105,24 @@ jobs:
       - name: Build release binary
         working-directory: codex-rs
         shell: bash
-        run: cargo build --release --target "${{ matrix.target }}" -p codex-cli --bin codex
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cargo build --release --target "${{ matrix.target }}" \
+              -p codex-cli --bin codex \
+              -p codex-windows-sandbox --bin codex-windows-sandbox-setup \
+              -p codex-windows-sandbox --bin codex-command-runner
+          else
+            cargo build --release --target "${{ matrix.target }}" -p codex-cli --bin codex
+          fi
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex.exe
-          Compress-Archive -Path dist/flowdex.exe -DestinationPath "${{ matrix.package }}"
+          Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe" dist/
+          Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-command-runner.exe" dist/
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.package }}"
       - name: Package macOS binary
         if: runner.os == 'macOS'
         shell: bash
@@ -147,4 +157,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$BRANCH" \
             --title "Flowdex for ${UPSTREAM_TAG}" \
-            --notes "Flowdex rebuilt from the official Codex ${UPSTREAM_TAG} release. Download the archive for your platform, extract the single Flowdex binary, and run \`flowdex install\`."
+            --notes "Flowdex rebuilt from the official Codex ${UPSTREAM_TAG} release. Download and extract the archive for your platform, then run \`flowdex install\`. The Windows archive contains \`flowdex.exe\`, \`codex-windows-sandbox-setup.exe\`, and \`codex-command-runner.exe\`; each macOS archive contains \`flowdex\`."

@@ -13,7 +13,10 @@ Use a saved V8 JavaScript workflow for orchestration. Node is not required.
 - Use `spawnAgent`, `sendMessage`, `waitAgent`, and `resumeAgent` for small role-neutral conversations. Express rounds with ordinary `for` or `while` loops.
 - Use `flowdex.runWorkflow("repo:name", input)` or `flowdex.runWorkflow("global:name", input)` for reusable nested behavior.
 
-Check `.flowdex/workflows` before authoring. Reuse `repo:defaults/worker-reviewer` for one implementation task with review, or `repo:defaults/research-rounds` for a bounded two-agent research exchange.
+Check `.flowdex/workflows` before authoring. Reuse
+`global:defaults/worker-reviewer` for one implementation task with review, or
+`global:defaults/research-rounds` for a bounded two-agent research exchange.
+Use `repo:defaults/...` only when the trusted repository contains its own copy.
 
 ## Author a run
 
@@ -31,7 +34,7 @@ const input = flowdex.requireInput({
 const run = await flowdex.startRun({
   name: "implementation",
   agents: {
-    worker: { profile: "implementation_worker" },
+    worker: { model: "gpt-5.6-sol", reasoningEffort: "high" },
     reviewer: { model: "gpt-5.6-luna", reasoningEffort: "xhigh" },
   },
   phases: [{
@@ -76,17 +79,17 @@ Wait event-first; never poll. On `steered`, `message`, or `signal`, handle the e
 ## Program generic rounds
 
 ```js
-const a = await flowdex.spawnAgent({ name: "a", instructions: "Research approach A.", profile: "explorer" });
-const b = await flowdex.spawnAgent({ name: "b", instructions: "Research approach B.", profile: "explorer" });
+const a = await flowdex.spawnAgent({ name: "a", instructions: "Research approach A.", model: "gpt-5.6-luna", reasoningEffort: "high" });
+const b = await flowdex.spawnAgent({ name: "b", instructions: "Research approach B.", model: "gpt-5.6-luna", reasoningEffort: "high" });
 
 let aResult = await flowdex.waitAgent(a);
 let bResult = await flowdex.waitAgent(b);
 
 for (let round = 0; round < 2; round++) {
-  await flowdex.sendMessage(a, JSON.stringify(bResult), { delivery: "turn" });
-  aResult = await flowdex.waitAgent(a);
-  await flowdex.sendMessage(b, JSON.stringify(aResult), { delivery: "turn" });
-  bResult = await flowdex.waitAgent(b);
+  await flowdex.sendMessage(a, JSON.stringify(bResult));
+  aResult = await flowdex.resumeAgent(a, "Respond to the queued peer report.", { contextMode: "keep" });
+  await flowdex.sendMessage(b, JSON.stringify(aResult));
+  bResult = await flowdex.resumeAgent(b, "Respond to the queued peer report.", { contextMode: "keep" });
 }
 
 flowdex.output({ a: aResult, b: bResult });
