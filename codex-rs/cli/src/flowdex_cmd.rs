@@ -12,6 +12,15 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const INSTALL_MANIFEST: &str = "flowdex/installed-assets-v1";
+const FLOWDEX_CONFIG_PATH: &str = "flowdex.toml";
+const FLOWDEX_CONFIG_CONTENTS: &str = "# Flowdex global defaults. Repository-local .flowdex settings take precedence.\n\
+compaction_reminder_threshold_tokens = 185000\n\
+multi_agent_version = \"v1\"\n\
+ast_grep_candidate_threshold = 3\n\
+ast_grep_always_run = []\n\
+\n\
+[tool_profiles]\n\
+# Add named tool profiles as [tool_profiles.<name>] tables.\n";
 
 #[cfg(windows)]
 const WINDOWS_HELPERS: &[&str] = &[
@@ -26,12 +35,8 @@ struct BundledAsset {
 
 const BUNDLED_ASSETS: &[BundledAsset] = &[
     BundledAsset {
-        relative_path: "flowdex.toml",
-        contents: "# Flowdex global defaults. Repository-local .flowdex settings take precedence.\n\
-compaction_reminder_threshold_tokens = 150000\n\
-multi_agent_version = \"v1\"\n\
-ast_grep_candidate_threshold = 3\n\
-ast_grep_always_run = []\n",
+        relative_path: FLOWDEX_CONFIG_PATH,
+        contents: FLOWDEX_CONFIG_CONTENTS,
     },
     BundledAsset {
         relative_path: "flowdex/workflows/defaults/research-rounds.js",
@@ -464,12 +469,61 @@ fn install_bundled_assets(codex_home: &Path) -> Result<()> {
         installed_paths.insert(asset.relative_path.to_owned());
     }
 
+    complete_existing_flowdex_config(&codex_home.join(FLOWDEX_CONFIG_PATH))?;
+
     if !installed_paths.is_empty() {
         let contents = installed_paths.into_iter().collect::<Vec<_>>().join("\n") + "\n";
         fs::write(&manifest_path, contents)
             .with_context(|| format!("cannot write {}", manifest_path.display()))?;
     }
     Ok(())
+}
+
+fn complete_existing_flowdex_config(path: &Path) -> Result<()> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let table = match toml::from_str::<toml::Table>(&source) {
+        Ok(table) => table,
+        Err(_) => return Ok(()),
+    };
+
+    let defaults = [
+        (
+            "compaction_reminder_threshold_tokens",
+            "compaction_reminder_threshold_tokens = 185000\n",
+        ),
+        ("multi_agent_version", "multi_agent_version = \"v1\"\n"),
+        (
+            "ast_grep_candidate_threshold",
+            "ast_grep_candidate_threshold = 3\n",
+        ),
+        ("ast_grep_always_run", "ast_grep_always_run = []\n"),
+    ];
+    let mut prefix = String::new();
+    for (key, default) in defaults {
+        if !table.contains_key(key) {
+            prefix.push_str(default);
+        }
+    }
+    let add_tool_profiles = !table.contains_key("tool_profiles");
+    if prefix.is_empty() && !add_tool_profiles {
+        return Ok(());
+    }
+
+    let mut completed = prefix;
+    completed.push_str(&source);
+    if add_tool_profiles {
+        if !completed.ends_with('\n') {
+            completed.push('\n');
+        }
+        completed.push_str(
+            "\n[tool_profiles]\n# Add named tool profiles as [tool_profiles.<name>] tables.\n",
+        );
+    }
+    fs::write(path, completed).with_context(|| format!("cannot update {}", path.display()))
 }
 
 fn purge_installed_assets(codex_home: &Path) -> Result<()> {
@@ -1064,6 +1118,22 @@ mod tests {
         let worker = include_str!("../../../.flowdex/workflows/defaults/worker-reviewer.js");
 
         assert!(config.contains("multi_agent_version = \"v1\""));
+        assert!(config.contains("compaction_reminder_threshold_tokens = 185000"));
+        assert!(config.contains("[tool_profiles]"));
+        for skill in [
+            "collect-flowdex-context",
+            "report-flowdex-review",
+            "run-flowdex-workflows",
+        ] {
+            assert!(
+                BUNDLED_ASSETS
+                    .iter()
+                    .any(|asset| { asset.relative_path == format!("skills/{skill}/SKILL.md") })
+            );
+            assert!(BUNDLED_ASSETS.iter().any(|asset| {
+                asset.relative_path == format!("skills/{skill}/agents/openai.yaml")
+            }));
+        }
         assert!(!research.contains("profile:"));
         assert!(research.contains("flowdex.sendMessage("));
         assert!(research.contains("flowdex.resumeAgent("));
@@ -1101,6 +1171,37 @@ mod tests {
                 .lines()
                 .any(|path| path == "flowdex/workflows/defaults/research-rounds.js")
         );
+    }
+
+    #[test]
+    fn install_completes_valid_existing_config_without_overwriting_values() {
+        let codex_home = tempdir().expect("codex home");
+        let config = codex_home.path().join("flowdex.toml");
+        fs::write(
+            &config,
+            "# user setting\ncompaction_reminder_threshold_tokens = 210000\n",
+        )
+        .expect("user config");
+
+        install_bundled_assets(codex_home.path()).expect("install assets");
+
+        let source = fs::read_to_string(&config).expect("completed config");
+        let table = toml::from_str::<toml::Table>(&source).expect("valid config");
+        assert_eq!(
+            table["compaction_reminder_threshold_tokens"].as_integer(),
+            Some(210000)
+        );
+        assert_eq!(table["multi_agent_version"].as_str(), Some("v1"));
+        assert_eq!(table["ast_grep_candidate_threshold"].as_integer(), Some(3));
+        assert_eq!(
+            table["ast_grep_always_run"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert!(table["tool_profiles"].as_table().is_some());
+        assert!(source.contains("# user setting"));
+        let manifest =
+            fs::read_to_string(codex_home.path().join(INSTALL_MANIFEST)).expect("manifest");
+        assert!(!manifest.lines().any(|path| path == FLOWDEX_CONFIG_PATH));
     }
 
     #[test]

@@ -35,6 +35,8 @@ Each executed entry has `command`, `exitCode`, and integer `durationMs`. A timed
 
 Silent verification suppresses an intermediate model turn and passing verification output in the parent model context. It does not suppress normal user-visible command lifecycle events. On failure, bounded output is returned to JavaScript; Rust does not choose an agent or repair automatically. A workflow can route the result explicitly:
 
+Scheduled task workers receive the exact task verification command list with an explicit note that Flowdex runs it after their turn. Workers should not rerun those commands merely to complete the workflow verification step. When automatic repair is enabled, Flowdex sends the bounded failed result to the same task agent and reruns verification after the repair.
+
 ```js
 const result = await flowdex.verify(commands);
 if (!result.passed) {

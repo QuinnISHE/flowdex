@@ -4,7 +4,7 @@ The frozen `flowdex` bootstrap exposes three agent operations to saved JavaScrip
 
 ## Multi-agent backend
 
-Set `multi_agent_version = "v1"` or `multi_agent_version = "v2"` in `$CODEX_HOME/flowdex.toml` to select the multi-agent backend for all newly loaded Codex tasks. A trusted repository can override it in `.flowdex/config.toml`; omitting the repository setting retains the global value. When the setting is absent everywhere, Codex keeps its normal model- and feature-based selection.
+Set `multi_agent_version = "v1"` or `multi_agent_version = "v2"` in `$CODEX_HOME/flowdex.toml` to select the multi-agent backend for all newly loaded Codex tasks. V1 is the Flowdex default. A trusted repository can override it in `.flowdex/config.toml`; omitting the repository setting retains the global value.
 
 The override does not enable agents when collaboration is unavailable and does not bypass agent depth or capacity limits. Restart Codex and start a new task after changing it; existing runtimes are not reloaded.
 

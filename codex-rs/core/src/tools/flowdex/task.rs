@@ -649,6 +649,7 @@ pub(crate) async fn handle_run_with_review(
         &task.instructions,
         &task.read_scope,
         &task.write_scope,
+        &task.verification,
         supplied,
         review.is_some(),
     );
@@ -827,14 +828,27 @@ fn task_agent_instructions(
     task_instructions: &str,
     read_scope: &[String],
     write_scope: &[String],
+    verification: &[String],
     supplied: &str,
     is_review: bool,
 ) -> String {
     if is_review {
         return supplied.to_string();
     }
+    let verification = if verification.is_empty() {
+        "Flowdex verification: no task commands declared.".to_string()
+    } else {
+        format!(
+            "Flowdex will run these task verification commands automatically after you finish:\n{}\nDo not run them yourself solely to complete workflow verification; Flowdex owns that step.",
+            verification
+                .iter()
+                .map(|command| format!("- {command}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     format!(
-        "Task requirements:\n{task_instructions}\n\nRead scope (advisory): {read_scope:?}\nWrite scope (advisory): {write_scope:?}\n\n{supplied}\n\nFinish with a brief useful summary. Flowdex commits successful task changes automatically."
+        "Task requirements:\n{task_instructions}\n\nRead scope (advisory): {read_scope:?}\nWrite scope (advisory): {write_scope:?}\n\n{verification}\n\n{supplied}\n\nFinish with a brief useful summary. Flowdex commits successful task changes automatically."
     )
 }
 
@@ -1103,6 +1117,7 @@ mod tests {
                 "stored task requirements",
                 &["src/**".into()],
                 &["src/lib.rs".into()],
+                &["cargo test -p example".into()],
                 "review the diff",
                 true,
             ),
@@ -1116,9 +1131,12 @@ mod tests {
             "stored task requirements",
             &["src/**".into()],
             &["src/lib.rs".into()],
+            &["cargo test -p example".into()],
             "implement the requirements above",
             false,
         );
         assert_eq!(prompt.matches("stored task requirements").count(), 1);
+        assert!(prompt.contains("cargo test -p example"));
+        assert!(prompt.contains("Flowdex will run these task verification commands automatically"));
     }
 }

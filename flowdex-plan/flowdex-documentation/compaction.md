@@ -25,7 +25,7 @@ Flowdex can add one reminder when the active context reaches the configured
 token threshold. The supported setting is:
 
 ```toml
-compaction_reminder_threshold_tokens = 150000
+compaction_reminder_threshold_tokens = 185000
 ```
 
 Configuration is read from the global `$CODEX_HOME/flowdex.toml`. A trusted
@@ -33,7 +33,7 @@ project may override it in `<project-root>/.flowdex/config.toml` when that file
 contains the field. The project root is the resolved Git/worktree root, or the
 resolved session working directory when no Git root exists. The repository file
 participates only under Codex's existing project-trust decision. The default is
-`150000`; the value must be a positive integer. Missing files are normal, while
+`185000`; the value must be a positive integer. Missing files are normal, while
 malformed TOML, unknown fields, and invalid values produce path-specific
 configuration errors.
 

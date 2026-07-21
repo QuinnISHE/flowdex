@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 150_000;
+pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 185_000;
 pub const DEFAULT_AST_GREP_CANDIDATE_THRESHOLD: i64 = 3;
 
 /// Multi-agent backend version selected by Flowdex configuration.
@@ -54,7 +54,7 @@ pub fn load_config(
     let mut ast_grep_candidate_threshold = DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
-    let mut multi_agent_version = None;
+    let mut multi_agent_version = Some(FlowdexMultiAgentVersion::V1);
 
     if let Some(config) = read_partial(&global_path)? {
         if let Some(value) = config.compaction_reminder_threshold_tokens {
@@ -278,7 +278,7 @@ mod tests {
 
         assert_eq!(
             config(temp.path(), Some(&repository_root)).multi_agent_version,
-            None
+            Some(FlowdexMultiAgentVersion::V1)
         );
 
         fs::write(

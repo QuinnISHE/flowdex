@@ -1235,10 +1235,11 @@ async fn complete_task(
                 run_verify_handler(controller.invocation.clone(), task_id.to_string())
                     .await
                     .map_err(|error| ("verification".to_string(), error.to_string()))?;
-            let passed = verification_output
-                .code_mode_result(&ToolPayload::Function {
+            let verification_result =
+                verification_output.code_mode_result(&ToolPayload::Function {
                     arguments: serde_json::json!({"task_id": task_id}).to_string(),
-                })
+                });
+            let passed = verification_result
                 .get("passed")
                 .and_then(serde_json::Value::as_bool)
                 == Some(true);
@@ -1272,8 +1273,11 @@ async fn complete_task(
             resume_task_agent(
                 controller,
                 task_agent_id,
-                "Verification failed for this task. Repair the failure while preserving the original requirements, then rerun the declared verification commands. Create a new commit; do not amend, rebase, reset, or rewrite existing commits."
-                    .into(),
+                format!(
+                    "Flowdex ran the declared task verification and it failed. Repair the failure while preserving the original requirements. Do not run the declared verification commands yourself; Flowdex will rerun them automatically after your repair. Create a new commit; do not amend, rebase, reset, or rewrite existing commits.\n\nVerification result:\n{}",
+                    serde_json::to_string_pretty(&verification_result)
+                        .unwrap_or_else(|_| verification_result.to_string())
+                ),
             )
             .await
                 .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
@@ -1639,7 +1643,7 @@ async fn repair_phase_task(
         controller,
         agent_id,
         format!(
-            "Repair these phase review findings while preserving the original task requirements, then rerun verification:\n{repair}"
+            "Repair these phase review findings while preserving the original task requirements. Do not run the declared verification commands yourself; Flowdex will run them automatically after your repair:\n{repair}"
         ),
     )
     .await?;
@@ -1992,7 +1996,7 @@ async fn review_task_rounds(
             controller,
             &agent_id,
             format!(
-                "Repair these review findings while preserving the original task requirements, then rerun verification. Create a new commit; do not amend, rebase, reset, or rewrite existing commits:\n{repair}"
+                "Repair these review findings while preserving the original task requirements. Do not run the declared verification commands yourself; Flowdex will run them automatically after your repair. Create a new commit; do not amend, rebase, reset, or rewrite existing commits:\n{repair}"
             ),
         )
         .await?;
