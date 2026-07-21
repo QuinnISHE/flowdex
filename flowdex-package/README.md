@@ -1,6 +1,29 @@
 # Flowdex package
 
-Place the release package files in this directory:
+## Judge demo quick start
+
+1. Extract the complete archive and keep the three `.exe` files together.
+2. In PowerShell, run `./flowdex.exe install`.
+3. Fully quit and reopen the Codex app.
+4. Open the included `Flowdex-Demo` folder in Codex and trust the repository.
+5. Ask Codex: `Read START-HERE.md and follow it exactly.`
+6. When the workflow completes, open `Flowdex-Demo/index.html` directly.
+
+The demo begins as a clean Git repository with no generated application files.
+Flowdex collects a context pack, runs a reusable nested workflow, dispatches
+parallel implementation agents, dynamically queues a dependent task, runs
+automatic verification and an AST-grep rule, routes an intentional review
+finding back to its worker, pauses at an orchestrator boundary, and integrates
+the committed result. The finished page is a centered animated FLOWDEX logo.
+
+## Package contents
+
+- `flowdex.exe`
+- `codex-windows-sandbox-setup.exe`
+- `codex-command-runner.exe`
+- `Flowdex-Demo/`
+
+For a package assembled from source, place the release files in this directory:
 
 - Windows: copy `codex-rs/target/release/codex.exe` here as `flowdex.exe`, plus
   `codex-windows-sandbox-setup.exe` and `codex-command-runner.exe` from the same
