@@ -1034,7 +1034,7 @@ async fn resolve_or_collect_context(
     let pack = pack.to_string();
     let pack_for_resolve = pack.clone();
     let integration = controller.info.integration_worktree.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
+    let mut resolved = tokio::task::spawn_blocking(move || {
         store.resolve_context_pack(&run_id, &pack_for_resolve, &integration)
     })
     .await
@@ -1048,34 +1048,43 @@ async fn resolve_or_collect_context(
         format!("Collecting context: {pack}"),
     )
     .await;
-    collect_context(controller, &pack, &resolved).await?;
-    let store = Arc::clone(&controller.store);
-    let run_id = controller.id.clone();
-    let pack_for_resolve = pack.clone();
-    let integration = controller.info.integration_worktree.clone();
-    let refreshed = tokio::task::spawn_blocking(move || {
-        store.resolve_context_pack(&run_id, &pack_for_resolve, &integration)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-    if refreshed.status != ContextPackStatus::Fresh {
-        let source = refreshed.stale_sources.first().map(|source| {
-            format!(
-                "; stale fragment {} at {}:{}-{}",
-                source.key,
-                source.path.display(),
-                source.line_start,
-                source.line_end
+    for attempt in 0..2 {
+        collect_context(controller, &pack, &resolved).await?;
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let pack_for_resolve = pack.clone();
+        let integration = controller.info.integration_worktree.clone();
+        resolved = tokio::task::spawn_blocking(move || {
+            store.resolve_context_pack(&run_id, &pack_for_resolve, &integration)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        if resolved.status == ContextPackStatus::Fresh {
+            progress(&controller.invocation, format!("Context ready: {pack}")).await;
+            return Ok(resolved);
+        }
+        if attempt == 0 {
+            progress(
+                &controller.invocation,
+                format!("Retrying context collection: {pack}"),
             )
-        });
-        return Err(format!(
-            "context collector completed without fresh pack {pack}{}",
-            source.unwrap_or_default()
-        ));
+            .await;
+        }
     }
-    progress(&controller.invocation, format!("Context ready: {pack}")).await;
-    Ok(refreshed)
+    let source = resolved.stale_sources.first().map(|source| {
+        format!(
+            "; stale fragment {} at {}:{}-{}",
+            source.key,
+            source.path.display(),
+            source.line_start,
+            source.line_end
+        )
+    });
+    Err(format!(
+        "context collectors completed without fresh pack {pack}{}",
+        source.unwrap_or_default()
+    ))
 }
 
 async fn collect_context(
