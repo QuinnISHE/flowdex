@@ -851,7 +851,7 @@ async fn run_phase(
                     .ok_or_else(|| "agent missing".to_string())?;
                 let agent = AgentSpec {
                     name: scheduler_agent_name("task", &task_def.name, &scheduled.task_id),
-                    instructions: task_instructions,
+                    instructions: "Implement the task requirements above.".into(),
                     profile: agent_def.profile,
                     model: agent_def.model,
                     reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
@@ -1126,10 +1126,9 @@ async fn collect_context(
         .get(&pack_definition.agent)
         .cloned()
         .ok_or_else(|| format!("context pack agent {} is missing", pack_definition.agent))?;
-    let collector_instructions = declaration.instructions.clone();
     let agent = AgentSpec {
         name: format!("context_collector_{collector_suffix}"),
-        instructions: collector_instructions,
+        instructions: "Collect and publish the context pack described above.".into(),
         profile: agent_definition.profile,
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),
@@ -1261,10 +1260,8 @@ async fn complete_task(
             resume_task_agent(
                 controller,
                 task_agent_id,
-                format!(
-                    "Verification failed for this task. Repair the failure and rerun the declared verification commands.\n\n{}",
-                    task_def.instructions
-                ),
+                "Verification failed for this task. Repair the failure while preserving the original requirements, then rerun the declared verification commands."
+                    .into(),
             )
             .await
                 .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
@@ -1600,8 +1597,7 @@ async fn repair_phase_task(
         controller,
         agent_id,
         format!(
-            "Repair these phase review findings and rerun verification:\n{repair}\n\n{}",
-            task_def.instructions
+            "Repair these phase review findings while preserving the original task requirements, then rerun verification:\n{repair}"
         ),
     )
     .await?;
@@ -1912,8 +1908,7 @@ async fn review_task(
             controller,
             &agent_id,
             format!(
-                "Repair these review findings and rerun verification:\n{repair}\n\n{}",
-                task_def.instructions
+                "Repair these review findings while preserving the original task requirements, then rerun verification:\n{repair}"
             ),
         )
         .await?;

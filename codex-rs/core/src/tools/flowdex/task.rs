@@ -642,9 +642,12 @@ pub(crate) async fn handle_run_with_review(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let instructions = format!(
-        "Task requirements:\n{}\n\nRead scope (advisory): {:?}\nWrite scope (advisory): {:?}\n\n{}\n\nFinish with a brief useful summary. Flowdex commits successful task changes automatically.",
-        task.instructions, task.read_scope, task.write_scope, supplied
+    let instructions = task_agent_instructions(
+        &task.instructions,
+        &task.read_scope,
+        &task.write_scope,
+        supplied,
+        review.is_some(),
     );
     let model = config
         .model
@@ -802,6 +805,21 @@ pub(crate) async fn handle_run_with_review(
     )
     .await?;
     Ok(JsonOutput(status_value(id, status)))
+}
+
+fn task_agent_instructions(
+    task_instructions: &str,
+    read_scope: &[String],
+    write_scope: &[String],
+    supplied: &str,
+    is_review: bool,
+) -> String {
+    if is_review {
+        return supplied.to_string();
+    }
+    format!(
+        "Task requirements:\n{task_instructions}\n\nRead scope (advisory): {read_scope:?}\nWrite scope (advisory): {write_scope:?}\n\n{supplied}\n\nFinish with a brief useful summary. Flowdex commits successful task changes automatically."
+    )
 }
 
 pub(crate) async fn run_task_agent_with_review(
@@ -1006,6 +1024,7 @@ impl ToolOutput for JsonOutput {
 mod tests {
     use super::repository_identity;
     use super::repository_root;
+    use super::task_agent_instructions;
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
@@ -1058,5 +1077,31 @@ mod tests {
             repository_root(&nested).unwrap(),
             repository.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn review_prompt_uses_supplied_review_instructions_only() {
+        assert_eq!(
+            task_agent_instructions(
+                "stored task requirements",
+                &["src/**".into()],
+                &["src/lib.rs".into()],
+                "review the diff",
+                true,
+            ),
+            "review the diff"
+        );
+    }
+
+    #[test]
+    fn worker_prompt_includes_stored_requirements_once() {
+        let prompt = task_agent_instructions(
+            "stored task requirements",
+            &["src/**".into()],
+            &["src/lib.rs".into()],
+            "implement the requirements above",
+            false,
+        );
+        assert_eq!(prompt.matches("stored task requirements").count(), 1);
     }
 }
