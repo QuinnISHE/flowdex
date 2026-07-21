@@ -55,6 +55,10 @@ const run = await flowdex.startRun({
 flowdex.output(await run.wait());
 ```
 
+`run.wait()` waits for terminal scheduler completion. It stays pending at
+orchestrator and human boundaries; handle those outside JavaScript with
+`wait_flowdex_workflow` and `continue_flowdex_workflow`.
+
 Dependency-ready tasks run concurrently. Phases run in order. `readScope` and `writeScope` are scheduling hints, not access controls. If `open: true`, add work with `run.queueTask(...)`, then call `run.sealPhase(...)`.
 
 ## Save and dispatch

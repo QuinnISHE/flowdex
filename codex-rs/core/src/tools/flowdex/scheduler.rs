@@ -540,25 +540,13 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
         .cloned()
         .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex run not found".into()))?;
     let mut rx = controller.status_rx.clone();
-    let mut boundary_wait = Box::pin(super::wait_for_flowdex_boundary(args.run_id.clone()));
     loop {
         let status = rx.borrow_and_update().clone();
         match status {
             RunStatus::Running => {
-                tokio::select! {
-                    boundary = &mut boundary_wait => {
-                        return Ok(task::JsonOutput(serde_json::json!({
-                            "runId": boundary.run_id,
-                            "status": "boundary",
-                            "scope": {"kind": boundary.scope_kind, "name": boundary.scope_id},
-                            "target": boundary.target,
-                            "reason": boundary.reason,
-                        })));
-                    }
-                    changed = rx.changed() => {
-                        changed.map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
-                    }
-                }
+                rx.changed()
+                    .await
+                    .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
             }
             RunStatus::Completed => {
                 remove_run_controller(&args.run_id).await;

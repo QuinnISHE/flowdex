@@ -132,10 +132,8 @@ pub(crate) async fn publish_flowdex_boundary(
     state.consumed = false;
     state.activity_generation = state.activity_generation.wrapping_add(1);
     let _ = state.activity.send(state.activity_generation);
-    state
-        .signal
-        .send(Some(boundary))
-        .map_err(|_| "Flowdex boundary waiters stopped".to_string())
+    state.signal.send_replace(Some(boundary));
+    Ok(())
 }
 
 pub(crate) async fn publish_flowdex_signal(

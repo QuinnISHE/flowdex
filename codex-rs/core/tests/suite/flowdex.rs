@@ -639,7 +639,7 @@ impl Respond for OrchestratorBoundaryResponder {
             ]));
         }
         if has_function_call_output(request, "call-boundary-continue") {
-            let start: Value = function_call_output_text(request, "call-boundary-start")
+            let boundary: Value = function_call_output_text(request, "call-boundary-wait")
                 .and_then(|text| serde_json::from_str(&text).ok())
                 .unwrap_or_default();
             return sse_response(sse(vec![
@@ -647,18 +647,14 @@ impl Respond for OrchestratorBoundaryResponder {
                 ev_function_call(
                     "call-boundary-final-wait",
                     "wait_flowdex_workflow",
-                    &serde_json::json!({ "run_id": start["runId"] }).to_string(),
+                    &serde_json::json!({ "run_id": boundary["runId"] }).to_string(),
                 ),
                 ev_completed("resp-boundary-final-wait"),
             ]));
         }
-        if has_function_call_output(request, "call-boundary-start") {
-            let start: Value = function_call_output_text(request, "call-boundary-start")
+        if has_function_call_output(request, "call-boundary-wait") {
+            let boundary: Value = function_call_output_text(request, "call-boundary-wait")
                 .and_then(|text| serde_json::from_str(&text).ok())
-                .unwrap_or_default();
-            let boundary: Value = start["output"]
-                .as_str()
-                .and_then(|text| serde_json::from_str(text).ok())
                 .unwrap_or_default();
             return sse_response(sse(vec![
                 ev_response_created("resp-boundary-continue"),
@@ -668,6 +664,20 @@ impl Respond for OrchestratorBoundaryResponder {
                     &serde_json::json!({ "run_id": boundary["runId"] }).to_string(),
                 ),
                 ev_completed("resp-boundary-continue"),
+            ]));
+        }
+        if has_function_call_output(request, "call-boundary-start") {
+            let start: Value = function_call_output_text(request, "call-boundary-start")
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+            return sse_response(sse(vec![
+                ev_response_created("resp-boundary-wait"),
+                ev_function_call(
+                    "call-boundary-wait",
+                    "wait_flowdex_workflow",
+                    &serde_json::json!({ "run_id": start["runId"] }).to_string(),
+                ),
+                ev_completed("resp-boundary-wait"),
             ]));
         }
         if body_contains(request, "boundary task instructions") {
@@ -2002,10 +2012,7 @@ fn flowdex_orchestrator_boundary_continues_to_terminal_result() -> Result<()> {
     tasks: [{ name: 'only', agent: 'worker', instructions: 'boundary task instructions' }],
   }],
 });
-const boundary = await run.wait();
-text(JSON.stringify(boundary));
-await new Promise(resolve => setTimeout(resolve, 15000));
-text(JSON.stringify(await run.wait()));"#,
+flowdex.output(await run.wait());"#,
                 )?;
                 fs::write(cwd.join("README.md"), "orchestrator boundary fixture\n")?;
                 let git = |args: &[&str]| -> Result<()> {
@@ -2038,8 +2045,15 @@ text(JSON.stringify(await run.wait()));"#,
         let start: Value = serde_json::from_str(
             &function_call_output_text(start_request, "call-boundary-start").unwrap(),
         )?;
-        assert_eq!(start["status"], "yielded");
-        let boundary: Value = serde_json::from_str(start["output"].as_str().unwrap_or_default())?;
+        assert_eq!(start["status"], "yielded", "{start:#}");
+
+        let boundary_request = requests
+            .iter()
+            .find(|request| has_function_call_output(request, "call-boundary-wait"))
+            .expect("direct boundary result");
+        let boundary: Value = serde_json::from_str(
+            &function_call_output_text(boundary_request, "call-boundary-wait").unwrap(),
+        )?;
         assert_eq!(boundary["status"], "boundary");
         assert_eq!(boundary["target"], "orchestrator");
 

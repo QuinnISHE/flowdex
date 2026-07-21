@@ -53,8 +53,12 @@ const run = await flowdex.startRun({
 
 const result = await run.wait();
 // { runId, status: "completed" }
-// or { runId, status: "boundary", scope: { kind, name }, target, reason }
 ```
+
+Saved-workflow `run.wait()` waits only for terminal scheduler completion. It
+remains pending at orchestrator and human boundaries; the orchestration model
+receives those boundaries from `wait_flowdex_workflow`, continues them with
+`continue_flowdex_workflow`, and then waits for the next event.
 
 Phases run in declaration order. Ready tasks run concurrently within the
 existing shared agent capacity; dependencies determine semantic ordering. The
