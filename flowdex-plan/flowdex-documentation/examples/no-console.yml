@@ -1,0 +1,7 @@
+# Repository rules live in .flowdex/ast-grep/rules/*.yml.
+id: no-console
+language: JavaScript
+rule:
+  pattern: console.log($$$ARGS)
+message: Use the project logger instead of console.log
+severity: warning
