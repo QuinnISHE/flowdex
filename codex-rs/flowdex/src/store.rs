@@ -501,12 +501,12 @@ impl FlowdexStore {
         }
         // The trusted root is intentionally validated independently. The source
         // is read from the explicit execution worktree, which may be a sibling.
-        let content = read_source_range(
+        let content = canonicalize_content(&read_source_range(
             &execution_root,
             &publication.path,
             publication.line_start,
             publication.line_end,
-        )?;
+        )?);
         let content_hash = hash_content(&content);
         Ok(self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -593,7 +593,7 @@ impl FlowdexStore {
             let content = row.get::<String, _>(6);
             let content_hash = row.get::<String, _>(7);
             let fresh = read_source_range(&root, &path, line_start, line_end)
-                .map(|current| hash_content(&current) == content_hash)
+                .map(|current| canonicalize_content(&current) == canonicalize_content(&content))
                 .unwrap_or(false);
             if !fresh {
                 stale_sources.push(ContextStaleSource {
@@ -1995,6 +1995,9 @@ fn hash_content(content: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+fn canonicalize_content(content: &str) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
+}
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3016,6 +3019,39 @@ mod tests {
             "SELECT superseded_version FROM context_fragments WHERE run_id='run' AND pack='pack' AND fragment_key='source' AND version=2"
         ).fetch_one(&store.pool)).unwrap();
         assert_eq!(superseded, Some(1));
+    }
+
+    #[test]
+    fn context_freshness_normalizes_line_endings() {
+        let (repo, store, _run) = context_store();
+        let collector = tempdir().unwrap();
+        fs::write(repo.path().join("source.txt"), "one\ntwo\n").unwrap();
+        fs::write(collector.path().join("source.txt"), "one\r\ntwo\r\n").unwrap();
+        let fragment = store
+            .publish_context_fragment(
+                "run",
+                collector.path(),
+                repo.path(),
+                &ContextPublisher::default(),
+                &ContextPublication {
+                    pack: "pack".into(),
+                    key: "source".into(),
+                    path: PathBuf::from("source.txt"),
+                    line_start: 1,
+                    line_end: 2,
+                    summary: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(fragment.content, "one\ntwo\n");
+        assert_eq!(
+            store
+                .resolve_context_pack("run", "pack", repo.path())
+                .unwrap()
+                .status,
+            ContextPackStatus::Fresh
+        );
     }
 
     #[test]

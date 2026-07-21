@@ -1034,8 +1034,18 @@ async fn resolve_or_collect_context(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if refreshed.status != ContextPackStatus::Fresh {
+        let source = refreshed.stale_sources.first().map(|source| {
+            format!(
+                "; stale fragment {} at {}:{}-{}",
+                source.key,
+                source.path.display(),
+                source.line_start,
+                source.line_end
+            )
+        });
         return Err(format!(
-            "context collector completed without fresh pack {pack}"
+            "context collector completed without fresh pack {pack}{}",
+            source.unwrap_or_default()
         ));
     }
     progress(&controller.invocation, format!("Context ready: {pack}")).await;
