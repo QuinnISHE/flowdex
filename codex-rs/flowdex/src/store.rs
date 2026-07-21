@@ -2141,20 +2141,12 @@ fn remove_task_worktree(
             FlowdexStoreError::Integration("task worktree remained registered".to_string())
         }));
     }
-    if canonical_path.exists()
-        && let Err(cleanup_error) = remove_dir_all_with_retry(&canonical_path)
-    {
-        let git_error = git_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "git left the task directory behind".to_string());
-        return Err(FlowdexStoreError::Integration(format!(
-            "{git_error}; exact task directory cleanup failed: {cleanup_error}"
-        )));
-    }
-    if canonical_path.exists() {
-        return Err(FlowdexStoreError::Integration(
-            "task worktree directory still exists after cleanup".to_string(),
-        ));
+    if canonical_path.exists() && remove_dir_all_with_retry(&canonical_path).is_err() {
+        // Git already detached this exact worktree. A transient Windows sharing lock must not
+        // roll back valid integration; keep retrying only the validated residual path.
+        defer_task_directory_cleanup(canonical_path);
+    } else {
+        prune_empty_run_directory(&canonical_path);
     }
     Ok(())
 }
@@ -2185,6 +2177,30 @@ fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
         }
     }
     Err(last_error.expect("directory removal retry records an error"))
+}
+
+fn defer_task_directory_cleanup(path: PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("flowdex-worktree-cleanup".to_string())
+        .spawn(move || {
+            for attempt in 0..3000 {
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) if attempt < 2999 => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => return,
+                }
+            }
+            prune_empty_run_directory(&path);
+        });
+}
+
+fn prune_empty_run_directory(task_path: &Path) {
+    if let Some(run_path) = task_path.parent() {
+        let _ = fs::remove_dir(run_path);
+    }
 }
 
 fn git_operation_in_progress(worktree: &Path) -> Result<bool, FlowdexStoreError> {
@@ -2653,6 +2669,37 @@ mod tests {
         remove_dir_all_with_retry(&task).unwrap();
         releaser.join().unwrap();
         assert!(!task.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_task_cleanup_finishes_after_windows_handle_release() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        let task = run.join("task");
+        fs::create_dir_all(&task).unwrap();
+        let file = task.join("locked.txt");
+        fs::write(&file, "locked").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+
+        defer_task_directory_cleanup(task.clone());
+        std::thread::sleep(Duration::from_millis(250));
+        drop(locked);
+        for _ in 0..100 {
+            if !run.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(!task.exists());
+        assert!(!run.exists());
     }
 
     #[test]
