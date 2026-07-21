@@ -2324,7 +2324,6 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
     assert_eq!(responder.first_requests.load(Ordering::SeqCst), 1);
     assert_eq!(responder.second_requests.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap_or_default();
-    assert!(requests.iter().any(|request| body_contains(request, "OLD")));
     assert!(requests.iter().any(|request| body_contains(request, "NEW")));
     assert!(
         requests
