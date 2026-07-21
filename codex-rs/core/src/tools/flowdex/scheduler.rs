@@ -19,6 +19,7 @@ use codex_flowdex::workflow::ContextPackDefinition;
 use codex_flowdex::{
     Boundary, PhaseDefinition, ReviewDefinition, TaskDefinition, WorkflowDefinition,
 };
+use codex_protocol::error::CodexErr;
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_tools::shell_command_backend_for_features;
@@ -873,29 +874,52 @@ async fn run_phase(
         let mut first_error = None;
         for completed in completed {
             let (scheduled, task_def, operation) = completed?;
-            if let Err(error) = operation {
+            let operation = match operation {
+                Ok(operation) => operation,
+                Err(error) => {
+                    let store = Arc::clone(&controller.store);
+                    let task_id = scheduled.task_id.clone();
+                    if is_capacity_error(&error) {
+                        let _ =
+                            tokio::task::spawn_blocking(move || store.mark_task_ready(&task_id))
+                                .await;
+                        retry_capacity = true;
+                    } else {
+                        let _ =
+                            tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id))
+                                .await;
+                        progress(
+                            &controller.invocation,
+                            format!("Task {} failed during agent", task_def.name),
+                        )
+                        .await;
+                        first_error.get_or_insert_with(|| error.to_string());
+                    }
+                    continue;
+                }
+            };
+            let task_agent_id = operation
+                .code_mode_result(&ToolPayload::Function {
+                    arguments: serde_json::json!({"task_id": scheduled.task_id}).to_string(),
+                })
+                .get("agentId")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let Some(task_agent_id) = task_agent_id else {
                 let store = Arc::clone(&controller.store);
                 let task_id = scheduled.task_id.clone();
-                if is_capacity_error(&error) {
-                    let _ =
-                        tokio::task::spawn_blocking(move || store.mark_task_ready(&task_id)).await;
-                    retry_capacity = true;
-                } else {
-                    let _ =
-                        tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
-                    progress(
-                        &controller.invocation,
-                        format!("Task {} failed during agent", task_def.name),
-                    )
-                    .await;
-                    first_error.get_or_insert_with(|| error.to_string());
-                }
+                let _ = tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
+                first_error.get_or_insert_with(|| {
+                    format!("Task {} did not return an agent ID", task_def.name)
+                });
                 continue;
-            }
+            };
             if let Err((stage, error)) = complete_task(
                 controller,
                 &scheduled.task_id,
                 &task_def,
+                &task_agent_id,
                 phase.review.is_some(),
             )
             .await
@@ -1134,14 +1158,17 @@ async fn collect_context(
 
 async fn close_task_agents(controller: &RunController, task_id: &str) -> Result<(), String> {
     for agent_id in task::agents_for_task(task_id) {
-        controller
+        match controller
             .invocation
             .session
             .services
             .agent_control
             .close_agent(agent_id)
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     task::forget_task_agents(task_id);
     Ok(())
@@ -1182,6 +1209,7 @@ async fn complete_task(
     controller: &Arc<RunController>,
     task_id: &str,
     task_def: &TaskDefinition,
+    task_agent_id: &str,
     retain_worktree: bool,
 ) -> Result<(), (String, String)> {
     if !task_def.verification.is_empty() {
@@ -1230,32 +1258,15 @@ async fn complete_task(
                 ),
             )
             .await;
-            let agent_def = controller
-                .definition
-                .lock()
-                .await
-                .agents
-                .get(&task_def.agent)
-                .cloned()
-                .ok_or_else(|| {
-                    (
-                        "verification repair".to_string(),
-                        "agent missing".to_string(),
-                    )
-                })?;
-            let agent = AgentSpec {
-                name: scheduler_agent_name("task", &task_def.name, task_id),
-                instructions: format!(
+            resume_task_agent(
+                controller,
+                task_agent_id,
+                format!(
                     "Verification failed for this task. Repair the failure and rerun the declared verification commands.\n\n{}",
                     task_def.instructions
                 ),
-                profile: agent_def.profile,
-                model: agent_def.model,
-                reasoning_effort: agent_def.reasoning_effort.and_then(parse_effort),
-                tool_profile: agent_def.tool_profile,
-            };
-            run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
-                .await
+            )
+            .await
                 .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
         }
         let store = Arc::clone(&controller.store);
