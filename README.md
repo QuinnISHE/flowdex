@@ -1,10 +1,10 @@
 # Flowdex
 
-Flowdex is a modified Codex CLI for running model-authored coding workflows. It moves routine orchestration out of the main model loop: a saved JavaScript workflow can dispatch agents, wait on events, verify changes, route review findings, and continue through dependencies without repeatedly waking the orchestrator.
+Flowdex is a modified Codex CLI for running model-authored coding workflows. It takes the model out of the loop for trivial orchestration decisions, and instead only uses Codex models when their input is genuinely needed.
 
 Workflows run in Codex's native V8 runtime and require no Node.js installation.
 
-## What it adds
+## Features
 
 - Durable runs composed of phases and dependency-aware tasks.
 - Parallel agents working in isolated Git worktrees with commit attribution.
@@ -15,7 +15,7 @@ Workflows run in Codex's native V8 runtime and require no Node.js installation.
 - Automatic, nonpersistent progress summaries and normal app-visible subagent events.
 - Native context compaction, per-agent tool profiles, and repository AST-grep rules.
 
-See the [getting-started guide](flowdex-plan/flowdex-documentation/getting-started.md), [workflow documentation](flowdex-plan/flowdex-documentation/workflows.md), and [video demo](flowdex-demo/VIDEO_DEMO.md).
+See the release to download the binary, along with a demo that will create an HTML file displaying an animated Flowdex logo.
 
 ## Build
 
