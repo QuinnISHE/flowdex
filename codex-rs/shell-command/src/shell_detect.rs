@@ -125,6 +125,16 @@ fn get_user_shell_path() -> Option<PathBuf> {
 }
 
 fn file_exists(path: &std::path::Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+    }) {
+        return None;
+    }
+
     if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
         Some(PathBuf::from(path))
     } else {
@@ -150,7 +160,9 @@ fn get_shell_path(
         return Some(default_shell_path);
     }
 
-    if let Ok(path) = which::which(binary_name) {
+    if let Ok(path) = which::which(binary_name)
+        && let Some(path) = file_exists(&path)
+    {
         return Some(path);
     }
 
@@ -364,5 +376,30 @@ mod tests {
             detect_shell_type(PathBuf::from("cmd.exe")),
             Some(ShellType::Cmd)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_apps_executables_are_not_selected_as_shells() {
+        assert_eq!(
+            file_exists(std::path::Path::new(
+                r"C:\Users\user\AppData\Local\Microsoft\WindowsApps\pwsh.exe",
+            )),
+            None
+        );
+        assert_eq!(
+            file_exists(std::path::Path::new(
+                r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.3.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            )),
+            None
+        );
+
+        let default_shell = default_user_shell();
+        assert!(!default_shell.shell_path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        }));
     }
 }
