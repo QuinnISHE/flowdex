@@ -748,6 +748,73 @@ impl Respond for OrchestratorBoundaryResponder {
 }
 
 #[derive(Clone, Default)]
+struct PauseResumeResponder;
+
+impl Respond for PauseResumeResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if has_function_call_output(request, "call-pause-wait") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-pause-done"),
+                ev_completed("resp-pause-done"),
+            ]));
+        }
+        let steps = [
+            (
+                "call-pause-seal",
+                "call-pause-wait",
+                "wait_flowdex_workflow",
+            ),
+            ("call-pause-resume", "call-pause-seal", "seal_flowdex_phase"),
+            (
+                "call-pause-request",
+                "call-pause-resume",
+                "resume_flowdex_workflow",
+            ),
+            (
+                "call-pause-start",
+                "call-pause-request",
+                "pause_flowdex_workflow",
+            ),
+        ];
+        for (previous, next, tool) in steps {
+            if has_function_call_output(request, previous) {
+                let output: Value = function_call_output_text(request, previous)
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default();
+                let arguments = if tool == "seal_flowdex_phase" {
+                    serde_json::json!({"run_id": output["runId"], "phase": "open"})
+                } else {
+                    serde_json::json!({"run_id": output["runId"]})
+                };
+                return sse_response(sse(vec![
+                    ev_response_created(&format!("resp-{next}")),
+                    ev_function_call(next, tool, &arguments.to_string()),
+                    ev_completed(&format!("resp-{next}")),
+                ]));
+            }
+        }
+        if body_contains(request, "run the pause workflow") {
+            return sse_response(sse(vec![
+                ev_response_created("resp-pause-start"),
+                ev_function_call(
+                    "call-pause-start",
+                    "start_flowdex_workflow",
+                    &serde_json::json!({
+                        "path": ".flowdex/workflows/pause.js"
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-pause-start"),
+            ]));
+        }
+        sse_response(sse(vec![
+            ev_response_created("resp-pause-empty"),
+            ev_completed("resp-pause-empty"),
+        ]))
+    }
+}
+
+#[derive(Clone, Default)]
 struct JoinedFlowResponder {
     alpha_requests: Arc<AtomicUsize>,
     review_repairs: Arc<AtomicUsize>,
@@ -2198,6 +2265,92 @@ flowdex.output(await run.wait());"#,
                 boundary["runId"].as_str().unwrap()
             )) && output.contains(r#""status":"completed""#)
         }));
+        Ok(())
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result
+}
+
+#[test]
+fn flowdex_pause_and_resume_keeps_the_live_workflow_cell() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(16 * 1024 * 1024)
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let server = start_mock_server().await;
+        let mut builder = test_codex()
+            .with_model("gpt-5.2")
+            .with_config(|config| {
+                config.features.enable(Feature::CodeMode).unwrap();
+                config.active_project.trust_level = Some(TrustLevel::Trusted);
+            })
+            .with_workspace_setup(|cwd, _fs| async move {
+                let workflow_dir = cwd.join(".flowdex/workflows");
+                fs::create_dir_all(&workflow_dir)?;
+                fs::write(
+                    workflow_dir.join("pause.js"),
+                    r#"const run = await flowdex.startRun({
+  name: 'pause-fixture',
+  agents: { worker: { model: 'gpt-5.4' } },
+  phases: [{
+    name: 'open',
+    instructions: 'Wait for dynamically queued work.',
+    open: true,
+    tasks: [],
+  }],
+});
+flowdex.output(await run.wait());"#,
+                )?;
+                fs::write(cwd.join("README.md"), "pause fixture\n")?;
+                let git = |args: &[&str]| -> Result<()> {
+                    let output = Command::new("git").current_dir(&cwd).args(args).output()?;
+                    anyhow::ensure!(output.status.success(), "git {args:?} failed");
+                    Ok(())
+                };
+                git(&["init"])?;
+                git(&["config", "user.name", "Flowdex Test"])?;
+                git(&["config", "user.email", "flowdex-test@example.com"])?;
+                git(&["add", "."])?;
+                git(&["commit", "-m", "pause fixture baseline"])?;
+                Ok::<(), anyhow::Error>(())
+            });
+        let test = builder.build(&server).await?;
+        Mock::given(method("POST"))
+            .and(path_regex(".*/responses$"))
+            .respond_with(PauseResumeResponder)
+            .mount(&server)
+            .await;
+
+        test.submit_turn("run the pause workflow").await?;
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let output = |call_id: &str| -> Result<Value> {
+            let request = requests
+                .iter()
+                .find(|request| has_function_call_output(request, call_id))
+                .ok_or_else(|| anyhow::anyhow!("missing output for {call_id}"))?;
+            Ok(serde_json::from_str(
+                &function_call_output_text(request, call_id).unwrap(),
+            )?)
+        };
+        let start = output("call-pause-start")?;
+        let paused = output("call-pause-request")?;
+        let resumed = output("call-pause-resume")?;
+        let terminal = output("call-pause-wait")?;
+        assert_eq!(start["status"], "yielded");
+        assert_eq!(paused["status"], "paused");
+        assert_eq!(resumed["status"], "resumed");
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(paused["runId"], start["runId"]);
+        assert_eq!(resumed["runId"], start["runId"]);
+        assert_eq!(terminal["runId"], start["runId"]);
+        assert!(
+            terminal["output"]
+                .as_str()
+                .is_some_and(|output| { output.contains(r#""status":"completed""#) })
+        );
         Ok(())
     });
     runtime.shutdown_timeout(Duration::from_secs(5));

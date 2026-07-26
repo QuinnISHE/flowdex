@@ -78,7 +78,7 @@ Turn a validated definition into an executing run:
 
 This should consume the task/worktree lifecycle from Batch 009 rather than replace it.
 
-Complete in Batch 010 for live-process execution. Process-restart controller resurrection and orphan cleanup are optional follow-up scope, not part of the requested Flowdex completion contract.
+Complete for live execution in Batch 010. Batch 022 adds explicit stable-checkpoint pause and durable scheduler reconstruction after interruption or failure while preserving the existing graph, worktrees, context, review state, signals, and boundaries. Orphan administration remains separate.
 
 ### 3. Reusable and nested workflow composition
 
@@ -158,7 +158,7 @@ Once the real workflow pipeline exists, exercise one representative workflow cov
 
 Use that pass to close genuine integration gaps and make the Flowdex documentation describe the final authoring API and runtime behavior. Avoid expanding it into exhaustive tests for every schema field or duplicating checks already owned by Codex primitives.
 
-Batch 018 completed this pass without changing production behavior or public APIs. Joined workflow evidence now covers saved V8 execution, phase inheritance, concurrent dependency-ready scheduling, verification, automatic progress isolation, app-visible children, an orchestrator boundary continued to terminal completion, and final scheduler completion. Existing focused tests remain authoritative for the other settled capabilities. Process-restart controller resurrection and a live macOS host run remain explicitly outside this completion contract.
+Batch 018 completed the original cohesive pass. Batch 022 subsequently adds durable scheduler pause and recovery without attempting to recreate a terminated V8 stack. A live macOS host run remains outside local validation.
 
 ## Likely dependency shape
 

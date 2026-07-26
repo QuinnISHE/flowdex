@@ -162,6 +162,14 @@ Scheduler transitions emit concise automatic reasoning summaries through the
 live app UI. They are not callable progress methods, are not added to model
 context or persisted conversation history, and are absent from workflow
 results. Task agents still use normal app-visible lifecycle and status events;
-roles and any loops remain defined by workflow instructions. A run is durable
-for execution and inspection, but process-restart resumption and orphan cleanup
-are not supported.
+roles and any loops remain defined by workflow instructions.
+
+Use `pause_flowdex_workflow({ run_id })` to stop at the next stable scheduler
+checkpoint after current agent, verification, review, or integration work
+finishes. Use `resume_flowdex_workflow({ run_id })` to continue a paused,
+interrupted, or failed run under the same run ID. Resume reconstructs the
+scheduler from SQLite when necessary and preserves integrated tasks, task
+worktrees, context fragments, review state, signals, dynamic tasks, and pending
+boundaries. A reconstructed run returns the standard scheduler terminal result;
+it cannot recreate terminated JavaScript local variables or a custom
+`flowdex.output(...)` value.

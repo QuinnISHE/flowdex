@@ -83,4 +83,10 @@ terminal, or already-consumed boundaries. Steering wakes do not consume it.
 
 Scheduler task, phase, and run boundaries use the same event-driven wait. There
 is no generic event bus, payload-bearing signal, external signal producer,
-generic wait selector, or process-restart controller recovery.
+or generic wait selector.
+
+`pause_flowdex_workflow({ run_id })` waits for a stable scheduler checkpoint and
+returns `paused`. `resume_flowdex_workflow({ run_id })` continues the same
+durable graph after a pause, interruption, or failure. A later
+`wait_flowdex_workflow` observes boundaries, signals, another pause, failure, or
+terminal completion without polling. Completed runs cannot be resumed.

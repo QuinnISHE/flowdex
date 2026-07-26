@@ -16,9 +16,11 @@ use crate::tools::flowdex::FlowdexSignalHandler;
 use crate::tools::flowdex::FlowdexStartRunHandler;
 use crate::tools::flowdex::FlowdexVerifyHandler;
 use crate::tools::flowdex::FlowdexWaitRunHandler;
+use crate::tools::flowdex::PauseFlowdexWorkflowHandler;
 use crate::tools::flowdex::PublishFlowdexContextHandler;
 use crate::tools::flowdex::QueueFlowdexTaskHandler;
 use crate::tools::flowdex::ReadFlowdexContextHandler;
+use crate::tools::flowdex::ResumeFlowdexWorkflowHandler;
 use crate::tools::flowdex::SaveFlowdexWorkflowHandler;
 use crate::tools::flowdex::SealFlowdexPhaseHandler;
 use crate::tools::flowdex::WaitFlowdexWorkflowHandler;
@@ -314,6 +316,8 @@ fn build_tool_specs_and_registry(
     planned_tools.add_with_exposure(ReadFlowdexContextHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(QueueFlowdexTaskHandler, ToolExposure::DirectModelOnly);
     planned_tools.add_with_exposure(SealFlowdexPhaseHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(PauseFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
+    planned_tools.add_with_exposure(ResumeFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
 }

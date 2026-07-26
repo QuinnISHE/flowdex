@@ -27,7 +27,7 @@ use codex_tools::shell_command_backend_for_features;
 use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};
 use futures::future::join_all;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, watch};
@@ -39,6 +39,8 @@ const SEAL: &str = "flowdex_seal_phase";
 const WAIT: &str = "flowdex_wait_run";
 const DIRECT_QUEUE: &str = "queue_flowdex_task";
 const DIRECT_SEAL: &str = "seal_flowdex_phase";
+const DIRECT_PAUSE: &str = "pause_flowdex_workflow";
+const DIRECT_RESUME: &str = "resume_flowdex_workflow";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -205,6 +207,7 @@ impl From<RawWorkflow> for WorkflowDefinition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RunStatus {
     Running,
+    Paused { interrupted: bool },
     Completed,
     Failed(String),
 }
@@ -219,12 +222,43 @@ struct RunController {
     status_rx: watch::Receiver<RunStatus>,
     activity: watch::Sender<u64>,
     activity_rx: watch::Receiver<u64>,
+    pause: watch::Sender<bool>,
+    pause_rx: watch::Receiver<bool>,
+    detached_resume: bool,
     context_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 static RUNS: OnceLock<Mutex<HashMap<String, Arc<RunController>>>> = OnceLock::new();
+static RESUMING_RUNS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
 fn runs() -> &'static Mutex<HashMap<String, Arc<RunController>>> {
     RUNS.get_or_init(Default::default)
+}
+
+struct ResumeClaim(String);
+
+impl ResumeClaim {
+    fn acquire(run_id: &str) -> Result<Self, FunctionCallError> {
+        let mut claims = RESUMING_RUNS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| {
+                FunctionCallError::RespondToModel("Flowdex resume state unavailable".into())
+            })?;
+        if !claims.insert(run_id.to_string()) {
+            return Err(FunctionCallError::RespondToModel(
+                "Flowdex run is already being resumed".into(),
+            ));
+        }
+        Ok(Self(run_id.to_string()))
+    }
+}
+
+impl Drop for ResumeClaim {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = RESUMING_RUNS.get_or_init(Default::default).lock() {
+            claims.remove(&self.0);
+        }
+    }
 }
 
 pub(crate) struct FlowdexStartRunHandler;
@@ -233,6 +267,8 @@ pub(crate) struct FlowdexSealPhaseHandler;
 pub(crate) struct FlowdexWaitRunHandler;
 pub(crate) struct QueueFlowdexTaskHandler;
 pub(crate) struct SealFlowdexPhaseHandler;
+pub(crate) struct PauseFlowdexWorkflowHandler;
+pub(crate) struct ResumeFlowdexWorkflowHandler;
 
 macro_rules! handler {
     ($ty:ty, $name:expr, $spec:ident, $call:ident) => {
@@ -280,6 +316,19 @@ impl ToolExecutor<ToolInvocation> for SealFlowdexPhaseHandler {
     }
 }
 impl CoreToolRuntime for SealFlowdexPhaseHandler {}
+
+handler!(
+    PauseFlowdexWorkflowHandler,
+    DIRECT_PAUSE,
+    pause_spec,
+    pause_call
+);
+handler!(
+    ResumeFlowdexWorkflowHandler,
+    DIRECT_RESUME,
+    resume_spec,
+    resume_call
+);
 
 fn spec(
     name: &str,
@@ -351,6 +400,22 @@ fn wait_spec() -> ToolSpec {
         vec!["run_id"],
     )
 }
+fn pause_spec() -> ToolSpec {
+    spec(
+        DIRECT_PAUSE,
+        "Pause a Flowdex workflow at its next stable scheduler checkpoint.",
+        vec![("run_id", JsonSchema::string(None))],
+        vec!["run_id"],
+    )
+}
+fn resume_spec() -> ToolSpec {
+    spec(
+        DIRECT_RESUME,
+        "Resume a paused, interrupted, or failed Flowdex workflow from durable state.",
+        vec![("run_id", JsonSchema::string(None))],
+        vec!["run_id"],
+    )
+}
 
 async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, FunctionCallError> {
     let ToolInvocation {
@@ -416,6 +481,7 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
     }
     let (status, status_rx) = watch::channel(RunStatus::Running);
     let (activity, activity_rx) = watch::channel(0u64);
+    let (pause, pause_rx) = watch::channel(false);
     let controller = Arc::new(RunController {
         id: run_id.clone(),
         definition: Mutex::new(definition),
@@ -426,6 +492,9 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
         status_rx,
         activity,
         activity_rx,
+        pause,
+        pause_rx,
+        detached_resume: false,
         context_gates: Mutex::new(HashMap::new()),
     });
     runs()
@@ -528,6 +597,155 @@ async fn seal_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
     ))
 }
 
+async fn pause_call(invocation: ToolInvocation) -> Result<task::JsonOutput, FunctionCallError> {
+    let ToolPayload::Function { arguments } = invocation.payload else {
+        return Err(FunctionCallError::RespondToModel(
+            "pause_flowdex_workflow expects JSON arguments".into(),
+        ));
+    };
+    let args: WaitArgs = parse_arguments(&arguments)?;
+    let controller = runs()
+        .lock()
+        .await
+        .get(&args.run_id)
+        .cloned()
+        .ok_or_else(|| FunctionCallError::RespondToModel("Flowdex run is not active".into()))?;
+    controller.pause.send_replace(true);
+    let next_activity = controller.activity_rx.borrow().wrapping_add(1);
+    let _ = controller.activity.send(next_activity);
+    let mut status = controller.status_rx.clone();
+    loop {
+        let current = status.borrow_and_update().clone();
+        match current {
+            RunStatus::Paused { .. } => {
+                return Ok(task::JsonOutput(
+                    serde_json::json!({"runId": args.run_id, "status": "paused"}),
+                ));
+            }
+            RunStatus::Failed(error) => {
+                return Err(FunctionCallError::RespondToModel(error));
+            }
+            RunStatus::Completed => {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex run already completed".into(),
+                ));
+            }
+            RunStatus::Running => {
+                status
+                    .changed()
+                    .await
+                    .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
+            }
+        }
+    }
+}
+
+async fn resume_call(invocation: ToolInvocation) -> Result<task::JsonOutput, FunctionCallError> {
+    let ToolPayload::Function { arguments } = invocation.payload.clone() else {
+        return Err(FunctionCallError::RespondToModel(
+            "resume_flowdex_workflow expects JSON arguments".into(),
+        ));
+    };
+    let args: WaitArgs = parse_arguments(&arguments)?;
+    let _claim = ResumeClaim::acquire(&args.run_id)?;
+    if let Some(controller) = runs().lock().await.get(&args.run_id).cloned() {
+        let current = controller.status_rx.borrow().clone();
+        match current {
+            RunStatus::Paused { interrupted: false } => {
+                let store = Arc::clone(&controller.store);
+                let run_id = args.run_id.clone();
+                tokio::task::spawn_blocking(move || store.prepare_run_resume(&run_id))
+                    .await
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                controller.pause.send_replace(false);
+                let _ = controller.status.send(RunStatus::Running);
+                tokio::spawn(run_scheduler(controller));
+                return Ok(task::JsonOutput(
+                    serde_json::json!({"runId": args.run_id, "status": "resumed"}),
+                ));
+            }
+            RunStatus::Paused { interrupted: true } => {
+                remove_run_controller(&args.run_id).await;
+            }
+            RunStatus::Running => {
+                return Err(FunctionCallError::RespondToModel(
+                    "Flowdex run is already active".into(),
+                ));
+            }
+            RunStatus::Completed => {
+                return Err(FunctionCallError::RespondToModel(
+                    "completed Flowdex runs cannot be resumed".into(),
+                ));
+            }
+            RunStatus::Failed(_) => {
+                remove_run_controller(&args.run_id).await;
+            }
+        }
+    }
+
+    let (store, cwd, repository_identity) =
+        task::open_store(&invocation.session, &invocation.turn).await?;
+    let store = Arc::new(store);
+    let run_id = args.run_id.clone();
+    let store_for_load = Arc::clone(&store);
+    let (info, definition) = tokio::task::spawn_blocking(move || {
+        let info = store_for_load.run_info(&run_id)?;
+        let definition = store_for_load.workflow_definition(&run_id)?;
+        Ok::<_, FlowdexStoreError>((info, definition))
+    })
+    .await
+    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    if info.repository_identity != repository_identity {
+        return Err(FunctionCallError::RespondToModel(
+            "Flowdex run belongs to another repository".into(),
+        ));
+    }
+    let persisted_worktree = std::fs::canonicalize(&info.integration_worktree)
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let current_worktree = std::fs::canonicalize(cwd)
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    if persisted_worktree != current_worktree {
+        return Err(FunctionCallError::RespondToModel(
+            "Flowdex run must be resumed from its original integration worktree".into(),
+        ));
+    }
+    let store_for_resume = Arc::clone(&store);
+    let run_id = args.run_id.clone();
+    tokio::task::spawn_blocking(move || store_for_resume.prepare_run_resume(&run_id))
+        .await
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let (status, status_rx) = watch::channel(RunStatus::Running);
+    let (activity, activity_rx) = watch::channel(0u64);
+    let (pause, pause_rx) = watch::channel(false);
+    let controller = Arc::new(RunController {
+        id: args.run_id.clone(),
+        definition: Mutex::new(definition),
+        invocation,
+        store,
+        info,
+        status,
+        status_rx,
+        activity,
+        activity_rx,
+        pause,
+        pause_rx,
+        detached_resume: true,
+        context_gates: Mutex::new(HashMap::new()),
+    });
+    runs()
+        .lock()
+        .await
+        .insert(args.run_id.clone(), Arc::clone(&controller));
+    super::register_flowdex_boundary_run(args.run_id.clone(), Arc::clone(&controller.store));
+    tokio::spawn(run_scheduler(controller));
+    Ok(task::JsonOutput(
+        serde_json::json!({"runId": args.run_id, "status": "resumed"}),
+    ))
+}
+
 async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, FunctionCallError> {
     let ToolPayload::Function { arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -545,7 +763,7 @@ async fn wait_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Funct
     loop {
         let status = rx.borrow_and_update().clone();
         match status {
-            RunStatus::Running => {
+            RunStatus::Running | RunStatus::Paused { .. } => {
                 rx.changed()
                     .await
                     .map_err(|_| FunctionCallError::RespondToModel("Flowdex run stopped".into()))?;
@@ -575,7 +793,21 @@ async fn remove_run_controller(run_id: &str) {
     }
 }
 
-pub(super) async fn wait_for_run_failure(run_id: String) -> String {
+pub(super) enum SchedulerEvent {
+    Paused,
+    Completed,
+    Failed(String),
+}
+
+pub(super) async fn is_detached_resume(run_id: &str) -> bool {
+    runs()
+        .lock()
+        .await
+        .get(run_id)
+        .is_some_and(|controller| controller.detached_resume)
+}
+
+pub(super) async fn wait_for_run_event(run_id: String) -> SchedulerEvent {
     let Some(controller) = runs().lock().await.get(&run_id).cloned() else {
         return std::future::pending().await;
     };
@@ -588,37 +820,81 @@ pub(super) async fn wait_for_run_failure(run_id: String) -> String {
                     return std::future::pending().await;
                 }
             }
+            RunStatus::Paused { .. } => return SchedulerEvent::Paused,
+            RunStatus::Completed if controller.detached_resume => {
+                remove_run_controller(&run_id).await;
+                return SchedulerEvent::Completed;
+            }
             RunStatus::Completed => return std::future::pending().await,
             RunStatus::Failed(error) => {
                 remove_run_controller(&run_id).await;
-                return error;
+                return SchedulerEvent::Failed(error);
             }
         }
     }
 }
 
+enum SchedulerOutcome {
+    Completed,
+    Paused { interrupted: bool },
+}
+
 async fn run_scheduler(controller: Arc<RunController>) {
     let result = tokio::select! {
         _ = controller.invocation.cancellation_token.cancelled() => {
-            Err("Flowdex run cancelled".to_string())
+            Ok(SchedulerOutcome::Paused { interrupted: true })
         }
         result = run_scheduler_inner(&controller) => result,
     };
-    if let Err(error) = result {
-        let store = Arc::clone(&controller.store);
-        let run_id = controller.id.clone();
-        let _ = tokio::task::spawn_blocking(move || store.mark_run_failed(&run_id)).await;
-        super::mark_flowdex_boundary_terminal(&controller.id);
-        let _ = controller.status.send(RunStatus::Failed(error));
-    } else {
-        super::mark_flowdex_boundary_terminal(&controller.id);
-        let _ = controller.status.send(RunStatus::Completed);
+    match result {
+        Err(error) => {
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let persisted_error = error.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                store.mark_run_failed(&run_id, &persisted_error)
+            })
+            .await;
+            super::mark_flowdex_boundary_terminal(&controller.id);
+            let _ = controller.status.send(RunStatus::Failed(error));
+        }
+        Ok(SchedulerOutcome::Paused { interrupted }) => {
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let _ = tokio::task::spawn_blocking(move || store.mark_run_paused(&run_id)).await;
+            progress(&controller.invocation, "Paused workflow".to_string()).await;
+            let _ = controller.status.send(RunStatus::Paused { interrupted });
+        }
+        Ok(SchedulerOutcome::Completed) => {
+            super::mark_flowdex_boundary_terminal(&controller.id);
+            let _ = controller.status.send(RunStatus::Completed);
+        }
     }
 }
 
-async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), String> {
+async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<SchedulerOutcome, String> {
     let definition = controller.definition.lock().await.clone();
     let total = definition.phases.len();
+    let pending_boundary = {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        tokio::task::spawn_blocking(move || store.pending_boundary(&run_id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+    };
+    if let Some(boundary) = pending_boundary {
+        super::publish_flowdex_boundary(Arc::clone(&controller.store), boundary.clone()).await?;
+        super::wait_flowdex_boundary_continuation(
+            &boundary.run_id,
+            &boundary.scope_kind,
+            &boundary.scope_id,
+        )
+        .await;
+        if boundary.scope_kind == "run" {
+            return Ok(SchedulerOutcome::Completed);
+        }
+    }
     progress(
         &controller.invocation,
         format!("Running workflow: {}", definition.name),
@@ -633,14 +909,61 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), Stri
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     for (index, phase) in definition.phases.iter().enumerate() {
+        if pause_requested(controller) {
+            return Ok(SchedulerOutcome::Paused { interrupted: false });
+        }
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let phase_name = phase.name.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            store
+                .phase_metadata(&run_id, &phase_name)
+                .map(|phase| phase.state)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if state == "completed" {
+            if phase.review.is_some() {
+                let store = Arc::clone(&controller.store);
+                let run_id = controller.id.clone();
+                let phase_name = phase.name.clone();
+                let tasks = tokio::task::spawn_blocking(move || {
+                    store.scheduled_tasks(&run_id, &phase_name)
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+                for task in tasks {
+                    close_task_agents(controller, &task.task_id).await?;
+                    let store = Arc::clone(&controller.store);
+                    let task_id = task.task_id;
+                    tokio::task::spawn_blocking(move || {
+                        store.recover_integrated_task_cleanup(&task_id)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            continue;
+        }
         progress(
             &controller.invocation,
             format!("Running phase {}/{}: {}", index + 1, total, phase.name),
         )
         .await;
-        run_phase(controller, index, total).await?;
+        if matches!(
+            run_phase(controller, index, total).await?,
+            SchedulerOutcome::Paused { .. }
+        ) {
+            return Ok(SchedulerOutcome::Paused { interrupted: false });
+        }
     }
     if !definition.verification.is_empty() {
+        if pause_requested(controller) {
+            return Ok(SchedulerOutcome::Paused { interrupted: false });
+        }
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
         tokio::task::spawn_blocking(move || store.mark_run_verifying(&run_id))
@@ -675,14 +998,14 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<(), Stri
         format!("Completed workflow: {}", definition.name),
     )
     .await;
-    Ok(())
+    Ok(SchedulerOutcome::Completed)
 }
 
 async fn run_phase(
     controller: &Arc<RunController>,
     index: usize,
     total: usize,
-) -> Result<(), String> {
+) -> Result<SchedulerOutcome, String> {
     let phase = controller
         .definition
         .lock()
@@ -699,6 +1022,9 @@ async fn run_phase(
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
     loop {
+        if pause_requested(controller) {
+            return Ok(SchedulerOutcome::Paused { interrupted: false });
+        }
         ensure_task_records(controller, &phase.name).await?;
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
@@ -725,6 +1051,54 @@ async fn run_phase(
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?
         };
+        if let Some(checkpoint) = all
+            .iter()
+            .find(|task| matches!(task.state.as_str(), "implemented" | "verified"))
+            .cloned()
+        {
+            let details = {
+                let store = Arc::clone(&controller.store);
+                let task_id = checkpoint.task_id.clone();
+                tokio::task::spawn_blocking(move || store.scheduler_task(&task_id))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?
+            };
+            let task_def = controller
+                .definition
+                .lock()
+                .await
+                .phases
+                .get(index)
+                .and_then(|phase| phase.tasks.iter().find(|task| task.name == details.name))
+                .cloned()
+                .ok_or_else(|| "recoverable task definition missing".to_string())?;
+            let agent_id = {
+                let store = Arc::clone(&controller.store);
+                let task_id = checkpoint.task_id.clone();
+                tokio::task::spawn_blocking(move || store.latest_task_agent(&task_id))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "recoverable task agent attribution missing".to_string())?
+            };
+            progress(
+                &controller.invocation,
+                format!("Resuming task from {}: {}", checkpoint.state, task_def.name),
+            )
+            .await;
+            complete_task(
+                controller,
+                &checkpoint.task_id,
+                &task_def,
+                &agent_id,
+                phase.review.is_some(),
+                checkpoint.state == "verified",
+            )
+            .await
+            .map_err(|(stage, error)| format!("{stage}: {error}"))?;
+            continue;
+        }
         if all.iter().all(|task| task.state == "integrated") {
             if !metadata.sealed {
                 let mut activity = controller.activity_rx.clone();
@@ -735,6 +1109,9 @@ async fn run_phase(
                 continue;
             }
             if !phase.verification.is_empty() {
+                if pause_requested(controller) {
+                    return Ok(SchedulerOutcome::Paused { interrupted: false });
+                }
                 let store = Arc::clone(&controller.store);
                 let run_id = controller.id.clone();
                 let name = phase.name.clone();
@@ -761,13 +1138,6 @@ async fn run_phase(
             if let Some(review) = phase.review.as_ref() {
                 run_phase_review(controller, &phase, review, &all).await?;
             }
-            let store = Arc::clone(&controller.store);
-            let run_id = controller.id.clone();
-            let name = phase.name.clone();
-            tokio::task::spawn_blocking(move || store.mark_phase_completed(&run_id, &name))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
             await_boundary(
                 controller,
                 "phase",
@@ -787,12 +1157,19 @@ async fn run_phase(
                         .map_err(|e| e.to_string())?;
                 }
             }
+            let store = Arc::clone(&controller.store);
+            let run_id = controller.id.clone();
+            let name = phase.name.clone();
+            tokio::task::spawn_blocking(move || store.mark_phase_completed(&run_id, &name))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
             progress(
                 &controller.invocation,
                 format!("Completed phase {}/{}: {}", index + 1, total, phase.name),
             )
             .await;
-            break Ok(());
+            break Ok(SchedulerOutcome::Completed);
         }
         if ready.is_empty() {
             let mut activity = controller.activity_rx.clone();
@@ -917,18 +1294,22 @@ async fn run_phase(
                 });
                 continue;
             };
+            let store = Arc::clone(&controller.store);
+            let task_id = scheduled.task_id.clone();
+            tokio::task::spawn_blocking(move || store.mark_task_implemented(&task_id))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
             if let Err((stage, error)) = complete_task(
                 controller,
                 &scheduled.task_id,
                 &task_def,
                 &task_agent_id,
                 phase.review.is_some(),
+                false,
             )
             .await
             {
-                let store = Arc::clone(&controller.store);
-                let task_id = scheduled.task_id.clone();
-                let _ = tokio::task::spawn_blocking(move || store.mark_task_failed(&task_id)).await;
                 progress(
                     &controller.invocation,
                     format!("Task {} failed during {stage}", task_def.name),
@@ -940,10 +1321,17 @@ async fn run_phase(
         if let Some(error) = first_error {
             return Err(error);
         }
+        if pause_requested(controller) {
+            return Ok(SchedulerOutcome::Paused { interrupted: false });
+        }
         if retry_capacity {
             continue;
         }
     }
+}
+
+fn pause_requested(controller: &RunController) -> bool {
+    *controller.pause_rx.borrow()
 }
 
 async fn ensure_task_records(
@@ -1224,8 +1612,10 @@ async fn complete_task(
     task_def: &TaskDefinition,
     task_agent_id: &str,
     retain_worktree: bool,
+    already_verified: bool,
 ) -> Result<(), (String, String)> {
-    if !task_def.verification.is_empty() {
+    let mut task_agent_id = task_agent_id.to_string();
+    if !already_verified && !task_def.verification.is_empty() {
         let mut repairs = 0usize;
         loop {
             progress(
@@ -1272,17 +1662,25 @@ async fn complete_task(
                 ),
             )
             .await;
-            resume_task_agent(
-                controller,
-                task_agent_id,
-                format!(
-                    "Flowdex ran the declared task verification and it failed. Repair the failure while preserving the original requirements. Do not run the declared verification commands yourself; Flowdex will rerun them automatically after your repair. Create a new commit; do not amend, rebase, reset, or rewrite existing commits.\n\nVerification result:\n{}",
-                    serde_json::to_string_pretty(&verification_result)
-                        .unwrap_or_else(|_| verification_result.to_string())
-                ),
-            )
-            .await
-                .map_err(|error| ("verification repair".to_string(), error.to_string()))?;
+            let repair_instructions = format!(
+                "Flowdex ran the declared task verification and it failed. Repair the failure while preserving the original requirements. Do not run the declared verification commands yourself; Flowdex will rerun them automatically after your repair. Create a new commit; do not amend, rebase, reset, or rewrite existing commits.\n\nVerification result:\n{}",
+                serde_json::to_string_pretty(&verification_result)
+                    .unwrap_or_else(|_| verification_result.to_string())
+            );
+            if resume_task_agent(controller, &task_agent_id, repair_instructions.clone())
+                .await
+                .is_err()
+            {
+                progress(
+                    &controller.invocation,
+                    format!("Starting replacement repair agent: {}", task_def.name),
+                )
+                .await;
+                task_agent_id =
+                    spawn_recovery_task_agent(controller, task_id, task_def, repair_instructions)
+                        .await
+                        .map_err(|error| ("verification repair".to_string(), error))?;
+            }
         }
         let store = Arc::clone(&controller.store);
         let id = task_id.to_string();
@@ -1315,12 +1713,6 @@ async fn complete_task(
     )
     .await
     .map_err(|error| ("integration".to_string(), error.to_string()))?;
-    let store = Arc::clone(&controller.store);
-    let id = task_id.to_string();
-    tokio::task::spawn_blocking(move || store.mark_task_integrated(&id))
-        .await
-        .map_err(|error| ("integration".to_string(), error.to_string()))?
-        .map_err(|error| ("integration".to_string(), error.to_string()))?;
     await_boundary(
         controller,
         "task",
@@ -1330,6 +1722,12 @@ async fn complete_task(
     )
     .await
     .map_err(|error| ("boundary".to_string(), error))?;
+    let store = Arc::clone(&controller.store);
+    let id = task_id.to_string();
+    tokio::task::spawn_blocking(move || store.mark_task_integrated(&id))
+        .await
+        .map_err(|error| ("integration".to_string(), error.to_string()))?
+        .map_err(|error| ("integration".to_string(), error.to_string()))?;
     progress(
         &controller.invocation,
         format!("Completed task: {}", task_def.name),
@@ -1416,7 +1814,24 @@ async fn run_phase_review_rounds(
         .cloned()
         .ok_or_else(|| format!("review agent {} is missing", review.agent))?;
 
-    for round in 1..=review.max_rounds {
+    for _ in 0..review.max_rounds {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        let phase_name = phase.name.clone();
+        let round = tokio::task::spawn_blocking(move || {
+            store.increment_phase_review_rounds(&run_id, &phase_name)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())? as u32;
+        if round > review.max_rounds {
+            return phase_review_boundary(
+                controller,
+                phase,
+                format!("Phase review exhausted after {} rounds", review.max_rounds),
+            )
+            .await;
+        }
         progress(
             &controller.invocation,
             format!(
@@ -1425,15 +1840,6 @@ async fn run_phase_review_rounds(
             ),
         )
         .await;
-        let store = Arc::clone(&controller.store);
-        let run_id = controller.id.clone();
-        let phase_name = phase.name.clone();
-        tokio::task::spawn_blocking(move || {
-            store.increment_phase_review_rounds(&run_id, &phase_name)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
 
         let base_commit = {
             let store = Arc::clone(&controller.store);
@@ -1817,17 +2223,26 @@ async fn review_task_rounds(
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?
     };
-    for round in 1..=review.max_rounds {
+    for _ in 0..review.max_rounds {
         let store = Arc::clone(&controller.store);
         let run_id = controller.id.clone();
         let id = scope_id.to_string();
         let scope_kind_for_counter = scope_kind.to_string();
-        tokio::task::spawn_blocking(move || {
+        let round = tokio::task::spawn_blocking(move || {
             store.increment_review_rounds(&scope_kind_for_counter, &run_id, &id)
         })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())? as u32;
+        if round > review.max_rounds {
+            return task_review_boundary(
+                controller,
+                task_def,
+                task_id,
+                format!("Task review exhausted after {} rounds", review.max_rounds),
+            )
+            .await;
+        }
         let diff = tokio::task::spawn_blocking({
             let path = review_worktree
                 .clone()
@@ -2216,6 +2631,43 @@ async fn run_task_handler(
         .to_string(),
     };
     FlowdexTaskRunAgentHandler.handle(invocation).await
+}
+
+async fn spawn_recovery_task_agent(
+    controller: &Arc<RunController>,
+    task_id: &str,
+    task_def: &TaskDefinition,
+    instructions: String,
+) -> Result<String, String> {
+    let definition = controller
+        .definition
+        .lock()
+        .await
+        .agents
+        .get(&task_def.agent)
+        .cloned()
+        .ok_or_else(|| format!("task agent {} is missing", task_def.agent))?;
+    let agent = AgentSpec {
+        name: scheduler_agent_name("task_recovery", &task_def.name, task_id),
+        display_name: Some(format!("{} repair", task_def.name)),
+        instructions,
+        profile: definition.profile,
+        model: definition.model,
+        reasoning_effort: definition.reasoning_effort.and_then(parse_effort),
+        tool_profile: definition.tool_profile,
+    };
+    let output = run_task_handler(controller.invocation.clone(), task_id.to_string(), agent)
+        .await
+        .map_err(|error| error.to_string())?;
+    output
+        .code_mode_result(&ToolPayload::Function {
+            arguments: serde_json::json!({"task_id": task_id}).to_string(),
+        })
+        .get("agentId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "replacement repair agent did not return an agent ID".to_string())
 }
 
 async fn run_verify_handler(

@@ -92,4 +92,4 @@ Use ordinary `for` or `while` loops with an explicit numeric budget. Roles are n
 
 ## Save and operate
 
-Outside workflow JavaScript, use `save_flowdex_workflow`, `start_flowdex_workflow`, and `wait_flowdex_workflow`. Handle `signal`, `message`, `steered`, and boundary results, then wait on the same run again. Use direct `queue_flowdex_task` and `seal_flowdex_phase` only when an awake orchestrator must modify a live open phase.
+Outside workflow JavaScript, use `save_flowdex_workflow`, `start_flowdex_workflow`, and `wait_flowdex_workflow`. Handle `signal`, `message`, `steered`, `paused`, and boundary results, then wait on the same run again. Use `pause_flowdex_workflow` for a cooperative stable checkpoint and `resume_flowdex_workflow` to continue the same durable graph after pause, interruption, or failure. Integrated tasks, task worktrees, context packs, review state, signals, and boundaries are retained; a terminated JavaScript stack is not recreated. Use direct `queue_flowdex_task` and `seal_flowdex_phase` only when an awake orchestrator must modify a live open phase.

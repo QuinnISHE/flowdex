@@ -54,7 +54,8 @@ pub(crate) use rules::FlowdexCheckRulesHandler;
 pub(crate) use rules::FlowdexScanRuleCandidatesHandler;
 pub(crate) use scheduler::{
     FlowdexQueueTaskHandler, FlowdexSealPhaseHandler, FlowdexStartRunHandler,
-    FlowdexWaitRunHandler, QueueFlowdexTaskHandler, SealFlowdexPhaseHandler,
+    FlowdexWaitRunHandler, PauseFlowdexWorkflowHandler, QueueFlowdexTaskHandler,
+    ResumeFlowdexWorkflowHandler, SealFlowdexPhaseHandler,
 };
 pub(crate) use task::FlowdexCreateTaskHandler;
 pub(crate) use task::FlowdexTaskIntegrateHandler;
@@ -576,8 +577,8 @@ impl WaitFlowdexWorkflowHandler {
 
         let mut boundary_wait = Box::pin(wait_for_flowdex_boundary(args.run_id.clone()));
         let mut signal_wait = Box::pin(signal_waiter(args.run_id.clone()));
-        let mut scheduler_failure_wait =
-            Box::pin(scheduler::wait_for_run_failure(args.run_id.clone()));
+        let detached_resume = scheduler::is_detached_resume(&args.run_id).await;
+        let mut scheduler_wait = Box::pin(scheduler::wait_for_run_event(args.run_id.clone()));
         if matches!(pending_activity, Some(InputQueueActivity::Mailbox))
             && session.input_queue.has_trigger_turn_mailbox_items().await
         {
@@ -587,12 +588,17 @@ impl WaitFlowdexWorkflowHandler {
             )));
         }
 
-        let mut cell_wait = Box::pin(
-            session
-                .services
-                .code_mode_service
-                .wait_until_yield(cell_id.clone()),
-        );
+        let mut cell_wait = Box::pin(async {
+            if detached_resume {
+                std::future::pending().await
+            } else {
+                session
+                    .services
+                    .code_mode_service
+                    .wait_until_yield(cell_id.clone())
+                    .await
+            }
+        });
         loop {
             tokio::select! {
                 biased;
@@ -630,35 +636,54 @@ impl WaitFlowdexWorkflowHandler {
                     }
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(result.to_string(), Some(true))));
                 }
-                error = &mut scheduler_failure_wait => {
-                    if let Ok(codex_code_mode::WaitOutcome::LiveCell(response)) = session
-                        .services
-                        .code_mode_service
-                        .terminate(cell_id.clone())
-                        .await
-                    {
-                        session
-                            .services
-                            .rollout_thread_trace
-                            .code_cell_trace_context(&turn.sub_id, cell_id.as_str())
-                            .record_ended(&response);
+                event = &mut scheduler_wait => {
+                    match event {
+                        scheduler::SchedulerEvent::Paused => {
+                            return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                                serde_json::json!({"runId": args.run_id, "status": "paused"}).to_string(),
+                                Some(true),
+                            )));
+                        }
+                        scheduler::SchedulerEvent::Completed => {
+                            session.services.elicitations.wait_until_clear().await;
+                            return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                                serde_json::json!({"runId": args.run_id, "status": "completed"}).to_string(),
+                                Some(true),
+                            )));
+                        }
+                        scheduler::SchedulerEvent::Failed(error) => {
+                            if !detached_resume {
+                                if let Ok(codex_code_mode::WaitOutcome::LiveCell(response)) = session
+                                    .services
+                                    .code_mode_service
+                                    .terminate(cell_id.clone())
+                                    .await
+                                {
+                                    session
+                                        .services
+                                        .rollout_thread_trace
+                                        .code_cell_trace_context(&turn.sub_id, cell_id.as_str())
+                                        .record_ended(&response);
+                                }
+                                session.services.code_mode_service.finish_cell_dispatch(&cell_id);
+                                workflow_chains()
+                                    .lock()
+                                    .expect("workflow chain mutex poisoned")
+                                    .remove(cell_id.as_str());
+                                remove_workflow_run(cell_id.as_str());
+                            }
+                            session.services.elicitations.wait_until_clear().await;
+                            return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                                serde_json::json!({
+                                    "runId": args.run_id,
+                                    "status": "failed",
+                                    "error": agents::truncate_message(&error),
+                                })
+                                .to_string(),
+                                Some(false),
+                            )));
+                        }
                     }
-                    session.services.code_mode_service.finish_cell_dispatch(&cell_id);
-                    workflow_chains()
-                        .lock()
-                        .expect("workflow chain mutex poisoned")
-                        .remove(cell_id.as_str());
-                    remove_workflow_run(cell_id.as_str());
-                    session.services.elicitations.wait_until_clear().await;
-                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                        serde_json::json!({
-                            "runId": args.run_id,
-                            "status": "failed",
-                            "error": agents::truncate_message(&error),
-                        })
-                        .to_string(),
-                        Some(false),
-                    )));
                 }
                 pending = &mut signal_wait => {
                     let pending_steer = match turn_state.as_deref() {
