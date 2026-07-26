@@ -523,6 +523,20 @@ fn gather_helper_read_roots(codex_home: &Path) -> Vec<PathBuf> {
     vec![helper_dir]
 }
 
+fn gather_path_read_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
+    let Some(path_value) = env_map
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value)
+    else {
+        return Vec::new();
+    };
+
+    std::env::split_paths(std::ffi::OsStr::new(path_value))
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .collect()
+}
+
 fn gather_full_read_roots_for_permissions(
     command_cwd: &Path,
     permissions: &ResolvedWindowsSandboxPermissions,
@@ -572,6 +586,7 @@ pub(crate) fn gather_read_roots(
         );
     }
     roots.extend(permissions.readable_roots_for_cwd(command_cwd));
+    roots.extend(gather_path_read_roots(env_map));
     canonical_existing(&roots)
 }
 
@@ -1278,7 +1293,12 @@ mod tests {
     use crate::setup_error::SetupErrorReport;
     use crate::setup_error::extract_failure;
     use crate::setup_error::write_setup_error_report;
+    use codex_protocol::models::ManagedFileSystemPermissions;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
@@ -1862,6 +1882,74 @@ mod tests {
             dunce::canonicalize(helper_bin_dir(&codex_home)).expect("canonical helper dir");
 
         assert!(roots.contains(&expected));
+    }
+
+    #[test]
+    fn gather_read_roots_includes_existing_directories_from_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let command_cwd = tmp.path().join("workspace");
+        let path_dir = tmp.path().join("path-tool");
+        let path_file = tmp.path().join("path-file");
+        let missing_dir = tmp.path().join("missing");
+        let relative_path = PathBuf::from("relative");
+        let duplicate_path = path_dir.join(".");
+        fs::create_dir_all(&command_cwd).expect("create workspace");
+        fs::create_dir_all(&path_dir).expect("create PATH directory");
+        fs::write(&path_file, "not a directory").expect("create PATH file");
+        let path_value = std::env::join_paths([
+            path_dir.as_os_str(),
+            relative_path.as_os_str(),
+            missing_dir.as_os_str(),
+            path_file.as_os_str(),
+            duplicate_path.as_os_str(),
+        ])
+        .expect("build PATH");
+        let env_map = HashMap::from([(
+            "pAtH".to_string(),
+            path_value.to_string_lossy().into_owned(),
+        )]);
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![FileSystemSandboxEntry {
+                    path: FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    access: FileSystemAccessMode::Read,
+                }],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let permissions = permissions_for(
+            &permission_profile,
+            workspace_roots_for(command_cwd.as_path()).as_slice(),
+        );
+
+        let roots = gather_read_roots(&command_cwd, &permissions, &env_map, &codex_home);
+        let request = super::SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd: &command_cwd,
+            env_map: &env_map,
+            codex_home: &codex_home,
+            proxy_enforced: false,
+        };
+        let (payload_read_roots, write_roots) =
+            build_payload_roots(&request, &super::SetupRootOverrides::default());
+        let expected = dunce::canonicalize(&path_dir).expect("canonical PATH directory");
+
+        assert!(roots.contains(&expected));
+        assert_eq!(
+            payload_read_roots
+                .iter()
+                .filter(|root| **root == expected)
+                .count(),
+            1
+        );
+        assert!(!roots.contains(&missing_dir));
+        assert!(!roots.contains(&path_file));
+        assert!(!roots.contains(&relative_path));
+        assert!(!write_roots.contains(&expected));
     }
 
     #[test]
