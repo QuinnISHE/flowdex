@@ -11,7 +11,9 @@ const result = await flowdex.verify(
 );
 ```
 
-`commands` must be a non-empty array of non-empty strings. The only options are `workdir` (an optional repository-relative working directory; by default the workflow turn's current environment directory) and `timeoutMs` (an optional timeout applied independently to each command; omission uses the normal shell-command default). Verification inherits the ordinary shell, environment, permissions, sandbox, approval, hooks, cancellation, and output limits.
+`commands` must be a non-empty array of non-empty strings. The only options are `workdir` (an optional repository-relative working directory; by default the workflow turn's current environment directory) and `timeoutMs` (an optional timeout applied independently to each command). Omission uses `verification_timeout_ms` from Flowdex configuration, which defaults to `300000` (five minutes). Verification inherits the ordinary shell, environment, permissions, sandbox, approval, hooks, cancellation, and output limits.
+
+Automatic task, phase, and run verification use the same configured per-command timeout. Set a larger global value in `$CODEX_HOME/flowdex.toml` or override it for a trusted repository in `.flowdex/config.toml`.
 
 Commands run sequentially in declaration order and stop after the first non-zero exit or timeout. Each result is either:
 

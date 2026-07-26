@@ -146,6 +146,10 @@ impl FlowdexVerifyHandler {
                 "commands must contain only non-empty strings".to_string(),
             ));
         }
+        let timeout_ms = verification_timeout_ms(
+            args.timeout_ms,
+            turn.config.flowdex_config.verification_timeout_ms,
+        );
 
         let Some(mut turn_environment) = step_context.environments.primary().cloned() else {
             return Err(FunctionCallError::RespondToModel(
@@ -193,7 +197,7 @@ impl FlowdexVerifyHandler {
                 command: command.clone(),
                 workdir: args.workdir.clone(),
                 login: None,
-                timeout_ms: args.timeout_ms,
+                timeout_ms: Some(timeout_ms),
                 sandbox_permissions: None,
                 prefix_rule: None,
                 additional_permissions: None,
@@ -319,6 +323,10 @@ impl ToolOutput for VerificationOutput {
     }
 }
 
+fn verification_timeout_ms(explicit: Option<u64>, configured: u64) -> u64 {
+    explicit.unwrap_or(configured)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +338,11 @@ mod tests {
             FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic)
                 .waits_for_runtime_cancellation()
         );
+    }
+
+    #[test]
+    fn verification_timeout_uses_config_unless_explicitly_overridden() {
+        assert_eq!(verification_timeout_ms(None, 300_000), 300_000);
+        assert_eq!(verification_timeout_ms(Some(900_000), 300_000), 900_000);
     }
 }

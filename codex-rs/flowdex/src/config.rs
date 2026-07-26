@@ -10,6 +10,7 @@ use thiserror::Error;
 
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 185_000;
 pub const DEFAULT_AST_GREP_CANDIDATE_THRESHOLD: i64 = 3;
+pub const DEFAULT_VERIFICATION_TIMEOUT_MS: u64 = 300_000;
 
 /// Multi-agent backend version selected by Flowdex configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -23,6 +24,7 @@ pub enum FlowdexMultiAgentVersion {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowdexConfig {
     pub compaction_reminder_threshold_tokens: i64,
+    pub verification_timeout_ms: u64,
     pub ast_grep_candidate_threshold: i64,
     pub ast_grep_always_run: Vec<String>,
     pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
@@ -51,6 +53,7 @@ pub fn load_config(
 ) -> Result<FlowdexConfig, FlowdexConfigError> {
     let global_path = codex_home.join("flowdex.toml");
     let mut threshold = DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
+    let mut verification_timeout_ms = DEFAULT_VERIFICATION_TIMEOUT_MS;
     let mut ast_grep_candidate_threshold = DEFAULT_AST_GREP_CANDIDATE_THRESHOLD;
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
@@ -60,6 +63,10 @@ pub fn load_config(
         if let Some(value) = config.compaction_reminder_threshold_tokens {
             validate_threshold(value, &global_path)?;
             threshold = value;
+        }
+        if let Some(value) = config.verification_timeout_ms {
+            validate_verification_timeout(value, &global_path)?;
+            verification_timeout_ms = value;
         }
         if let Some(value) = config.ast_grep_candidate_threshold {
             validate_candidate_threshold(value, &global_path)?;
@@ -82,6 +89,10 @@ pub fn load_config(
                 validate_threshold(value, &repository_path)?;
                 threshold = value;
             }
+            if let Some(value) = config.verification_timeout_ms {
+                validate_verification_timeout(value, &repository_path)?;
+                verification_timeout_ms = value;
+            }
             if let Some(value) = config.ast_grep_candidate_threshold {
                 validate_candidate_threshold(value, &repository_path)?;
                 ast_grep_candidate_threshold = value;
@@ -99,6 +110,7 @@ pub fn load_config(
 
     Ok(FlowdexConfig {
         compaction_reminder_threshold_tokens: threshold,
+        verification_timeout_ms,
         ast_grep_candidate_threshold,
         ast_grep_always_run,
         tool_profiles,
@@ -110,6 +122,7 @@ pub fn load_config(
 #[serde(deny_unknown_fields)]
 struct PartialFlowdexConfig {
     compaction_reminder_threshold_tokens: Option<i64>,
+    verification_timeout_ms: Option<u64>,
     ast_grep_candidate_threshold: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
     multi_agent_version: Option<FlowdexMultiAgentVersion>,
@@ -155,6 +168,15 @@ fn validate_candidate_threshold(value: i64, path: &Path) -> Result<(), FlowdexCo
     Ok(())
 }
 
+fn validate_verification_timeout(value: u64, path: &Path) -> Result<(), FlowdexConfigError> {
+    if value == 0 {
+        return Err(FlowdexConfigError::InvalidVerificationTimeout {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_rule_ids(values: &[String], path: &Path) -> Result<(), FlowdexConfigError> {
     let mut seen = std::collections::HashSet::new();
     for value in values {
@@ -193,6 +215,9 @@ pub enum FlowdexConfigError {
     )]
     InvalidThreshold { path: PathBuf },
 
+    #[error("invalid verification_timeout_ms in Flowdex config at {path}: value must be positive")]
+    InvalidVerificationTimeout { path: PathBuf },
+
     #[error(
         "invalid ast_grep_candidate_threshold in Flowdex config at {path}: value must be positive"
     )]
@@ -227,26 +252,28 @@ mod tests {
             config(temp.path(), Some(&repository_root)).compaction_reminder_threshold_tokens,
             DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS
         );
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).verification_timeout_ms,
+            DEFAULT_VERIFICATION_TIMEOUT_MS
+        );
 
         fs::write(
             temp.path().join("flowdex.toml"),
-            "compaction_reminder_threshold_tokens = 120000\n",
+            "compaction_reminder_threshold_tokens = 120000\nverification_timeout_ms = 600000\n",
         )
         .expect("global config");
-        assert_eq!(
-            config(temp.path(), Some(&repository_root)).compaction_reminder_threshold_tokens,
-            120000
-        );
+        let resolved = config(temp.path(), Some(&repository_root));
+        assert_eq!(resolved.compaction_reminder_threshold_tokens, 120000);
+        assert_eq!(resolved.verification_timeout_ms, 600000);
 
         fs::write(
             repository_root.join(".flowdex/config.toml"),
-            "compaction_reminder_threshold_tokens = 90000\n",
+            "compaction_reminder_threshold_tokens = 90000\nverification_timeout_ms = 900000\n",
         )
         .expect("repository config");
-        assert_eq!(
-            config(temp.path(), Some(&repository_root)).compaction_reminder_threshold_tokens,
-            90000
-        );
+        let resolved = config(temp.path(), Some(&repository_root));
+        assert_eq!(resolved.compaction_reminder_threshold_tokens, 90000);
+        assert_eq!(resolved.verification_timeout_ms, 900000);
 
         fs::write(
             repository_root.join(".flowdex/config.toml"),
@@ -255,6 +282,7 @@ mod tests {
         .expect("repository omission");
         let resolved = config(temp.path(), Some(&repository_root));
         assert_eq!(resolved.compaction_reminder_threshold_tokens, 120000);
+        assert_eq!(resolved.verification_timeout_ms, 600000);
         assert_eq!(resolved.ast_grep_always_run, ["repo-rule"]);
 
         fs::write(
@@ -320,6 +348,21 @@ mod tests {
         assert!(message.contains("invalid Flowdex config"), "{message}");
         assert!(message.contains("multi_agent_version"), "{message}");
         assert!(message.contains("v3"), "{message}");
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_verification_timeout_with_path() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("flowdex.toml");
+        fs::write(&path, "verification_timeout_ms = 0\n").expect("global config");
+
+        let error = load_config(temp.path(), None).expect_err("invalid verification timeout");
+        let message = error.to_string();
+        assert!(message.contains("verification_timeout_ms"), "{message}");
         assert!(
             message.contains(path.to_string_lossy().as_ref()),
             "{message}"

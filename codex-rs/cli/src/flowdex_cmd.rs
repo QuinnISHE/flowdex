@@ -15,6 +15,7 @@ const INSTALL_MANIFEST: &str = "flowdex/installed-assets-v1";
 const FLOWDEX_CONFIG_PATH: &str = "flowdex.toml";
 const FLOWDEX_CONFIG_CONTENTS: &str = "# Flowdex global defaults. Repository-local .flowdex settings take precedence.\n\
 compaction_reminder_threshold_tokens = 185000\n\
+verification_timeout_ms = 300000\n\
 multi_agent_version = \"v1\"\n\
 ast_grep_candidate_threshold = 3\n\
 ast_grep_always_run = []\n\
@@ -535,6 +536,10 @@ fn complete_existing_flowdex_config(path: &Path) -> Result<()> {
         (
             "compaction_reminder_threshold_tokens",
             "compaction_reminder_threshold_tokens = 185000\n",
+        ),
+        (
+            "verification_timeout_ms",
+            "verification_timeout_ms = 300000\n",
         ),
         ("multi_agent_version", "multi_agent_version = \"v1\"\n"),
         (
@@ -1162,6 +1167,7 @@ mod tests {
 
         assert!(config.contains("multi_agent_version = \"v1\""));
         assert!(config.contains("compaction_reminder_threshold_tokens = 185000"));
+        assert!(config.contains("verification_timeout_ms = 300000"));
         assert!(config.contains("[tool_profiles]"));
         for relative_path in [
             "skills/run-flowdex-workflows/SKILL.md",
@@ -1233,6 +1239,7 @@ mod tests {
             table["compaction_reminder_threshold_tokens"].as_integer(),
             Some(210000)
         );
+        assert_eq!(table["verification_timeout_ms"].as_integer(), Some(300000));
         assert_eq!(table["multi_agent_version"].as_str(), Some("v1"));
         assert_eq!(table["ast_grep_candidate_threshold"].as_integer(), Some(3));
         assert_eq!(

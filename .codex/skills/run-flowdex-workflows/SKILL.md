@@ -80,6 +80,8 @@ Use short, deterministic, non-interactive commands. Put checks at the scope whos
 
 Flowdex tells task workers exactly which commands are declared and runs them automatically after the worker finishes. Workers should not rerun them merely to complete workflow verification. `verificationRepairLimit` controls automatic task repair and is independent of review rounds. Passing output is silent; failed output is bounded and routed to repair.
 
+Each command uses `verification_timeout_ms` from `flowdex.toml`, defaulting to five minutes. Increase that setting for repositories with longer builds. Direct `flowdex.verify()` calls may override it with `timeoutMs`.
+
 ## Configure review
 
 Use task review only when one task needs isolated scrutiny. Put `review` on a phase to batch-review the integrated changes from all tasks in that phase; attribution routes each finding to the responsible task agent. This is usually faster and cheaper than reviewing every task separately.
