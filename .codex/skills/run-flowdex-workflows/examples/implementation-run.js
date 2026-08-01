@@ -16,6 +16,7 @@ const run = await flowdex.startRun({
   contextPacks: {
     architecture: {
       agent: "explorer",
+      lifetime: "repository",
       instructions: "Publish the relevant entry points, invariants, and tests as small source ranges with stable keys.",
     },
   },

@@ -34,6 +34,8 @@ Tool profiles are named in `$CODEX_HOME/flowdex.toml`. An eligible trusted repos
 ```toml
 [tool_profiles.research]
 web_search = "live"
+excluded_tools = ["apply_patch"]
+excluded_skills = []
 
 [tool_profiles.research.tools.web_search]
 context_size = "high"
@@ -46,7 +48,7 @@ disabled_tools = ["write"]
 tool_timeout_sec = 30
 ```
 
-A tool profile contains only `web_search`, `tools`, and `mcp_servers`. Unknown profile names and other configuration keys fail before agent dispatch. Declared scheduler agents retain the same resolved tool profile for task execution and repair, task and phase review, attributed review repair, context-pack collection, and handoff replacement.
+A tool profile contains only `web_search`, `tools`, `mcp_servers`, `excluded_tools`, and `excluded_skills`. Exact exclusions extend the Flowdex-wide defaults for that child. `$CODEX_HOME/flowdex.toml` defaults `subagent_excluded_skills` to `["run-flowdex-workflows"]`, keeping workflow authoring on the orchestrator; trusted repository lists replace same-named global lists when present. Unknown profile names and other configuration keys fail before agent dispatch. Declared scheduler agents retain the same resolved tool profile for task execution and repair, task and phase review, attributed review repair, context-pack collection, and handoff replacement.
 
 `await flowdex.sendMessage(agentId, message, options?)` resolves to `{ submissionId: string }`. `agentId` is the child thread ID and `message` must be non-empty. `options.delivery` is either `"queue"` (the default), which queues the message without starting a turn, or `"turn"`, which starts or continues the recipient's turn. Unknown delivery values are rejected.
 

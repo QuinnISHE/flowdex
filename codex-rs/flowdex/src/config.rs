@@ -11,6 +11,7 @@ use thiserror::Error;
 pub const DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS: i64 = 185_000;
 pub const DEFAULT_AST_GREP_CANDIDATE_THRESHOLD: i64 = 3;
 pub const DEFAULT_VERIFICATION_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_SUBAGENT_EXCLUDED_SKILL: &str = "run-flowdex-workflows";
 
 /// Multi-agent backend version selected by Flowdex configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,6 +30,10 @@ pub struct FlowdexConfig {
     pub ast_grep_always_run: Vec<String>,
     pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
     pub multi_agent_version: Option<FlowdexMultiAgentVersion>,
+    pub subagent_excluded_tools: Vec<String>,
+    pub subagent_excluded_skills: Vec<String>,
+    /// Resolved only on a Flowdex child config after applying its tool profile.
+    pub active_agent_excluded_tools: Vec<String>,
 }
 
 /// Tool-related configuration that can be selected by a Flowdex agent.
@@ -41,6 +46,10 @@ pub struct ToolProfileConfig {
     pub tools: Option<ToolsToml>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_skills: Vec<String>,
 }
 
 /// Loads global settings and, when eligible, a trusted repository override.
@@ -58,6 +67,8 @@ pub fn load_config(
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
     let mut multi_agent_version = Some(FlowdexMultiAgentVersion::V1);
+    let mut subagent_excluded_tools = Vec::new();
+    let mut subagent_excluded_skills = vec![DEFAULT_SUBAGENT_EXCLUDED_SKILL.to_string()];
 
     if let Some(config) = read_partial(&global_path)? {
         if let Some(value) = config.compaction_reminder_threshold_tokens {
@@ -76,9 +87,18 @@ pub fn load_config(
             validate_rule_ids(&value, &global_path)?;
             ast_grep_always_run = value;
         }
+        validate_tool_profiles(&config.tool_profiles, &global_path)?;
         tool_profiles.extend(config.tool_profiles);
         if let Some(value) = config.multi_agent_version {
             multi_agent_version = Some(value);
+        }
+        if let Some(value) = config.subagent_excluded_tools {
+            validate_names(&value, &global_path, "subagent_excluded_tools")?;
+            subagent_excluded_tools = value;
+        }
+        if let Some(value) = config.subagent_excluded_skills {
+            validate_names(&value, &global_path, "subagent_excluded_skills")?;
+            subagent_excluded_skills = value;
         }
     }
 
@@ -101,9 +121,18 @@ pub fn load_config(
                 validate_rule_ids(&value, &repository_path)?;
                 ast_grep_always_run = value;
             }
+            validate_tool_profiles(&config.tool_profiles, &repository_path)?;
             tool_profiles.extend(config.tool_profiles);
             if let Some(value) = config.multi_agent_version {
                 multi_agent_version = Some(value);
+            }
+            if let Some(value) = config.subagent_excluded_tools {
+                validate_names(&value, &repository_path, "subagent_excluded_tools")?;
+                subagent_excluded_tools = value;
+            }
+            if let Some(value) = config.subagent_excluded_skills {
+                validate_names(&value, &repository_path, "subagent_excluded_skills")?;
+                subagent_excluded_skills = value;
             }
         }
     }
@@ -115,6 +144,9 @@ pub fn load_config(
         ast_grep_always_run,
         tool_profiles,
         multi_agent_version,
+        subagent_excluded_tools,
+        subagent_excluded_skills,
+        active_agent_excluded_tools: Vec::new(),
     })
 }
 
@@ -126,6 +158,8 @@ struct PartialFlowdexConfig {
     ast_grep_candidate_threshold: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
     multi_agent_version: Option<FlowdexMultiAgentVersion>,
+    subagent_excluded_tools: Option<Vec<String>>,
+    subagent_excluded_skills: Option<Vec<String>>,
     #[serde(default)]
     tool_profiles: BTreeMap<String, ToolProfileConfig>,
 }
@@ -196,6 +230,50 @@ fn validate_rule_ids(values: &[String], path: &Path) -> Result<(), FlowdexConfig
     Ok(())
 }
 
+fn validate_names(
+    values: &[String],
+    path: &Path,
+    field: &'static str,
+) -> Result<(), FlowdexConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        if value.trim().is_empty() || !seen.insert(value) {
+            return Err(FlowdexConfigError::InvalidExclusion {
+                path: path.to_path_buf(),
+                field,
+                value: value.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_profiles(
+    profiles: &BTreeMap<String, ToolProfileConfig>,
+    path: &Path,
+) -> Result<(), FlowdexConfigError> {
+    for (name, profile) in profiles {
+        validate_names(
+            &profile.excluded_tools,
+            path,
+            "tool_profiles.<name>.excluded_tools",
+        )?;
+        validate_names(
+            &profile.excluded_skills,
+            path,
+            "tool_profiles.<name>.excluded_skills",
+        )?;
+        if name.trim().is_empty() {
+            return Err(FlowdexConfigError::InvalidExclusion {
+                path: path.to_path_buf(),
+                field: "tool_profiles",
+                value: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum FlowdexConfigError {
     #[error("unable to read Flowdex config at {path}: {source}")]
@@ -230,6 +308,15 @@ pub enum FlowdexConfigError {
 
     #[error("duplicate ast_grep_always_run rule id `{id}` in Flowdex config at {path}")]
     DuplicateAstGrepRuleId { path: PathBuf, id: String },
+
+    #[error(
+        "invalid {field} entry `{value}` in Flowdex config at {path}: values must be non-empty and unique"
+    )]
+    InvalidExclusion {
+        path: PathBuf,
+        field: &'static str,
+        value: String,
+    },
 }
 
 #[cfg(test)]
@@ -255,6 +342,15 @@ mod tests {
         assert_eq!(
             config(temp.path(), Some(&repository_root)).verification_timeout_ms,
             DEFAULT_VERIFICATION_TIMEOUT_MS
+        );
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).subagent_excluded_skills,
+            [DEFAULT_SUBAGENT_EXCLUDED_SKILL]
+        );
+        assert!(
+            config(temp.path(), Some(&repository_root))
+                .subagent_excluded_tools
+                .is_empty()
         );
 
         fs::write(
@@ -379,6 +475,8 @@ mod tests {
             r#"
 [tool_profiles.research]
 web_search = "live"
+excluded_tools = ["apply_patch"]
+excluded_skills = ["repo-only-skill"]
 
 [tool_profiles.docs]
 web_search = "cached"
@@ -399,6 +497,7 @@ web_search = "disabled"
             profiles["research"].web_search,
             Some(WebSearchMode::Disabled)
         );
+        assert!(profiles["research"].excluded_tools.is_empty());
         assert_eq!(profiles["docs"].web_search, Some(WebSearchMode::Cached));
         let serialized = toml::Value::try_from(profiles["docs"].clone()).unwrap();
         assert_eq!(serialized["web_search"].as_str(), Some("cached"));

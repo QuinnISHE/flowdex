@@ -26,7 +26,7 @@ The installer does not modify `PATH`, shell profiles, machine-wide environment
 state, the Codex application bundle, or compatibility variables. The executable embeds
 and creates these files when they are missing:
 
-- `$CODEX_HOME/flowdex.toml` with every global option populated at its default (`185000` compaction reminder tokens, multi-agent V1, AST-grep candidate threshold `3`, no always-run rules, and no tool profiles). Reinstall adds missing options to a valid existing config without replacing existing values.
+- `$CODEX_HOME/flowdex.toml` with every global option populated at its default (`185000` compaction reminder tokens, five-minute verification timeout, multi-agent V1, AST-grep candidate threshold `3`, no always-run rules or excluded child tools, and `run-flowdex-workflows` excluded from child skills). Reinstall adds missing options to a valid existing config without replacing existing values.
 - `$CODEX_HOME/flowdex/workflows/defaults/research-rounds.js`
 - `$CODEX_HOME/flowdex/workflows/defaults/worker-reviewer.js`
 - the `run-flowdex-workflows` skill, UI metadata, and standalone JavaScript examples under `$CODEX_HOME/skills/run-flowdex-workflows/`

@@ -42,7 +42,7 @@ PowerShell may require `./flowdex.exe`; macOS shells may require `./flowdex`.
 
 Install copies the backend to `$CODEX_HOME/flowdex/bin/codex[.exe]`, configures the Codex app to use it, and creates these missing global assets from the binary:
 
-- `$CODEX_HOME/flowdex.toml`, populated with all global defaults (including a `185000`-token compaction reminder, five-minute verification timeout, and multi-agent V1)
+- `$CODEX_HOME/flowdex.toml`, populated with all global defaults (including a `185000`-token compaction reminder, five-minute verification timeout, multi-agent V1, and child tool/skill exclusions)
 - `$CODEX_HOME/flowdex/workflows/defaults/{research-rounds,worker-reviewer}.js`
 - `$CODEX_HOME/skills/run-flowdex-workflows/`, including standalone JavaScript examples
 

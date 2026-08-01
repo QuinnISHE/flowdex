@@ -72,6 +72,8 @@ context-pack collection, and handoff replacements. Resolution starts from the
 parent configuration snapshot, then applies the `.codex/agents` profile, the
 Flowdex tool profile, and finally explicit model and reasoning overrides.
 
+Top-level `cleanup` is an optional ordered command array. It runs only after final verification, review, and boundary continuation. Passing output is silent. Failure fails the run and preserves temporary context and recovery state; successful cleanup is recorded so process recovery does not repeat it. Commands should be non-interactive, idempotent, and leave the integration worktree usable.
+
 An open phase can receive tasks while it is active. A saved workflow uses the
 handle methods; an awake orchestrator may use the direct model-only
 `queue_flowdex_task({ run_id, phase, task })` and

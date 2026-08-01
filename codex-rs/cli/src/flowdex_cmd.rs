@@ -19,9 +19,12 @@ verification_timeout_ms = 300000\n\
 multi_agent_version = \"v1\"\n\
 ast_grep_candidate_threshold = 3\n\
 ast_grep_always_run = []\n\
+subagent_excluded_tools = []\n\
+subagent_excluded_skills = [\"run-flowdex-workflows\"]\n\
 \n\
 [tool_profiles]\n\
-# Add named tool profiles as [tool_profiles.<name>] tables.\n";
+# Add named tool profiles as [tool_profiles.<name>] tables. Profiles may add\n\
+# excluded_tools and excluded_skills for focused Flowdex child roles.\n";
 
 #[cfg(windows)]
 const WINDOWS_HELPERS: &[&str] = &[
@@ -547,6 +550,11 @@ fn complete_existing_flowdex_config(path: &Path) -> Result<()> {
             "ast_grep_candidate_threshold = 3\n",
         ),
         ("ast_grep_always_run", "ast_grep_always_run = []\n"),
+        ("subagent_excluded_tools", "subagent_excluded_tools = []\n"),
+        (
+            "subagent_excluded_skills",
+            "subagent_excluded_skills = [\"run-flowdex-workflows\"]\n",
+        ),
     ];
     let mut prefix = String::new();
     for (key, default) in defaults {
@@ -1168,6 +1176,8 @@ mod tests {
         assert!(config.contains("multi_agent_version = \"v1\""));
         assert!(config.contains("compaction_reminder_threshold_tokens = 185000"));
         assert!(config.contains("verification_timeout_ms = 300000"));
+        assert!(config.contains("subagent_excluded_tools = []"));
+        assert!(config.contains("subagent_excluded_skills = [\"run-flowdex-workflows\"]"));
         assert!(config.contains("[tool_profiles]"));
         for relative_path in [
             "skills/run-flowdex-workflows/SKILL.md",
@@ -1245,6 +1255,17 @@ mod tests {
         assert_eq!(
             table["ast_grep_always_run"].as_array().map(Vec::len),
             Some(0)
+        );
+        assert_eq!(
+            table["subagent_excluded_tools"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            table["subagent_excluded_skills"]
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("run-flowdex-workflows")
         );
         assert!(table["tool_profiles"].as_table().is_some());
         assert!(source.contains("# user setting"));

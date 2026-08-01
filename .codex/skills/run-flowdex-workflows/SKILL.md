@@ -43,7 +43,7 @@ Progress summaries and child lifecycle events are automatic and app-visible. The
 
 Put shared requirements and invariants in phase `instructions`. Put one concrete deliverable, relevant constraints, and completion criteria in each task `instructions`; do not repeat the phase text. Use `dependencies` only for semantic ordering. Dependency-ready tasks run concurrently. Declare `readScope` and `writeScope` to document ownership and avoid obvious write collisions; scopes are scheduling hints, not access controls.
 
-Use multiple narrow tasks when they can produce independent commits. Keep tightly coupled edits in one task. Set `open: true` only when the workflow must discover work dynamically; queue tasks and always seal the phase.
+Use multiple narrow tasks when they can produce independent commits. Keep tightly coupled edits in one task. Dependency-ready tasks run concurrently, so omit dependencies that express preference rather than a real data requirement. Independent context packs also collect concurrently; declare separate packs instead of one broad explorer job. Set `open: true` only when the workflow must discover work dynamically; queue tasks and always seal the phase.
 
 Phases run in order. Put a boundary on the smallest scope requiring approval:
 
@@ -62,13 +62,21 @@ Every declared agent needs a `profile`, `model`, or `reasoningEffort`. Prefer a 
 - Use `gpt-5.6-luna` at `high` for exploration and `xhigh` for difficult final review.
 - Reserve `xhigh` for judgment-heavy work; it is usually wasteful for mechanical tasks.
 
-Use `toolProfile` for a named Flowdex tool overlay from `flowdex.toml`. Grant only the web, MCP, and existing Codex tools the role needs. A tool profile is separate from a `.codex/agents` profile.
+Use `toolProfile` for a named Flowdex tool overlay from `flowdex.toml`. Grant only the web, MCP, and existing Codex tools the role needs. Profiles may add `excluded_tools` and `excluded_skills`; use this to remove `apply_patch` from explorers and reviewers. Flowdex hides this workflow-authoring skill from child agents by default. A tool profile is separate from a `.codex/agents` profile.
 
 ## Use context packs
 
 Declare a context pack when downstream tasks need exact source facts that the orchestrator should not load. Pack instructions should name the facts to collect, expected stable keys, and the smallest source ranges that prove them. Do not put implementation work or broad repository exploration into a pack.
 
-Tasks opt in with `context: ["pack-name"]`. Flowdex injects fresh fragments only into those task prompts. Missing or stale packs dispatch the declared collector while unrelated ready tasks continue. Collectors publish bounded repository-relative inclusive ranges with `publish_flowdex_context`; republishing the same key supersedes its prior version.
+Choose one `lifetime`:
+
+- `workflow` (default): durable for this run and its recovery history.
+- `temporary`: durable through pause, failure, and recovery, then cleared after successful workflow cleanup.
+- `repository`: loaded from and updated at `.flowdex/context-packs/<name>.json` for reuse by later workflows.
+
+Workflow and temporary packs may declare source-backed `fragments` with `key`, `path`, `lineStart`, `lineEnd`, and optional `summary`. Use these when the planner already knows the relevant plan/source ranges; a fresh seed avoids an explorer turn. Repository packs are populated through their checked-in file or collector so updates remain attributed task commits.
+
+Tasks opt in with `context: ["pack-name"]`. Flowdex injects fresh fragments only into those task prompts. Missing or stale distinct packs dispatch their collectors concurrently while unrelated ready tasks continue. Collectors publish bounded repository-relative inclusive ranges with `publish_flowdex_context`; republishing the same key supersedes its prior version. A worker receiving repository context should republish only when its edits invalidate a fragment's meaning, not for incidental line changes.
 
 ## Configure verification
 
@@ -81,6 +89,8 @@ Use short, deterministic, non-interactive commands. Put checks at the scope whos
 Flowdex tells task workers exactly which commands are declared and runs them automatically after the worker finishes. Workers should not rerun them merely to complete workflow verification. `verificationRepairLimit` controls automatic task repair and is independent of review rounds. Passing output is silent; failed output is bounded and routed to repair.
 
 Each command uses `verification_timeout_ms` from `flowdex.toml`, defaulting to five minutes. Increase that setting for repositories with longer builds. Direct `flowdex.verify()` calls may override it with `timeoutMs`.
+
+Top-level `cleanup` commands run in order only after successful final verification, review, and boundary continuation. Keep them non-interactive and idempotent. A cleanup failure fails the run and retains temporary packs so `resume_flowdex_workflow` can retry safely.
 
 ## Configure review
 

@@ -220,6 +220,7 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    apply_flowdex_agent_tool_exclusions(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     let flowdex_agent_tools_enabled = collab_tools_enabled(turn_context);
@@ -320,6 +321,27 @@ fn build_tool_specs_and_registry(
     planned_tools.add_with_exposure(ResumeFlowdexWorkflowHandler, ToolExposure::DirectModelOnly);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
+}
+
+fn apply_flowdex_agent_tool_exclusions(
+    turn_context: &TurnContext,
+    planned_tools: &mut PlannedTools,
+) {
+    let excluded = &turn_context
+        .config
+        .flowdex_config
+        .active_agent_excluded_tools;
+    if excluded.is_empty() {
+        return;
+    }
+    planned_tools.runtimes.retain(|runtime| {
+        !excluded
+            .iter()
+            .any(|name| name == &runtime.tool_name().to_string())
+    });
+    planned_tools
+        .hosted_specs
+        .retain(|spec| !excluded.iter().any(|name| name == spec.name()));
 }
 
 fn apply_direct_model_only_namespace_overrides(

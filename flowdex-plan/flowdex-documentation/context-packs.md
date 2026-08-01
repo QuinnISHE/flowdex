@@ -16,6 +16,7 @@ const run = await flowdex.startRun({
     "contact-layout": {
       agent: "explorer",
       instructions: "Collect the current layout and invariants.",
+      lifetime: "repository",
     },
   },
   phases: [{
@@ -30,6 +31,27 @@ const run = await flowdex.startRun({
   }],
 });
 ```
+
+Pack `lifetime` is `workflow` by default. `temporary` retains fragments through failure, pause, and recovery, then removes them only after successful workflow cleanup. `repository` loads and updates `.flowdex/context-packs/<pack>.json`, so later workflows can reuse fresh code context without another collector. Repository pack updates are generated in the publishing task worktree and included in Flowdex's attributed task commit.
+
+Workflow and temporary packs may be seeded directly when the planner already knows bounded source ranges:
+
+```js
+plan: {
+  agent: "explorer",
+  instructions: "Refresh these plan requirements only if they become stale.",
+  lifetime: "temporary",
+  fragments: [{
+    key: "requirements",
+    path: "PLAN.md",
+    lineStart: 10,
+    lineEnd: 35,
+    summary: "Requirements for this run",
+  }],
+}
+```
+
+Fresh seeds avoid an explorer turn. Repository packs are seeded by their checked-in file or collector so persistence remains part of a task commit.
 
 A Flowdex child publishes a repository-relative inclusive line range with:
 
@@ -53,11 +75,13 @@ components, links, reparse points, directories, or invalid ranges.
 Before a dependent task starts, Flowdex re-reads each active range from the
 current integration worktree. Fresh fragments are ordered by key and appended
 once to the task instructions. Missing or changed ranges make the pack missing
-or stale and block only dependent tasks. The scheduler starts one ordinary
+or stale and block only dependent tasks. Distinct packs needed by the same or different ready tasks collect concurrently. The scheduler starts one ordinary
 `StatusOnly` collector per run and pack, using the declared agent and normal
 capacity, profile, cancellation, and lifecycle behavior. Other ready tasks
 continue. A collector that fails or finishes without a fresh pack fails the
 affected scheduler path instead of looping.
+
+Workers receiving a repository pack are told to republish a fragment only when their changes invalidate its meaning. Incidental edits that leave the context accurate do not require an update.
 
 Models can inspect a pack directly when needed:
 

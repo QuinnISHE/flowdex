@@ -215,27 +215,65 @@ pub(crate) async fn apply_flowdex_tool_profile(
     config: &mut Config,
     profile_name: Option<&str>,
 ) -> Result<(), FunctionCallError> {
-    let Some(profile_name) = profile_name else {
-        return Ok(());
-    };
-    let profile = config
-        .flowdex_config
-        .tool_profiles
-        .get(profile_name)
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "unknown Flowdex tool profile `{profile_name}`"
-            ))
-        })?
-        .clone();
-    let profile_value = toml::Value::try_from(profile).map_err(|error| {
-        FunctionCallError::RespondToModel(format!("invalid Flowdex tool profile: {error}"))
-    })?;
+    let profile = profile_name
+        .map(|profile_name| {
+            config
+                .flowdex_config
+                .tool_profiles
+                .get(profile_name)
+                .cloned()
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(format!(
+                        "unknown Flowdex tool profile `{profile_name}`"
+                    ))
+                })
+        })
+        .transpose()?;
+    let mut excluded_tools = config.flowdex_config.subagent_excluded_tools.clone();
+    let mut excluded_skills = config.flowdex_config.subagent_excluded_skills.clone();
+    if let Some(profile) = profile.as_ref() {
+        excluded_tools.extend(profile.excluded_tools.iter().cloned());
+        excluded_skills.extend(profile.excluded_skills.iter().cloned());
+    }
+    excluded_tools.sort();
+    excluded_tools.dedup();
+    excluded_skills.sort();
+    excluded_skills.dedup();
     let mut layer = toml::map::Map::new();
-    if let TomlValue::Table(values) = profile_value {
+    if let Some(profile) = profile {
+        let profile_value = toml::Value::try_from(profile).map_err(|error| {
+            FunctionCallError::RespondToModel(format!("invalid Flowdex tool profile: {error}"))
+        })?;
+        let TomlValue::Table(mut values) = profile_value else {
+            unreachable!("Flowdex tool profiles serialize as tables")
+        };
+        values.remove("excluded_tools");
+        values.remove("excluded_skills");
         for (key, value) in values {
             layer.insert(key, value);
         }
+    }
+    if !excluded_skills.is_empty() {
+        let entries = excluded_skills
+            .iter()
+            .map(|name| {
+                TomlValue::Table(toml::map::Map::from_iter([
+                    ("name".into(), TomlValue::String(name.clone())),
+                    ("enabled".into(), TomlValue::Boolean(false)),
+                ]))
+            })
+            .collect();
+        layer.insert(
+            "skills".into(),
+            TomlValue::Table(toml::map::Map::from_iter([(
+                "config".into(),
+                TomlValue::Array(entries),
+            )])),
+        );
+    }
+    if layer.is_empty() {
+        config.flowdex_config.active_agent_excluded_tools = excluded_tools;
+        return Ok(());
     }
     let mut layers = config
         .config_layer_stack
@@ -256,7 +294,7 @@ pub(crate) async fn apply_flowdex_tool_profile(
     let cfg =
         deserialize_config_toml_with_base(stack.effective_config(), config.codex_home.as_path())
             .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-    let next = Config::load_config_with_layer_stack(
+    let mut next = Config::load_config_with_layer_stack(
         LOCAL_FS.as_ref(),
         cfg,
         ConfigOverrides {
@@ -271,6 +309,7 @@ pub(crate) async fn apply_flowdex_tool_profile(
     )
     .await
     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    next.flowdex_config.active_agent_excluded_tools = excluded_tools;
     *config = next;
     Ok(())
 }

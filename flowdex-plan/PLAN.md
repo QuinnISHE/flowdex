@@ -58,6 +58,7 @@ The intended durable vocabulary is:
 - **Agent control:** spawn or resume an agent and send direct agent-to-agent messages when the high-level task scheduler is not the right abstraction.
 - **Verification and review:** execute structured verification and route structured findings without hard-coding worker or reviewer roles.
 - **Context:** request a context pack and publish or supersede a fragment.
+- **Context lifetime:** keep a pack workflow-scoped, clear it after successful cleanup, or persist its active fragments under `.flowdex/context-packs` for later workflows. Planner-provided bounded fragments may seed non-repository packs.
 - **Suspension:** await scheduler state, agent completion, signals, messages, or steering without polling.
 
 Common implementation workflows should mostly use run, phase, and task declarations. The lower-level agent and verification primitives remain available for generic workflows that do not fit the implementation-task lifecycle. Automatic progress is runtime-owned and intentionally absent from this vocabulary.
@@ -88,6 +89,7 @@ Messages go directly to the target thread without passing through the orchestrat
 - Validate initial task dependencies before starting.
 - Validate dynamically queued tasks independently. Reject an invalid addition without terminating unrelated running tasks.
 - Run phases sequentially and dependency-ready tasks concurrently.
+- Resolve distinct context packs concurrently while sharing one collector for duplicate requests of the same pack.
 - Keep a phase open while its workflow code and agents may still queue work. Seal it before phase verification, review, and boundary handling.
 - Do not reopen completed phases. Additional work discovered later is queued into an active/future phase or a newly declared phase without restarting the run.
 

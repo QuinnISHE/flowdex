@@ -17,7 +17,8 @@ use codex_flowdex::store::{
 };
 use codex_flowdex::workflow::ContextPackDefinition;
 use codex_flowdex::{
-    Boundary, PhaseDefinition, ReviewDefinition, TaskDefinition, WorkflowDefinition,
+    Boundary, ContextFragmentSeed, ContextPackLifetime, PhaseDefinition, ReviewDefinition,
+    TaskDefinition, WorkflowDefinition,
 };
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -76,6 +77,8 @@ struct RawWorkflow {
     #[serde(default)]
     verification: Vec<String>,
     #[serde(default)]
+    cleanup: Vec<String>,
+    #[serde(default)]
     context_packs: std::collections::BTreeMap<String, RawContextPack>,
     #[serde(default)]
     boundary: Boundary,
@@ -85,6 +88,20 @@ struct RawWorkflow {
 struct RawContextPack {
     agent: String,
     instructions: String,
+    #[serde(default)]
+    lifetime: ContextPackLifetime,
+    #[serde(default)]
+    fragments: Vec<RawContextFragment>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawContextFragment {
+    key: String,
+    path: std::path::PathBuf,
+    line_start: u32,
+    line_end: u32,
+    #[serde(default)]
+    summary: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +203,7 @@ impl From<RawWorkflow> for WorkflowDefinition {
                 })
                 .collect(),
             verification: w.verification,
+            cleanup: w.cleanup,
             boundary: w.boundary,
             context_packs: w
                 .context_packs
@@ -196,6 +214,18 @@ impl From<RawWorkflow> for WorkflowDefinition {
                         ContextPackDefinition {
                             agent: pack.agent,
                             instructions: pack.instructions,
+                            lifetime: pack.lifetime,
+                            fragments: pack
+                                .fragments
+                                .into_iter()
+                                .map(|fragment| ContextFragmentSeed {
+                                    key: fragment.key,
+                                    path: fragment.path,
+                                    line_start: fragment.line_start,
+                                    line_end: fragment.line_end,
+                                    summary: fragment.summary,
+                                })
+                                .collect(),
                         },
                     )
                 })
@@ -465,6 +495,8 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
                 ContextPackDeclaration {
                     agent: pack.agent.clone(),
                     instructions: pack.instructions.clone(),
+                    lifetime: pack.lifetime,
+                    fragments: pack.fragments.clone(),
                 },
             )
         })
@@ -472,8 +504,23 @@ async fn start_call(invocation: ToolInvocation) -> Result<task::JsonOutput, Func
     if !declarations.is_empty() {
         let store_for_context = Arc::clone(&store);
         let run_id_for_context = run_id.clone();
+        let declarations_for_declare = declarations.clone();
         tokio::task::spawn_blocking(move || {
-            store_for_context.declare_context_packs(&run_id_for_context, &declarations)
+            store_for_context.declare_context_packs(&run_id_for_context, &declarations_for_declare)
+        })
+        .await
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
+        .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?;
+        let store_for_hydration = Arc::clone(&store);
+        let run_id_for_hydration = run_id.clone();
+        let integration_worktree = info.integration_worktree.clone();
+        let declarations_for_hydration = declarations.clone();
+        tokio::task::spawn_blocking(move || {
+            store_for_hydration.hydrate_context_packs(
+                &run_id_for_hydration,
+                &integration_worktree,
+                &declarations_for_hydration,
+            )
         })
         .await
         .map_err(|e| FunctionCallError::RespondToModel(e.to_string()))?
@@ -892,6 +939,7 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<Schedule
         )
         .await;
         if boundary.scope_kind == "run" {
+            finish_successful_run(controller, &definition).await?;
             return Ok(SchedulerOutcome::Completed);
         }
     }
@@ -985,6 +1033,40 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<Schedule
         format!("Completed workflow: {}", definition.name),
     )
     .await?;
+    finish_successful_run(controller, &definition).await?;
+    Ok(SchedulerOutcome::Completed)
+}
+
+async fn finish_successful_run(
+    controller: &Arc<RunController>,
+    definition: &WorkflowDefinition,
+) -> Result<(), String> {
+    let cleanup_completed = {
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        tokio::task::spawn_blocking(move || store.run_cleanup_completed(&run_id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+    };
+    if !cleanup_completed {
+        if !definition.cleanup.is_empty() {
+            progress(
+                &controller.invocation,
+                format!("Cleaning up workflow: {}", definition.name),
+            )
+            .await;
+            verify_commands(controller, &definition.cleanup)
+                .await
+                .map_err(|error| format!("workflow cleanup failed: {error}"))?;
+        }
+        let store = Arc::clone(&controller.store);
+        let run_id = controller.id.clone();
+        tokio::task::spawn_blocking(move || store.finish_successful_cleanup(&run_id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+    }
     let set_run = (
         Arc::clone(&controller.store),
         controller.info.run_id.clone(),
@@ -998,7 +1080,7 @@ async fn run_scheduler_inner(controller: &Arc<RunController>) -> Result<Schedule
         format!("Completed workflow: {}", definition.name),
     )
     .await;
-    Ok(SchedulerOutcome::Completed)
+    Ok(())
 }
 
 async fn run_phase(
@@ -1375,11 +1457,35 @@ async fn prepare_task_instructions(
 ) -> Result<String, String> {
     let mut rendered = String::new();
     let mut seen = std::collections::BTreeSet::new();
-    for pack in &task.context {
-        if !seen.insert(pack) {
-            continue;
+    let packs = task
+        .context
+        .iter()
+        .filter(|pack| seen.insert((*pack).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let lifetimes = {
+        let definition = controller.definition.lock().await;
+        packs
+            .iter()
+            .filter_map(|pack| {
+                definition
+                    .context_packs
+                    .get(pack)
+                    .map(|definition| (pack.clone(), definition.lifetime))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let resolved = join_all(packs.iter().map(|pack| {
+        let controller = Arc::clone(controller);
+        async move {
+            resolve_or_collect_context(&controller, pack)
+                .await
+                .map(|resolved| (pack.clone(), resolved))
         }
-        let resolved = resolve_or_collect_context(controller, pack).await?;
+    }))
+    .await;
+    for resolved in resolved {
+        let (pack, resolved) = resolved?;
         if resolved.status != ContextPackStatus::Fresh {
             return Err(format!("context pack {pack} is not fresh after collection"));
         }
@@ -1401,6 +1507,14 @@ async fn prepare_task_instructions(
     }
     if !rendered.is_empty() {
         rendered.push_str("--- End Flowdex context ---");
+    }
+    if packs
+        .iter()
+        .any(|pack| lifetimes.get(pack) == Some(&ContextPackLifetime::Repository))
+    {
+        rendered.push_str(
+            "\n\nRepository context maintenance: if your edits invalidate the meaning of a received repository fragment, use publish_flowdex_context to supersede that fragment. Do not republish for incidental line changes that leave the context accurate; Flowdex commits deliberate updates with your task changes.",
+        );
     }
     Ok(format!("{}{}", base_instructions, rendered))
 }
@@ -1499,9 +1613,14 @@ async fn collect_context(
                 .join("\n")
         )
     };
+    let repository_note = if pack_definition.lifetime == ContextPackLifetime::Repository {
+        " The publish tool also updates the checked-in repository pack file; Flowdex will include it in the collector task commit."
+    } else {
+        ""
+    };
     let instructions = format!(
-        "Collect context pack `{pack}`.\n\n{}{}\n\nUse publish_flowdex_context to publish one or more fresh, bounded source-backed fragments. The collection is incomplete until the tool accepts a fresh fragment. Do not return source context through the orchestrator or finish with prose only.",
-        pack_definition.instructions, stale
+        "Collect context pack `{pack}`.\n\n{}{}\n\nUse publish_flowdex_context to publish one or more fresh, bounded source-backed fragments. The collection is incomplete until the tool accepts a fresh fragment.{repository_note} Do not return source context through the orchestrator or finish with prose only.",
+        pack_definition.instructions, stale,
     );
     let collector_suffix = Uuid::new_v4().simple().to_string();
     let task_id = format!("context-{collector_suffix}");
@@ -1528,9 +1647,9 @@ async fn collect_context(
     let agent = AgentSpec {
         name: format!("context_collector_{collector_suffix}"),
         display_name: Some(format!("{} context", pack)),
-        instructions:
-            "Publish the requested bounded context with publish_flowdex_context before finishing."
-                .into(),
+        instructions: format!(
+            "Publish the requested bounded context with publish_flowdex_context before finishing.{repository_note}"
+        ),
         profile: agent_definition.profile,
         model: agent_definition.model,
         reasoning_effort: agent_definition.reasoning_effort.and_then(parse_effort),

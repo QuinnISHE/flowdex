@@ -62,7 +62,7 @@ impl CoreToolRuntime for ReadFlowdexContextHandler {}
 fn publish_spec() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: PUBLISH.into(),
-        description: "Publish one bounded source-backed fragment for the active Flowdex context collection. Use a stable descriptive key, a repository-relative path, and the smallest complete inclusive line range that proves one fact. Publish separate facts separately; publishing the same pack/key supersedes its prior version. The collection is incomplete until at least one fresh fragment is accepted. Do not paste source contents into a prose response.".into(),
+        description: "Publish one bounded source-backed fragment for the active Flowdex context collection. Use a stable descriptive key, a repository-relative path, and the smallest complete inclusive line range that proves one fact. Publish separate facts separately; publishing the same pack/key supersedes its prior version. Repository-lived packs also update their checked-in pack file in the task worktree, which Flowdex commits with successful task changes. The collection is incomplete until at least one fresh fragment is accepted. Do not paste source contents into a prose response.".into(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(

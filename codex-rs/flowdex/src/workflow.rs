@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, PathBuf};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,7 +40,29 @@ pub struct WorkflowDefinition {
     pub context_packs: BTreeMap<String, ContextPackDefinition>,
     #[serde(default)]
     pub verification: Vec<String>,
+    #[serde(default)]
+    pub cleanup: Vec<String>,
     pub phases: Vec<PhaseDefinition>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextPackLifetime {
+    #[default]
+    Workflow,
+    Temporary,
+    Repository,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextFragmentSeed {
+    pub key: String,
+    pub path: PathBuf,
+    pub line_start: u32,
+    pub line_end: u32,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +70,10 @@ pub struct WorkflowDefinition {
 pub struct ContextPackDefinition {
     pub agent: String,
     pub instructions: String,
+    #[serde(default)]
+    pub lifetime: ContextPackLifetime,
+    #[serde(default)]
+    pub fragments: Vec<ContextFragmentSeed>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,6 +128,12 @@ pub enum WorkflowValidationError {
     AgentWithoutSelector(String),
     #[error("context pack {0} must define an agent and instructions")]
     InvalidContextPack(String),
+    #[error("repository context pack name is not a safe path component: {0}")]
+    InvalidRepositoryContextPackName(String),
+    #[error("repository context pack {0} cannot declare inline fragments")]
+    RepositoryContextPackHasFragments(String),
+    #[error("context pack {pack} has an invalid fragment: {reason}")]
+    InvalidContextFragment { pack: String, reason: String },
     #[error("context pack {pack} references unknown agent {agent}")]
     UnknownContextAgent { pack: String, agent: String },
     #[error("task {task} references unknown context pack {pack}")]
@@ -188,12 +221,65 @@ impl WorkflowDefinition {
             }
         }
         validate_commands(&self.verification)?;
+        validate_commands(&self.cleanup)?;
         for (name, pack) in &self.context_packs {
             non_empty("context pack name", name)?;
             non_empty("context pack agent", &pack.agent)
                 .map_err(|_| WorkflowValidationError::InvalidContextPack(name.clone()))?;
             non_empty("context pack instructions", &pack.instructions)
                 .map_err(|_| WorkflowValidationError::InvalidContextPack(name.clone()))?;
+            if pack.lifetime == ContextPackLifetime::Repository {
+                if !safe_repository_pack_name(name) {
+                    return Err(WorkflowValidationError::InvalidRepositoryContextPackName(
+                        name.clone(),
+                    ));
+                }
+                if !pack.fragments.is_empty() {
+                    return Err(WorkflowValidationError::RepositoryContextPackHasFragments(
+                        name.clone(),
+                    ));
+                }
+            }
+            let mut fragment_keys = BTreeSet::new();
+            for fragment in &pack.fragments {
+                if fragment.key.trim().is_empty() {
+                    return Err(WorkflowValidationError::InvalidContextFragment {
+                        pack: name.clone(),
+                        reason: "key must be non-empty".into(),
+                    });
+                }
+                if !fragment_keys.insert(fragment.key.trim()) {
+                    return Err(WorkflowValidationError::InvalidContextFragment {
+                        pack: name.clone(),
+                        reason: format!("duplicate key {}", fragment.key),
+                    });
+                }
+                if fragment.path.is_absolute()
+                    || fragment.path.components().any(|component| {
+                        matches!(
+                            component,
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(WorkflowValidationError::InvalidContextFragment {
+                        pack: name.clone(),
+                        reason: format!(
+                            "path must be repository-relative: {}",
+                            fragment.path.display()
+                        ),
+                    });
+                }
+                if fragment.line_start == 0 || fragment.line_end < fragment.line_start {
+                    return Err(WorkflowValidationError::InvalidContextFragment {
+                        pack: name.clone(),
+                        reason: format!(
+                            "invalid line range {}..={}",
+                            fragment.line_start, fragment.line_end
+                        ),
+                    });
+                }
+            }
             if !self.agents.contains_key(&pack.agent) {
                 return Err(WorkflowValidationError::UnknownContextAgent {
                     pack: name.clone(),
@@ -360,6 +446,15 @@ impl WorkflowDefinition {
     }
 }
 
+fn safe_repository_pack_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && name != "."
+        && name != ".."
+}
+
 fn validate_task_shape(task: &TaskDefinition) -> Result<(), WorkflowValidationError> {
     non_empty("task name", &task.name)?;
     non_empty("task agent", &task.agent)?;
@@ -465,6 +560,7 @@ mod tests {
             .collect(),
             boundary: Boundary::Continue,
             verification: vec![],
+            cleanup: vec![],
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
                 name: "phase".into(),

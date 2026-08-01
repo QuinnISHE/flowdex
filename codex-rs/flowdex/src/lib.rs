@@ -73,6 +73,8 @@ pub use store::TaskOperation;
 pub use store::TaskRecord;
 pub use workflow::AgentDefinition;
 pub use workflow::Boundary;
+pub use workflow::ContextFragmentSeed;
+pub use workflow::ContextPackLifetime;
 pub use workflow::PhaseDefinition;
 pub use workflow::ReviewDefinition;
 pub use workflow::TaskDefinition;
@@ -354,7 +356,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     };
 
     requireObject(definition, "startRun definition");
-    requireKeys(definition, new Set(["name", "agents", "phases", "verification", "contextPacks", "boundary"]), "startRun");
+    requireKeys(definition, new Set(["name", "agents", "phases", "verification", "cleanup", "contextPacks", "boundary"]), "startRun");
     const runName = requireString(definition.name, "startRun.name");
     const agents = requireObject(definition.agents, "startRun.agents");
     const agentNames = new Set(Object.keys(agents));
@@ -384,12 +386,46 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
     for (const packName of contextPackNames) {
       requireString(packName, "startRun context pack name");
       const pack = requireObject(contextPacks[packName], `startRun.contextPacks.${packName}`);
-      requireKeys(pack, new Set(["agent", "instructions"]), `startRun.contextPacks.${packName}`);
+      requireKeys(pack, new Set(["agent", "instructions", "lifetime", "fragments"]), `startRun.contextPacks.${packName}`);
       const agent = requireString(pack.agent, `startRun.contextPacks.${packName}.agent`);
       if (!agentNames.has(agent)) throw new TypeError(`startRun.contextPacks.${packName}.agent is unknown`);
+      const lifetime = pack.lifetime === undefined ? "workflow" : requireString(pack.lifetime, `startRun.contextPacks.${packName}.lifetime`);
+      if (!["workflow", "temporary", "repository"].includes(lifetime)) {
+        throw new TypeError(`startRun.contextPacks.${packName}.lifetime must be workflow, temporary, or repository`);
+      }
+      if (lifetime === "repository" && (!/^[A-Za-z0-9._-]+$/.test(packName) || packName === "." || packName === "..")) {
+        throw new TypeError(`startRun.contextPacks.${packName} needs a filesystem-safe repository pack name`);
+      }
+      const fragments = pack.fragments === undefined ? [] : pack.fragments;
+      if (!Array.isArray(fragments)) throw new TypeError(`startRun.contextPacks.${packName}.fragments must be an array`);
+      if (lifetime === "repository" && fragments.length !== 0) {
+        throw new TypeError(`startRun.contextPacks.${packName} cannot seed repository fragments`);
+      }
+      const fragmentKeys = new Set();
+      const normalizedFragments = fragments.map((fragment, index) => {
+        const label = `startRun.contextPacks.${packName}.fragments[${index}]`;
+        requireObject(fragment, label);
+        requireKeys(fragment, new Set(["key", "path", "lineStart", "lineEnd", "summary"]), label);
+        const key = requireString(fragment.key, `${label}.key`);
+        if (!fragmentKeys.add(key)) throw new TypeError(`${label}.key is duplicate`);
+        if (!Number.isInteger(fragment.lineStart) || fragment.lineStart <= 0 ||
+            !Number.isInteger(fragment.lineEnd) || fragment.lineEnd < fragment.lineStart) {
+          throw new TypeError(`${label} has an invalid inclusive line range`);
+        }
+        const normalized = {
+          key,
+          path: requireString(fragment.path, `${label}.path`),
+          line_start: fragment.lineStart,
+          line_end: fragment.lineEnd,
+        };
+        if (fragment.summary !== undefined) normalized.summary = requireString(fragment.summary, `${label}.summary`);
+        return normalized;
+      });
       normalizedContextPacks[packName] = {
         agent,
         instructions: requireString(pack.instructions, `startRun.contextPacks.${packName}.instructions`),
+        lifetime,
+        fragments: normalizedFragments,
       };
     }
 
@@ -448,6 +484,7 @@ const START_RUN_BOOTSTRAP: &str = r#"  startRun: async (definition) => {
       context_packs: normalizedContextPacks,
       phases,
       verification: commandArray(definition.verification, "startRun.verification"),
+      cleanup: commandArray(definition.cleanup, "startRun.cleanup"),
     };
     const created = await tools.flowdex_start_run({
       definition: normalized,
@@ -1102,7 +1139,7 @@ fn same_target_metadata(
     }
 }
 
-fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         fs::rename(temporary, target)

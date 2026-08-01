@@ -1,6 +1,6 @@
 # Flowdex Living Roadmap
 
-Last updated: 2026-07-19
+Last updated: 2026-08-01
 
 This is a planning scratchpad, not an implementation specification. Its job is to keep the remaining work pointed at the same final system while allowing individual implementation plans to change order when the code makes another sequence more sensible.
 
@@ -42,6 +42,7 @@ JavaScript is the workflow definition and control language. The final authoring 
 - **Review, repair, and boundaries (Batch 015):** task verification can repair through the declared task agent, task and phase reviews use any declared agent plus a review-only structured reporting tool, findings route through exact commit attribution, verification and review budgets remain independent, and orchestrator/human boundaries suspend event-driven without consuming steering. Generic multi-agent rounds remain ordinary role-neutral JavaScript loops over messaging and resume primitives.
 - **Agent tool profiles and named signals (Batch 016):** strict global/repository tool-only profiles compose with normal `.codex/agents` profiles and explicit model/reasoning overrides, while persisted FIFO signals wake workflow waits without a model call or loss during steering.
 - **Review-history rule promotion (Batch 017):** a trusted-repository, direct-model scan derives bounded AST-grep candidates from distinct resolved findings and their integrated commits without writing state, dispatching a model, or bypassing individual human approval.
+- **Context lifetimes and focused agents (Batch 023):** context packs can remain workflow-scoped, be cleared after successful cleanup, or live as checked-in repository context. Workflows can seed run-scoped packs directly, independent packs resolve concurrently, and Flowdex child configs can exclude tools and skills while hiding workflow authoring guidance by default.
 
 ### Partial or correction needed
 
@@ -130,19 +131,23 @@ Build the final task/phase orchestration around the existing verification primit
 
 The runtime supplies composition and routing primitives without hard-coding a worker/reviewer loop.
 
-### 7. Context packs — complete (Batch 013)
+### 7. Context packs — complete (Batches 013 and 023)
 
 Add versioned, immutable context fragments grouped into named packs. A newer fragment supersedes an older one; integrated commits that touch covered lines mark affected fragments stale. Later task dispatches resolve the newest non-stale fragment and inject it directly into the agent prompt without passing its content through the orchestrator.
 
 If required context is absent or stale, queue a bounded context-gathering task, suspend only dependent tasks, and resume them when the fragment is published. Escalate only when collection fails. Keep fragments and injected packs bounded.
 
-### 8. Agent and tool profiles — complete (Batch 016)
+Batch 023 adds explicit workflow, temporary, and repository lifetimes. Repository packs are checked in beneath `.flowdex/context-packs/`; temporary packs survive failure and resume but are cleared after successful workflow cleanup. Inline fragments let a planner seed run-scoped context without an explorer, and distinct missing packs collect concurrently within normal agent capacity.
+
+### 8. Agent and tool profiles — complete (Batches 016 and 023)
 
 Complete workflow-level reusable agent declarations using model, reasoning effort, existing `.codex/agents` profiles, and optional Flowdex tool profiles. Agent roles remain instructions and tool access, never worker/reviewer/explorer runtime enums.
 
 Expand global and trusted-repository configuration for named tool profiles, alongside the already consumed compaction and AST-grep settings. Do not add unused configuration defaults for values already explicit in a workflow.
 
 Batch 016 completed tool-profile composition and named workflow signals. Existing `.codex/agents` profiles remain reusable agent defaults, Flowdex tool profiles remain tool-only overlays, and explicit model/reasoning values remain final overrides. Selectors and operation budgets stay explicit in workflow definitions.
+
+Batch 023 adds global/repository default exclusions and per-tool-profile exclusions. These narrow only Flowdex child tool and skill surfaces; workflow authoring guidance is hidden from children by default while normal Codex agent behavior remains unchanged.
 
 ### 9. Review history and AST-grep rule promotion — complete (Batch 017)
 
@@ -201,6 +206,7 @@ Central session-loop changes, shared tool registration, and migrations that depe
 
 ## Update log
 
+- **2026-08-01:** Added Batch 023 context lifetimes, inline run-context seeding, success-only cleanup, concurrent distinct-pack collection, and Flowdex-child tool/skill exclusions. Repository context updates remain deliberate: workers are prompted to republish only when their edits invalidate a fragment's meaning.
 - **2026-07-19:** Accepted Batch 018 and fast-forwarded `codex/flowdex` to `953964899e`. The joined completion path and focused evidence pass, including orchestrator-boundary continuation to the final terminal result. No production defect or API change was needed. All requested Flowdex feature slices are complete; process-restart controller resurrection and a live macOS host run remain optional follow-up validation rather than completion requirements.
 - **2026-07-19:** Accepted Batch 017 and fast-forwarded `codex/flowdex` to `1305d0d08f`. Candidate scanning is repository-rooted, bounded, read-only on first use and thereafter, and preserves the explicit human-approval boundary. Started Batch 018 as the final cohesive acceptance and documentation pass; no new public API is planned.
 - **2026-07-19:** Accepted Batch 016 and fast-forwarded `codex/flowdex` to `fc6a8f03b1`. Tool-profile precedence and propagation are complete, and persisted FIFO named signals now wake event-driven waits without model/history output while preserving steering. Started Batch 017 for the remaining AST-grep candidate-promotion backend.

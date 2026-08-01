@@ -1,11 +1,12 @@
 use crate::context::{
     ContextError, ContextFragment, ContextPackDeclaration, ContextPackStatus, ContextPublication,
-    ContextPublisher, ContextStaleSource, ResolvedContextPack, read_source_range,
-    validate_publication,
+    ContextPublisher, ContextStaleSource, ResolvedContextPack, read_repository_context_pack,
+    read_source_range, validate_publication, write_repository_context_pack,
 };
 use crate::workflow::{
-    AgentDefinition, ContextPackDefinition, PhaseDefinition, ReviewDefinition, TaskDefinition,
-    WorkflowDefinition, WorkflowValidationError, validate_task_definition, write_scope_conflicts,
+    AgentDefinition, ContextPackDefinition, ContextPackLifetime, PhaseDefinition, ReviewDefinition,
+    TaskDefinition, WorkflowDefinition, WorkflowValidationError, validate_task_definition,
+    write_scope_conflicts,
 };
 use crate::{RuleCandidate, RuleCandidateEvidence, RuleCandidateScanResult};
 use sha2::Digest;
@@ -473,18 +474,73 @@ impl FlowdexStore {
                     )));
                 }
                 sqlx::query(
-                    "INSERT INTO context_packs(run_id,name,agent,instructions) VALUES (?,?,?,?) ON CONFLICT(run_id,name) DO UPDATE SET agent=excluded.agent,instructions=excluded.instructions",
+                    "INSERT INTO context_packs(run_id,name,agent,instructions,lifetime) VALUES (?,?,?,?,?) ON CONFLICT(run_id,name) DO UPDATE SET agent=excluded.agent,instructions=excluded.instructions,lifetime=excluded.lifetime",
                 )
                 .bind(run_id)
                 .bind(pack)
                 .bind(&declaration.agent)
                 .bind(&declaration.instructions)
+                .bind(context_lifetime_name(declaration.lifetime))
                 .execute(&mut *tx)
                 .await?;
             }
             tx.commit().await?;
             Ok::<(), FlowdexStoreError>(())
         })?;
+        Ok(())
+    }
+
+    /// Hydrates checked-in repository packs and inline workflow fragments.
+    pub fn hydrate_context_packs(
+        &self,
+        run_id: &str,
+        integration_worktree: &Path,
+        declarations: &[(String, ContextPackDeclaration)],
+    ) -> Result<(), FlowdexStoreError> {
+        for (pack, declaration) in declarations {
+            if declaration.lifetime == ContextPackLifetime::Repository {
+                if let Some(fragments) = read_repository_context_pack(integration_worktree, pack)? {
+                    self.runtime.block_on(async {
+                        let mut tx = self.pool.begin().await?;
+                        for fragment in fragments {
+                            sqlx::query("INSERT INTO context_fragments(run_id,pack,fragment_key,version,publisher_thread_id,publisher_agent_id,path,line_start,line_end,summary,content,content_hash,superseded_version,created_at) VALUES (?,?,?,?,NULL,NULL,?,?,?,?,?,?,NULL,?)")
+                                .bind(run_id)
+                                .bind(pack)
+                                .bind(&fragment.key)
+                                .bind(fragment.version)
+                                .bind(fragment.path.to_string_lossy().as_ref())
+                                .bind(fragment.line_start as i64)
+                                .bind(fragment.line_end as i64)
+                                .bind(&fragment.summary)
+                                .bind(&fragment.content)
+                                .bind(&fragment.content_hash)
+                                .bind(now_unix())
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                        tx.commit().await?;
+                        Ok::<(), FlowdexStoreError>(())
+                    })?;
+                }
+                continue;
+            }
+            for fragment in &declaration.fragments {
+                self.publish_context_fragment(
+                    run_id,
+                    integration_worktree,
+                    integration_worktree,
+                    &ContextPublisher::default(),
+                    &ContextPublication {
+                        pack: pack.clone(),
+                        key: fragment.key.clone(),
+                        path: fragment.path.clone(),
+                        line_start: fragment.line_start,
+                        line_end: fragment.line_end,
+                        summary: fragment.summary.clone(),
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -519,21 +575,21 @@ impl FlowdexStore {
             publication.line_end,
         )?);
         let content_hash = hash_content(&content);
-        Ok(self.runtime.block_on(async {
+        let (fragment, lifetime) = self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
-            let pack_exists: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM context_packs WHERE run_id=? AND name=?",
+            let lifetime: Option<String> = sqlx::query_scalar(
+                "SELECT lifetime FROM context_packs WHERE run_id=? AND name=?",
             )
             .bind(run_id)
             .bind(&publication.pack)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-            if pack_exists == 0 {
+            let Some(lifetime) = lifetime else {
                 return Err(FlowdexStoreError::Integration(format!(
                     "context pack not declared: {}",
                     publication.pack
                 )));
-            }
+            };
             let previous: Option<i64> = sqlx::query_scalar(
                 "SELECT MAX(version) FROM context_fragments WHERE run_id=? AND pack=? AND fragment_key=?",
             )
@@ -561,7 +617,7 @@ impl FlowdexStore {
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            Ok(ContextFragment {
+            Ok::<_, FlowdexStoreError>((ContextFragment {
                 pack: publication.pack.clone(),
                 key: publication.key.clone(),
                 version,
@@ -571,8 +627,38 @@ impl FlowdexStore {
                 summary: publication.summary.clone(),
                 content,
                 content_hash,
+            }, parse_context_lifetime(&lifetime)?))
+        })?;
+        if lifetime == ContextPackLifetime::Repository {
+            let fragments = self.active_context_fragments(run_id, &publication.pack)?;
+            write_repository_context_pack(&execution_root, &publication.pack, &fragments)?;
+        }
+        Ok(fragment)
+    }
+
+    fn active_context_fragments(
+        &self,
+        run_id: &str,
+        pack: &str,
+    ) -> Result<Vec<ContextFragment>, FlowdexStoreError> {
+        let rows = self.runtime.block_on(
+            sqlx::query("SELECT f.fragment_key,f.version,f.path,f.line_start,f.line_end,f.summary,f.content,f.content_hash FROM context_fragments f JOIN (SELECT fragment_key,MAX(version) AS version FROM context_fragments WHERE run_id=? AND pack=? GROUP BY fragment_key) active ON active.fragment_key=f.fragment_key AND active.version=f.version WHERE f.run_id=? AND f.pack=? ORDER BY f.fragment_key")
+                .bind(run_id).bind(pack).bind(run_id).bind(pack).fetch_all(&self.pool),
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ContextFragment {
+                pack: pack.to_string(),
+                key: row.get(0),
+                version: row.get(1),
+                path: PathBuf::from(row.get::<String, _>(2)),
+                line_start: row.get::<i64, _>(3) as u32,
+                line_end: row.get::<i64, _>(4) as u32,
+                summary: row.get(5),
+                content: row.get(6),
+                content_hash: row.get(7),
             })
-        })?)
+            .collect())
     }
 
     /// Resolves active fragments against the supplied integration worktree.
@@ -582,11 +668,8 @@ impl FlowdexStore {
         pack: &str,
         integration_worktree: &Path,
     ) -> Result<ResolvedContextPack, FlowdexStoreError> {
-        let rows = self.runtime.block_on(
-            sqlx::query("SELECT f.fragment_key,f.version,f.path,f.line_start,f.line_end,f.summary,f.content,f.content_hash FROM context_fragments f JOIN (SELECT fragment_key,MAX(version) AS version FROM context_fragments WHERE run_id=? AND pack=? GROUP BY fragment_key) active ON active.fragment_key=f.fragment_key AND active.version=f.version WHERE f.run_id=? AND f.pack=? ORDER BY f.fragment_key")
-                .bind(run_id).bind(pack).bind(run_id).bind(pack).fetch_all(&self.pool),
-        )?;
-        if rows.is_empty() {
+        let stored_fragments = self.active_context_fragments(run_id, pack)?;
+        if stored_fragments.is_empty() {
             return Ok(ResolvedContextPack {
                 pack: pack.to_string(),
                 status: ContextPackStatus::Missing,
@@ -595,36 +678,25 @@ impl FlowdexStore {
             });
         }
         let root = integration_worktree.canonicalize()?;
-        let mut fragments = Vec::with_capacity(rows.len());
+        let mut fragments = Vec::with_capacity(stored_fragments.len());
         let mut stale_sources = Vec::new();
-        for row in rows {
-            let path: PathBuf = PathBuf::from(row.get::<String, _>(2));
-            let line_start = row.get::<i64, _>(3) as u32;
-            let line_end = row.get::<i64, _>(4) as u32;
-            let content = row.get::<String, _>(6);
-            let content_hash = row.get::<String, _>(7);
+        for fragment in stored_fragments {
+            let path = fragment.path.clone();
+            let line_start = fragment.line_start;
+            let line_end = fragment.line_end;
+            let content = fragment.content.clone();
             let fresh = read_source_range(&root, &path, line_start, line_end)
                 .map(|current| canonicalize_content(&current) == canonicalize_content(&content))
                 .unwrap_or(false);
             if !fresh {
                 stale_sources.push(ContextStaleSource {
-                    key: row.get(0),
+                    key: fragment.key.clone(),
                     path: path.clone(),
                     line_start,
                     line_end,
                 });
             }
-            fragments.push(ContextFragment {
-                pack: pack.to_string(),
-                key: row.get(0),
-                version: row.get(1),
-                path,
-                line_start,
-                line_end,
-                summary: row.get(5),
-                content,
-                content_hash,
-            });
+            fragments.push(fragment);
         }
         Ok(ResolvedContextPack {
             pack: pack.to_string(),
@@ -648,8 +720,8 @@ impl FlowdexStore {
         self.ensure_run(info)?;
         self.runtime.block_on(async {
             let mut tx = self.pool.begin().await?;
-            sqlx::query("UPDATE runs SET name=?, verification=?, state=?, boundary=? WHERE run_id=?")
-                .bind(&definition.name).bind(encode(&definition.verification)).bind(RunState::Queued.as_str()).bind(boundary_name(definition.boundary)).bind(&info.run_id)
+            sqlx::query("UPDATE runs SET name=?, verification=?, cleanup=?, state=?, boundary=? WHERE run_id=?")
+                .bind(&definition.name).bind(encode(&definition.verification)).bind(encode(&definition.cleanup)).bind(RunState::Queued.as_str()).bind(boundary_name(definition.boundary)).bind(&info.run_id)
                 .execute(&mut *tx).await?;
             for (agent_name, agent) in &definition.agents {
                 sqlx::query("INSERT INTO workflow_agents(run_id,name,profile,model,reasoning_effort,tool_profile) VALUES (?,?,?,?,?,?)")
@@ -724,6 +796,40 @@ impl FlowdexStore {
                 "run not found: {run_id}"
             )));
         }
+        Ok(())
+    }
+
+    pub fn run_cleanup_completed(&self, run_id: &str) -> Result<bool, FlowdexStoreError> {
+        self.runtime
+            .block_on(
+                sqlx::query_scalar::<_, i64>("SELECT cleanup_completed FROM runs WHERE run_id=?")
+                    .bind(run_id)
+                    .fetch_optional(&self.pool),
+            )?
+            .map(|value| value != 0)
+            .ok_or_else(|| FlowdexStoreError::Integration(format!("run not found: {run_id}")))
+    }
+
+    pub fn finish_successful_cleanup(&self, run_id: &str) -> Result<(), FlowdexStoreError> {
+        self.runtime.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("DELETE FROM context_fragments WHERE run_id=? AND pack IN (SELECT name FROM context_packs WHERE run_id=? AND lifetime='temporary')")
+                .bind(run_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            let changed = sqlx::query("UPDATE runs SET cleanup_completed=1 WHERE run_id=?")
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            if changed.rows_affected() == 0 {
+                return Err(FlowdexStoreError::Integration(format!(
+                    "run not found: {run_id}"
+                )));
+            }
+            tx.commit().await?;
+            Ok::<(), FlowdexStoreError>(())
+        })?;
         Ok(())
     }
 
@@ -891,7 +997,7 @@ impl FlowdexStore {
         run_id: &str,
     ) -> Result<WorkflowDefinition, FlowdexStoreError> {
         let definition = self.runtime.block_on(async {
-            let run = sqlx::query("SELECT name,verification,boundary FROM runs WHERE run_id=?")
+            let run = sqlx::query("SELECT name,verification,boundary,cleanup FROM runs WHERE run_id=?")
                 .bind(run_id)
                 .fetch_optional(&self.pool)
                 .await?
@@ -916,7 +1022,7 @@ impl FlowdexStore {
             }
             let mut context_packs = BTreeMap::new();
             for row in sqlx::query(
-                "SELECT name,agent,instructions FROM context_packs WHERE run_id=? ORDER BY name",
+                "SELECT name,agent,instructions,lifetime FROM context_packs WHERE run_id=? ORDER BY name",
             )
             .bind(run_id)
             .fetch_all(&self.pool)
@@ -927,6 +1033,8 @@ impl FlowdexStore {
                     ContextPackDefinition {
                         agent: row.get(1),
                         instructions: row.get(2),
+                        lifetime: parse_context_lifetime(row.get::<String, _>(3).as_str())?,
+                        fragments: Vec::new(),
                     },
                 );
             }
@@ -974,6 +1082,7 @@ impl FlowdexStore {
                 boundary: parse_boundary(run.get(2))?,
                 context_packs,
                 verification: decode(run.get(1)),
+                cleanup: decode(run.get(3)),
                 phases,
             })
         })?;
@@ -2187,7 +2296,7 @@ async fn insert_schedule_row(
 async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let statements = "PRAGMA foreign_keys=ON;
       CREATE TABLE IF NOT EXISTS repository(identity TEXT NOT NULL PRIMARY KEY);
-      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',state TEXT NOT NULL DEFAULT 'queued',last_error TEXT,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue');
+      CREATE TABLE IF NOT EXISTS runs(run_id TEXT PRIMARY KEY,parent_thread_id TEXT NOT NULL,workflow_path TEXT NOT NULL,parent_run_id TEXT,workflow_identity TEXT,repository_identity TEXT NOT NULL,integration_worktree TEXT NOT NULL,created_at INTEGER NOT NULL,name TEXT NOT NULL DEFAULT '',verification TEXT NOT NULL DEFAULT '[]',cleanup TEXT NOT NULL DEFAULT '[]',cleanup_completed INTEGER NOT NULL DEFAULT 0,state TEXT NOT NULL DEFAULT 'queued',last_error TEXT,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue');
       CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,name TEXT NOT NULL,instructions TEXT NOT NULL,read_scope TEXT NOT NULL,write_scope TEXT NOT NULL,verification TEXT NOT NULL,base_commit TEXT NOT NULL,worktree_path TEXT NOT NULL,state TEXT NOT NULL,last_verified_commit TEXT);
       CREATE TABLE IF NOT EXISTS workflow_phases(run_id TEXT NOT NULL,name TEXT NOT NULL,declaration_order INTEGER NOT NULL,instructions TEXT NOT NULL,open INTEGER NOT NULL,sealed INTEGER NOT NULL,verification TEXT NOT NULL,state TEXT NOT NULL,verification_repair_count INTEGER NOT NULL DEFAULT 0,review_round_count INTEGER NOT NULL DEFAULT 0,boundary TEXT NOT NULL DEFAULT 'continue',review_agent TEXT,review_instructions TEXT,review_max_rounds INTEGER,PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS workflow_agents(run_id TEXT NOT NULL,name TEXT NOT NULL,profile TEXT,model TEXT,reasoning_effort TEXT,tool_profile TEXT,PRIMARY KEY(run_id,name));
@@ -2195,7 +2304,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
       CREATE TABLE IF NOT EXISTS task_operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,start_commit TEXT NOT NULL,terminal_state TEXT,sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_commits(task_id TEXT NOT NULL,source_commit TEXT NOT NULL,integrated_commit TEXT,operation_id TEXT NOT NULL,agent_id TEXT NOT NULL,model TEXT NOT NULL,sequence INTEGER NOT NULL,summary TEXT NOT NULL,PRIMARY KEY(task_id,source_commit));
       CREATE TABLE IF NOT EXISTS integration_lock(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS context_packs(run_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,instructions TEXT NOT NULL,PRIMARY KEY(run_id,name));
+      CREATE TABLE IF NOT EXISTS context_packs(run_id TEXT NOT NULL,name TEXT NOT NULL,agent TEXT NOT NULL,instructions TEXT NOT NULL,lifetime TEXT NOT NULL DEFAULT 'workflow',PRIMARY KEY(run_id,name));
       CREATE TABLE IF NOT EXISTS context_fragments(run_id TEXT NOT NULL,pack TEXT NOT NULL,fragment_key TEXT NOT NULL,version INTEGER NOT NULL,publisher_thread_id TEXT,publisher_agent_id TEXT,path TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,summary TEXT,content TEXT NOT NULL,content_hash TEXT NOT NULL,superseded_version INTEGER,created_at INTEGER NOT NULL,PRIMARY KEY(run_id,pack,fragment_key,version));
       CREATE TABLE IF NOT EXISTS review_operations(operation_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,scope_kind TEXT NOT NULL,scope_id TEXT NOT NULL,round INTEGER NOT NULL,reviewer_thread_id TEXT NOT NULL,state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS review_findings(finding_id TEXT PRIMARY KEY,operation_id TEXT NOT NULL,finding_order INTEGER NOT NULL,file TEXT NOT NULL,line_start INTEGER NOT NULL,line_end INTEGER NOT NULL,reason TEXT NOT NULL,rule_key TEXT,ast_grep_suitable INTEGER NOT NULL,attributed_task_id TEXT,attributed_operation_id TEXT,attributed_agent_id TEXT);
@@ -2221,6 +2330,8 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE runs ADD COLUMN review_round_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE runs ADD COLUMN boundary TEXT NOT NULL DEFAULT 'continue'",
         "ALTER TABLE runs ADD COLUMN last_error TEXT",
+        "ALTER TABLE runs ADD COLUMN cleanup TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE runs ADD COLUMN cleanup_completed INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_phases ADD COLUMN verification_repair_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_phases ADD COLUMN review_round_count INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workflow_phases ADD COLUMN boundary TEXT NOT NULL DEFAULT 'continue'",
@@ -2236,6 +2347,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE workflow_tasks ADD COLUMN review_max_rounds INTEGER",
         "ALTER TABLE workflow_tasks ADD COLUMN context TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE workflow_agents ADD COLUMN tool_profile TEXT",
+        "ALTER TABLE context_packs ADD COLUMN lifetime TEXT NOT NULL DEFAULT 'workflow'",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
@@ -2250,6 +2362,23 @@ fn boundary_name(boundary: crate::workflow::Boundary) -> &'static str {
         crate::workflow::Boundary::Continue => "continue",
         crate::workflow::Boundary::Orchestrator => "orchestrator",
         crate::workflow::Boundary::Human => "human",
+    }
+}
+fn context_lifetime_name(lifetime: ContextPackLifetime) -> &'static str {
+    match lifetime {
+        ContextPackLifetime::Workflow => "workflow",
+        ContextPackLifetime::Temporary => "temporary",
+        ContextPackLifetime::Repository => "repository",
+    }
+}
+fn parse_context_lifetime(value: &str) -> Result<ContextPackLifetime, FlowdexStoreError> {
+    match value {
+        "workflow" => Ok(ContextPackLifetime::Workflow),
+        "temporary" => Ok(ContextPackLifetime::Temporary),
+        "repository" => Ok(ContextPackLifetime::Repository),
+        other => Err(FlowdexStoreError::Integration(format!(
+            "unknown context pack lifetime: {other}"
+        ))),
     }
 }
 fn parse_boundary(value: &str) -> Result<crate::workflow::Boundary, FlowdexStoreError> {
@@ -3189,6 +3318,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec!["git diff --check".into()],
+            cleanup: vec![],
             boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
@@ -3281,12 +3411,15 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec!["git diff --check".into()],
+            cleanup: vec!["remove temporary plan context".into()],
             boundary: crate::workflow::Boundary::Human,
             context_packs: [(
                 "contract".into(),
                 ContextPackDefinition {
                     agent: "worker".into(),
                     instructions: "Collect the bounded contract.".into(),
+                    lifetime: ContextPackLifetime::Workflow,
+                    fragments: vec![],
                 },
             )]
             .into_iter()
@@ -3322,6 +3455,8 @@ mod tests {
                     ContextPackDeclaration {
                         agent: "worker".into(),
                         instructions: "Collect the bounded contract.".into(),
+                        lifetime: ContextPackLifetime::Workflow,
+                        fragments: vec![],
                     },
                 )],
             )
@@ -3345,6 +3480,7 @@ mod tests {
             Some("repository")
         );
         assert!(restored.context_packs.contains_key("contract"));
+        assert_eq!(restored.cleanup, ["remove temporary plan context"]);
 
         store.prepare_run_resume("run").unwrap();
         assert_eq!(store.run_metadata("run").unwrap().state, "queued");
@@ -3427,6 +3563,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            cleanup: vec![],
             boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
@@ -3508,6 +3645,7 @@ mod tests {
             .into_iter()
             .collect(),
             verification: vec![],
+            cleanup: vec![],
             boundary: crate::workflow::Boundary::Continue,
             context_packs: BTreeMap::new(),
             phases: vec![PhaseDefinition {
@@ -3529,6 +3667,8 @@ mod tests {
                     ContextPackDeclaration {
                         agent: "worker".into(),
                         instructions: "collect".into(),
+                        lifetime: ContextPackLifetime::Workflow,
+                        fragments: vec![],
                     },
                 )],
             )
@@ -3674,6 +3814,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fragment.content, "execution\n");
+    }
+
+    #[test]
+    fn repository_context_publication_writes_reusable_pack_file() {
+        let (repo, store, _run) = context_store();
+        store
+            .declare_context_packs(
+                "run",
+                &[(
+                    "pack".into(),
+                    ContextPackDeclaration {
+                        agent: "worker".into(),
+                        instructions: "collect".into(),
+                        lifetime: ContextPackLifetime::Repository,
+                        fragments: vec![],
+                    },
+                )],
+            )
+            .unwrap();
+        fs::write(repo.path().join("source.txt"), "stable\n").unwrap();
+        store
+            .publish_context_fragment(
+                "run",
+                repo.path(),
+                repo.path(),
+                &ContextPublisher::default(),
+                &ContextPublication {
+                    pack: "pack".into(),
+                    key: "source".into(),
+                    path: PathBuf::from("source.txt"),
+                    line_start: 1,
+                    line_end: 1,
+                    summary: Some("stable contract".into()),
+                },
+            )
+            .unwrap();
+
+        let stored = read_repository_context_pack(repo.path(), "pack")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].key, "source");
+        assert_eq!(stored[0].content, "stable\n");
+    }
+
+    #[test]
+    fn temporary_context_is_retained_on_failure_and_cleared_after_success() {
+        let (repo, store, _run) = context_store();
+        fs::write(repo.path().join("plan.md"), "temporary plan\n").unwrap();
+        let declarations = vec![(
+            "pack".into(),
+            ContextPackDeclaration {
+                agent: "worker".into(),
+                instructions: "collect".into(),
+                lifetime: ContextPackLifetime::Temporary,
+                fragments: vec![crate::workflow::ContextFragmentSeed {
+                    key: "plan".into(),
+                    path: PathBuf::from("plan.md"),
+                    line_start: 1,
+                    line_end: 1,
+                    summary: None,
+                }],
+            },
+        )];
+        store.declare_context_packs("run", &declarations).unwrap();
+        store
+            .hydrate_context_packs("run", repo.path(), &declarations)
+            .unwrap();
+        store.mark_run_failed("run", "retry later").unwrap();
+        assert_eq!(
+            store
+                .resolve_context_pack("run", "pack", repo.path())
+                .unwrap()
+                .status,
+            ContextPackStatus::Fresh
+        );
+
+        store.finish_successful_cleanup("run").unwrap();
+        assert!(store.run_cleanup_completed("run").unwrap());
+        assert_eq!(
+            store
+                .resolve_context_pack("run", "pack", repo.path())
+                .unwrap()
+                .status,
+            ContextPackStatus::Missing
+        );
     }
 
     #[test]
