@@ -14,6 +14,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::multi_agents_common::apply_explicit_spawn_agent_model_overrides;
 use crate::tools::handlers::multi_agents_common::apply_spawn_agent_role;
+use crate::tools::handlers::multi_agents_common::apply_spawn_agent_runtime_overrides;
 use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
 use crate::tools::handlers::multi_agents_common::collab_agent_error;
 use crate::tools::handlers::multi_agents_common::collab_spawn_error;
@@ -323,6 +324,9 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             .filter(|v| !v.is_empty()),
     )
     .await?;
+    // Profile loading rebuilds Config from persisted layers. Restore the live turn's
+    // approval and sandbox selection before dispatching the child.
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
     apply_explicit_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),

@@ -241,12 +241,16 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     config.cwd = turn_cwd;
+    config.workspace_roots = turn.config.workspace_roots.clone();
     config
         .permissions
         .set_permission_profile(turn.permission_profile())
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
         })?;
+    config
+        .permissions
+        .set_workspace_roots(turn.config.permissions.workspace_roots().to_vec());
     Ok(())
 }
 

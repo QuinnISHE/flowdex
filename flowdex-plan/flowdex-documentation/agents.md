@@ -25,6 +25,8 @@ flowdex.spawnAgent({
 
 `name` and `instructions` are required and must be non-empty after trimming. At least one selector—`profile`, `model`, or `reasoningEffort`—is required; `toolProfile` is optional and does not satisfy that requirement. A profile is resolved through the normal `.codex/agents` mechanism, then the selected Flowdex tool profile is applied, and explicit model and reasoning effort values apply last. Spawning obeys the existing agent depth limit.
 
+Flowdex children inherit the live parent turn's approval and permission profile, including full-access/never-ask mode. Loading an agent or tool profile does not replace that runtime selection. Task agents then use their detached task worktree as cwd and workspace root.
+
 ## Tool profiles
 
 Tool profiles are named in `$CODEX_HOME/flowdex.toml`. An eligible trusted repository may add profiles or replace a same-named global profile as one complete definition in `.flowdex/config.toml`:

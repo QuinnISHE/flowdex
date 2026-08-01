@@ -4443,6 +4443,12 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     }
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
+    let mut config = (*turn.config).clone();
+    config.workspace_roots = vec![turn_cwd.clone()];
+    config
+        .permissions
+        .set_workspace_roots(vec![turn_cwd.clone()]);
+    turn.config = Arc::new(config);
     let sandbox_policy = pick_allowed_sandbox_policy(
         &turn.config.permissions,
         turn.config.legacy_sandbox_policy(),
@@ -4483,6 +4489,22 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set_permission_profile(permission_profile)
         .expect("permission profile set");
     assert_eq!(config, expected);
+
+    let mut reloaded = config;
+    reloaded.workspace_roots.clear();
+    reloaded.permissions.set_workspace_roots(Vec::new());
+    apply_spawn_agent_runtime_overrides(&mut reloaded, &turn)
+        .expect("runtime permissions should be restored");
+    assert_eq!(reloaded.workspace_roots, vec![turn_cwd.clone()]);
+    assert_eq!(reloaded.permissions.workspace_roots(), &[turn_cwd.clone()]);
+    assert_eq!(
+        reloaded.permissions.approval_policy.value(),
+        turn.approval_policy.value()
+    );
+    assert_eq!(
+        reloaded.permissions.permission_profile(),
+        &turn.permission_profile
+    );
 }
 
 #[tokio::test]
