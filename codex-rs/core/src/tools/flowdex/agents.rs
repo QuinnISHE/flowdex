@@ -861,7 +861,7 @@ async fn refresh_agent_runtime_settings(
                 approval_policy: Some(turn.approval_policy.value()),
                 approvals_reviewer: Some(turn.config.approvals_reviewer),
                 sandbox_policy: Some(turn.sandbox_policy()),
-                windows_sandbox_level: Some(turn.config.windows_sandbox_level),
+                windows_sandbox_level: Some(turn.windows_sandbox_level),
                 ..Default::default()
             },
         )
