@@ -8,6 +8,7 @@ use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::function_tool::FunctionCallError;
+use crate::session::SessionSettingsUpdate;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -496,6 +497,9 @@ async fn handle_send(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
             "task-associated agents must be resumed with resumeAgent; trigger-turn delivery is not supported".into(),
         ));
     }
+    if trigger_turn {
+        refresh_agent_runtime_settings(&session, &turn, target).await?;
+    }
     let metadata = session
         .services
         .agent_control
@@ -598,6 +602,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         Some(task_id) => Some(super::task::acquire_task_gate(task_id).await),
         None => None,
     };
+    refresh_agent_runtime_settings(&session, &turn, id).await?;
 
     if mode == "compact" {
         let operation = session
@@ -840,6 +845,28 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
         .await?;
     }
     Ok(JsonOutput::new(status_value(id, status)))
+}
+
+async fn refresh_agent_runtime_settings(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
+    agent_id: ThreadId,
+) -> Result<(), FunctionCallError> {
+    session
+        .services
+        .agent_control
+        .update_agent_settings(
+            agent_id,
+            SessionSettingsUpdate {
+                approval_policy: Some(turn.approval_policy.value()),
+                approvals_reviewer: Some(turn.config.approvals_reviewer),
+                sandbox_policy: Some(turn.sandbox_policy()),
+                windows_sandbox_level: Some(turn.config.windows_sandbox_level),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| collab_agent_error(agent_id, err))
 }
 
 async fn submit_trigger_turn(

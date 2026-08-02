@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::rollout_budget::RolloutBudget;
+use crate::session::SessionSettingsUpdate;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
@@ -453,6 +454,20 @@ impl AgentControl {
             return None;
         };
         Some(thread.config_snapshot().await)
+    }
+
+    pub(crate) async fn update_agent_settings(
+        &self,
+        agent_id: ThreadId,
+        updates: SessionSettingsUpdate,
+    ) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(agent_id).await?;
+        thread
+            .session
+            .update_settings(updates)
+            .await
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))
     }
 
     pub(crate) async fn get_agent_config(&self, agent_id: ThreadId) -> Option<Arc<Config>> {

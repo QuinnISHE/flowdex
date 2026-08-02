@@ -611,7 +611,10 @@ pub(crate) async fn handle_run_with_review(
     config.workspace_roots = vec![task_cwd.clone()];
     config
         .permissions
-        .set_workspace_roots(vec![task_cwd.clone()]);
+        .set_legacy_sandbox_policy(invocation.turn.sandbox_policy(), task_cwd.as_path())
+        .map_err(|err| {
+            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+        })?;
     let mut environments = invocation.turn.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
