@@ -37,3 +37,13 @@ flowdex uninstall --purge
 ```
 
 Normal uninstall preserves Flowdex workflows and configuration. `--purge` also removes global Flowdex data from `CODEX_HOME`; repository `.flowdex/` directories remain project-owned.
+
+## Automated upstream releases
+
+The `Flowdex upstream release` workflow checks the latest stable official Codex release every six hours. It merges that tag, uses Codex to resolve conflicts or repair failed platform builds, fast-forwards `main` only after Windows and macOS builds pass, and publishes checksummed release archives.
+
+Automatic repair requires an Actions secret named `OPENAI_API_KEY`:
+
+```shell
+gh secret set OPENAI_API_KEY --repo QuinnISHE/flowdex
+```

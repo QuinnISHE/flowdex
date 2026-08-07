@@ -2,12 +2,22 @@ name: Flowdex upstream release
 
 on:
   schedule:
-    - cron: "17 9 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      sync_branch:
+        description: Existing repaired sync branch to rebuild
+        required: false
+        type: string
+      repair_attempt:
+        description: Internal automatic repair attempt
+        required: false
+        default: "0"
+        type: string
 
 permissions:
+  actions: read
   contents: write
-  issues: write
   pull-requests: write
 
 concurrency:
@@ -16,56 +26,124 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.repository != 'openai/codex'
+    if: github.repository == 'QuinnISHE/flowdex'
     runs-on: ubuntu-latest
     outputs:
-      build: ${{ steps.sync.outputs.build }}
+      attempt: ${{ steps.sync.outputs.attempt }}
+      base_sha: ${{ steps.sync.outputs.base_sha }}
       branch: ${{ steps.sync.outputs.branch }}
+      build: ${{ steps.sync.outputs.build }}
       release_tag: ${{ steps.sync.outputs.release_tag }}
       upstream_tag: ${{ steps.sync.outputs.upstream_tag }}
+      run_codex: ${{ steps.sync.outputs.run_codex }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
       - id: sync
-        name: Merge the latest official Codex release
+        name: Prepare the latest official Codex release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_BRANCH: ${{ inputs.sync_branch }}
+          REPAIR_ATTEMPT: ${{ inputs.repair_attempt || '0' }}
         run: |
           set -euo pipefail
           upstream_tag="$(gh api repos/openai/codex/releases/latest --jq .tag_name)"
-          release_tag="flowdex-${upstream_tag}"
-          branch="automation/flowdex-${upstream_tag//[^A-Za-z0-9._-]/-}"
-          echo "upstream_tag=${upstream_tag}" >> "$GITHUB_OUTPUT"
-          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          release_tag="flowdex-$upstream_tag"
+          safe_tag="$(printf '%s' "$upstream_tag" | sed 's/[^A-Za-z0-9._-]/-/g')"
+          branch="automation/flowdex-$safe_tag"
+          base_sha="$(git rev-parse HEAD)"
 
-          if gh release view "$release_tag" >/dev/null 2>&1; then
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          echo "attempt=$REPAIR_ATTEMPT" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch https://github.com/openai/codex.git "refs/tags/${upstream_tag}:refs/tags/${upstream_tag}"
-          git fetch origin "+refs/heads/${branch}:refs/remotes/origin/${branch}" || true
-          git switch -C "$branch" "$GITHUB_SHA"
-          if ! git merge --no-edit "$upstream_tag"; then
-            git merge --abort
-            title="Flowdex upstream merge needs attention: ${upstream_tag}"
-            if [[ -z "$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')" ]]; then
-              gh issue create --title "$title" --body "The automatic merge of official Codex release \`${upstream_tag}\` conflicted with Flowdex. Resolve it on branch \`${branch}\`, then rerun this workflow."
+          git fetch --no-tags https://github.com/openai/codex.git \
+            "refs/tags/$upstream_tag:refs/tags/$upstream_tag"
+
+          if [[ -n "$REQUESTED_BRANCH" ]]; then
+            if [[ "$REQUESTED_BRANCH" != "$branch" ]]; then
+              echo "::error::Repair branch $REQUESTED_BRANCH does not match $branch"
+              exit 1
             fi
-            exit 1
+            git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            git switch -C "$branch" "origin/$branch"
+            git merge-base --is-ancestor "$upstream_tag" HEAD
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "run_codex=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          git push --force-with-lease origin "HEAD:refs/heads/${branch}"
+
+          if git merge-base --is-ancestor "$upstream_tag" HEAD \
+            && gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "run_codex=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git switch -C "$branch" "$base_sha"
+          set +e
+          git merge --no-commit --no-edit "$upstream_tag"
+          merge_status=$?
+          set -e
+          if [[ $merge_status -ne 0 ]]; then
+            echo "Upstream merge has conflicts; Codex will resolve them."
+            echo "run_codex=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_codex=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "build=true" >> "$GITHUB_OUTPUT"
 
-          if [[ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')" ]]; then
-            gh pr create --base "${{ github.event.repository.default_branch }}" --head "$branch" --title "Sync Flowdex with ${upstream_tag}" --body "Automated clean merge of official Codex release \`${upstream_tag}\`. The matching Flowdex binaries are built and released by this workflow." || true
+      - name: Require an OpenAI API key for automatic repair
+        if: steps.sync.outputs.run_codex == 'true'
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo "::error::Add OPENAI_API_KEY as a repository Actions secret so Codex can resolve upstream changes."
+            exit 1
           fi
+
+      - name: Resolve and adapt the upstream integration
+        if: steps.sync.outputs.run_codex == 'true'
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/flowdex-upstream-sync.md
+          output-file: codex-upstream-sync.md
+          permission-profile: ":workspace"
+          effort: high
+          allow-bots: true
+
+      - name: Commit and publish the sync branch
+        if: steps.sync.outputs.build == 'true'
+        shell: bash
+        env:
+          BRANCH: ${{ steps.sync.outputs.branch }}
+          UPSTREAM_TAG: ${{ steps.sync.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            echo "::error::Codex left unresolved merge conflicts"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          rm -f codex-upstream-sync.md
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Merge official Codex $UPSTREAM_TAG into Flowdex"
+          elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git commit --no-edit
+          fi
+          git merge-base --is-ancestor "$UPSTREAM_TAG" HEAD
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
 
   build:
     needs: prepare
@@ -96,12 +174,17 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.prepare.outputs.branch }}
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Install the repository Rust toolchain and target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add "${{ matrix.target }}"
+
       - uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}
+
       - name: Build release binary
         working-directory: codex-rs
         shell: bash
@@ -114,6 +197,7 @@ jobs:
           else
             cargo build --release --target "${{ matrix.target }}" -p codex-cli --bin codex
           fi
+
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -123,6 +207,7 @@ jobs:
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe" dist/
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-command-runner.exe" dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.package }}"
+
       - name: Package macOS binary
         if: runner.os == 'macOS'
         shell: bash
@@ -131,30 +216,137 @@ jobs:
           cp "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex
           chmod +x dist/flowdex
           tar -C dist -czf "../${{ matrix.package }}" flowdex
+
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.package }}
 
-  release:
+  repair-build:
     needs: [prepare, build]
-    if: needs.prepare.outputs.build == 'true'
+    if: >-
+      ${{
+        always()
+        && needs.prepare.result == 'success'
+        && needs.prepare.outputs.build == 'true'
+        && needs.build.result == 'failure'
+        && fromJSON(needs.prepare.outputs.attempt) < 2
+      }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.branch }}
+
+      - name: Capture failed platform build logs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run view "$GITHUB_RUN_ID" --log-failed > "$RUNNER_TEMP/flowdex-build-failures.log"
+
+      - name: Repair the failed release build
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Repair the Flowdex upstream integration using the failed platform build log at
+            ${{ runner.temp }}/flowdex-build-failures.log. Preserve all Flowdex behavior and the
+            newly merged upstream release. Fix root causes rather than suppressing checks. Run the
+            narrowest relevant cargo checks or builds you can complete. Do not commit or push.
+          output-file: codex-build-repair.md
+          permission-profile: ":workspace"
+          effort: high
+          allow-bots: true
+
+      - name: Commit repair and redispatch the release
+        shell: bash
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          CURRENT_ATTEMPT: ${{ needs.prepare.outputs.attempt }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          next_attempt=$((CURRENT_ATTEMPT + 1))
+          rm -f codex-build-repair.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::Codex did not produce a repair"
+            exit 1
+          fi
+          git commit -m "Repair Flowdex release build"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          gh workflow run flowdex-upstream-release.yml --ref main \
+            -f sync_branch="$BRANCH" \
+            -f repair_attempt="$next_attempt"
+
+  report-failure:
+    needs: [prepare, build]
+    if: >-
+      ${{
+        always()
+        && needs.prepare.result == 'success'
+        && needs.prepare.outputs.build == 'true'
+        && needs.build.result == 'failure'
+        && fromJSON(needs.prepare.outputs.attempt) >= 2
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open a fallback pull request
+        shell: bash
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+        run: |
+          if [[ -z "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')" ]]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" \
+              --base "${{ github.event.repository.default_branch }}" \
+              --head "$BRANCH" \
+              --title "Finish Flowdex sync with $UPSTREAM_TAG" \
+              --body "Automatic conflict resolution and two build-repair attempts completed, but a platform build still fails. The repaired integration is preserved on this branch for focused follow-up."
+          fi
+          exit 1
+
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.branch }}
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
-      - name: Publish Flowdex release
+
+      - name: Fast-forward Flowdex and publish the release
+        shell: bash
         env:
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
           UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
-          BRANCH: ${{ needs.prepare.outputs.branch }}
-        shell: bash
         run: |
-          gh release create "$RELEASE_TAG" artifacts/* \
+          set -euo pipefail
+          git fetch origin "${{ github.event.repository.default_branch }}"
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$BASE_SHA" ]]; then
+            echo "::error::Flowdex main changed during the release build; the next run will integrate both updates."
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/${{ github.event.repository.default_branch }}"
+
+          cd artifacts
+          sha256sum flowdex-* > SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" ./* \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$BRANCH" \
-            --title "Flowdex for ${UPSTREAM_TAG}" \
-            --notes "Flowdex rebuilt from the official Codex ${UPSTREAM_TAG} release. Download and extract the archive for your platform, then run \`flowdex install\`. The Windows archive contains \`flowdex.exe\`, \`codex-windows-sandbox-setup.exe\`, and \`codex-command-runner.exe\`; each macOS archive contains \`flowdex\`."
+            --target "$(git -C .. rev-parse HEAD)" \
+            --title "Flowdex for $UPSTREAM_TAG" \
+            --notes "Flowdex automatically integrated, repaired, and rebuilt from official Codex $UPSTREAM_TAG. Download the archive for your platform, extract it, and run the included Flowdex binary with install."
+          git -C .. push origin --delete "$BRANCH" || true
