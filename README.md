@@ -40,10 +40,6 @@ Normal uninstall preserves Flowdex workflows and configuration. `--purge` also r
 
 ## Automated upstream releases
 
-The `Flowdex upstream release` workflow checks the latest stable official Codex release every six hours. It merges that tag, uses Codex to resolve conflicts or repair failed platform builds, fast-forwards `main` only after Windows and macOS builds pass, and publishes checksummed release archives.
+The `Flowdex upstream release` workflow checks the latest stable official Codex release every six hours. Git performs a three-way merge, then Windows and macOS release builds run in parallel. Only a fully passing integration fast-forwards `main` and publishes checksummed archives.
 
-Automatic repair requires an Actions secret named `OPENAI_API_KEY`:
-
-```shell
-gh secret set OPENAI_API_KEY --repo QuinnISHE/flowdex
-```
+No OpenAI API key is required. If a new upstream conflict cannot be merged mechanically, or a platform build fails, the workflow preserves the useful state and opens a deduplicated GitHub issue with the exact tag, branch, run, and diagnostics. After the issue is resolved on `main`, the next scheduled run completes the release automatically.
