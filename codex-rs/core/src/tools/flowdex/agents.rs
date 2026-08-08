@@ -25,6 +25,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::CollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallItem;
 use codex_protocol::items::CollabAgentToolCallStatus;
@@ -46,9 +47,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::config::{Config, ConfigOverrides, deserialize_config_toml_with_base};
-use codex_config::{
-    ConfigLayerEntry, ConfigLayerSource, ConfigLayerStack, ConfigLayerStackOrdering,
-};
+use codex_config::{ConfigLayerEntry, ConfigLayerSource, ConfigLayerStack};
 use codex_exec_server::LOCAL_FS;
 use toml::Value as TomlValue;
 use uuid::Uuid;
@@ -278,8 +277,7 @@ pub(crate) async fn apply_flowdex_tool_profile(
     }
     let mut layers = config
         .config_layer_stack
-        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
-        .into_iter()
+        .layers_low_to_high()
         .cloned()
         .collect::<Vec<_>>();
     layers.push(ConfigLayerEntry::new(
@@ -319,6 +317,7 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
     let ToolInvocation {
         session,
         turn,
+        step_context,
         payload,
         ..
     } = invocation;
@@ -352,8 +351,11 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut config = build_agent_spawn_config(
+        &session.get_base_instructions().await,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
     apply_spawn_agent_role(&session, &mut config, profile).await?;
     apply_flowdex_tool_profile(
         &session,
@@ -366,7 +368,11 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
     .await?;
     // Profile loading rebuilds Config from persisted layers. Restore the live turn's
     // approval and sandbox selection before dispatching the child.
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(
+        &mut config,
+        turn.as_ref(),
+        step_context.environments.primary(),
+    )?;
     apply_explicit_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
@@ -421,7 +427,8 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             Some(spawn_source),
             SpawnAgentOptions {
                 parent_thread_id: Some(session.thread_id),
-                environments: Some(turn.environments.to_selections()),
+                parent_turn_id: Some(turn.sub_id.clone()),
+                environments: Some(step_context.environments.to_selections()),
                 completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
                 ..Default::default()
             },
@@ -525,7 +532,7 @@ async fn handle_send(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
     let submission_id = session
         .services
         .agent_control
-        .send_inter_agent_communication(target, communication, context)
+        .send_inter_agent_communication(target, communication, context, Some(turn.sub_id.clone()))
         .await
         .map_err(|err| collab_agent_error(target, err))?;
     Ok(JsonOutput::new(
@@ -858,7 +865,7 @@ async fn refresh_agent_runtime_settings(
         .update_agent_settings(
             agent_id,
             SessionSettingsUpdate {
-                approval_policy: Some(turn.approval_policy.value()),
+                approval_policy: Some(turn.approval_policy()),
                 approvals_reviewer: Some(turn.config.approvals_reviewer),
                 sandbox_policy: Some(turn.sandbox_policy()),
                 windows_sandbox_level: Some(turn.windows_sandbox_level),
@@ -894,7 +901,12 @@ async fn submit_trigger_turn(
     let operation = session
         .services
         .agent_control
-        .submit_inter_agent_communication_operation(id, communication, context)
+        .submit_inter_agent_communication_operation(
+            id,
+            communication,
+            context,
+            Some(turn.sub_id.clone()),
+        )
         .await
         .map_err(|err| collab_agent_error(id, err))?;
     Ok(operation)
@@ -988,7 +1000,7 @@ async fn handle_wait(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
         .map_err(|_| FunctionCallError::RespondToModel("agentId must be a thread id".into()))?;
     let mut rx = match session.services.agent_control.subscribe_status(id).await {
         Ok(rx) => rx,
-        Err(codex_protocol::error::CodexErr::ThreadNotFound(_)) => {
+        Err(error) if matches!(error.details(), CodexErrorDetails::ThreadNotFound(_)) => {
             return Ok(JsonOutput::new(
                 serde_json::json!({"agentId": id.to_string(), "status": "notFound"}),
             ));

@@ -209,7 +209,6 @@ impl FlowdexVerifyHandler {
                 turn.as_ref(),
                 &turn_environment,
                 cwd.clone(),
-                turn.config.permissions.allow_login_shell,
             )?;
             let result = run_exec_like_result(RunExecLikeArgs {
                 tool_name: ToolName::plain(TOOL_NAME),

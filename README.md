@@ -38,6 +38,18 @@ flowdex uninstall --purge
 
 Normal uninstall preserves Flowdex workflows and configuration. `--purge` also removes global Flowdex data from `CODEX_HOME`; repository `.flowdex/` directories remain project-owned.
 
+The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+
+```shell
+curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
+```
+
+```powershell
+$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
+```
+
+Codex CLI can also be installed via the following package managers:
+
 ## Automated upstream releases
 
 The `Flowdex upstream release` workflow checks the latest stable official Codex release every six hours. Git performs a three-way merge, then Windows and macOS release builds run in parallel. Only a fully passing integration fast-forwards `main` and publishes checksummed archives.

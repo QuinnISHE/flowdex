@@ -21,7 +21,7 @@ use codex_flowdex::{
     TaskDefinition, WorkflowDefinition,
 };
 use codex_protocol::ThreadId;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_tools::shell_command_backend_for_features;
@@ -1686,7 +1686,12 @@ async fn close_task_agents(controller: &RunController, task_id: &str) -> Result<
             .close_agent(agent_id)
             .await
         {
-            Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {}
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.details(),
+                    CodexErrorDetails::ThreadNotFound(_) | CodexErrorDetails::InternalAgentDied
+                ) => {}
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -2656,7 +2661,15 @@ async fn close_review_agent(
         .close_agent(thread_id)
         .await
     {
-        Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(error)
+            if matches!(
+                error.details(),
+                CodexErrorDetails::ThreadNotFound(_) | CodexErrorDetails::InternalAgentDied
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error.to_string()),
     }
 }

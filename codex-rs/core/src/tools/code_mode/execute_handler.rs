@@ -12,6 +12,7 @@ use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::handle_runtime_response;
 use super::is_exec_tool_name;
+use super::telemetry::CodeModeToolCallGuard;
 
 pub struct CodeModeExecuteHandler {
     spec: ToolSpec,
@@ -32,11 +33,12 @@ impl CodeModeExecuteHandler {
         turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
         call_id: String,
         code: String,
+        telemetry: &mut CodeModeToolCallGuard,
     ) -> Result<FunctionToolOutput, FunctionCallError> {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
-        let (response, _cell_id, started_at) = execute_source(
+        let (response, cell_id, started_at) = execute_source(
             &exec,
             call_id,
             args.code,
@@ -46,6 +48,7 @@ impl CodeModeExecuteHandler {
         )
         .await
         .map_err(FunctionCallError::RespondToModel)?;
+        telemetry.cell_id = Some(cell_id.to_string());
         handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
             .await
             .map_err(FunctionCallError::RespondToModel)
@@ -112,6 +115,18 @@ pub(crate) async fn execute_source_with_cell_hook(
         })
         .await?;
     let cell_id = started_cell.cell_id.clone();
+    exec.session
+        .services
+        .analytics_events_client
+        .track_code_mode_tool_call(codex_analytics::CodeModeToolCallFact::CellStarted {
+            thread_id: exec.session.thread_id.to_string(),
+            turn_id: exec.turn.sub_id.clone(),
+            call_id: call_id.clone(),
+            cell_id: cell_id.to_string(),
+        });
+    if let Some(executed_tool_calls) = exec.session.services.executed_tool_calls.as_ref() {
+        executed_tool_calls.register_cell(&cell_id, &call_id);
+    }
     if let Some(cell_started) = cell_started {
         cell_started(&cell_id);
     }
@@ -138,6 +153,14 @@ pub(crate) async fn execute_source_with_cell_hook(
             .services
             .code_mode_service
             .finish_cell_dispatch(&cell_id);
+        exec.session
+            .services
+            .analytics_events_client
+            .track_code_mode_tool_call(codex_analytics::CodeModeToolCallFact::CellClosed {
+                thread_id: exec.session.thread_id.to_string(),
+                turn_id: exec.turn.sub_id.clone(),
+                cell_id: cell_id.to_string(),
+            });
     }
     exec.session.services.elicitations.wait_until_clear().await;
     Ok((response, cell_id, started_at))
@@ -171,15 +194,28 @@ impl CodeModeExecuteHandler {
             ..
         } = invocation;
 
-        match payload {
+        let mut telemetry = CodeModeToolCallGuard::new(
+            session.services.analytics_events_client.clone(),
+            session.thread_id.to_string(),
+            turn.sub_id.clone(),
+            call_id.clone(),
+            PUBLIC_TOOL_NAME,
+        );
+        let result = match payload {
             ToolPayload::Custom { input } if is_exec_tool_name(&tool_name) => self
-                .execute(session, turn, call_id, input)
+                .execute(session, turn, call_id, input, &mut telemetry)
                 .await
                 .map(boxed_tool_output),
             _ => Err(FunctionCallError::RespondToModel(format!(
                 "{PUBLIC_TOOL_NAME} expects raw JavaScript source text"
             ))),
-        }
+        };
+        telemetry.finish(
+            result
+                .as_ref()
+                .is_ok_and(|output| output.success_for_logging()),
+        );
+        result
     }
 }
 

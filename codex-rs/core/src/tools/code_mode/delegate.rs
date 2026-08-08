@@ -19,7 +19,6 @@ use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
 use super::call_nested_tool;
 use crate::session::step_context::StepContext;
-use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
@@ -71,12 +70,10 @@ impl CodeModeDispatchBroker {
     pub(super) fn start_turn_worker(
         &self,
         exec: ExecContext,
-        router: Arc<ToolRouter>,
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
     ) -> CodeModeDispatchWorker {
-        let tool_runtime =
-            ToolCallRuntime::new(router, Arc::clone(&exec.session), step_context, tracker);
+        let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let host_id = self.next_host_id.fetch_add(1, Ordering::Relaxed);
         *lock_or_recover(&self.active_host) = Some((host_id, host));

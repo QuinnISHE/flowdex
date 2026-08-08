@@ -1,5 +1,3 @@
-pub(crate) mod agent_jobs;
-pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
 mod compact_context;
@@ -92,6 +90,7 @@ pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
+pub use wait_for_environment::WaitForEnvironmentToolConfig;
 
 pub(crate) fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
 where
@@ -100,6 +99,19 @@ where
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
+}
+
+fn resolve_sandbox_permissions(
+    sandbox_permissions: Option<SandboxPermissions>,
+    justification: Option<&str>,
+) -> Result<SandboxPermissions, FunctionCallError> {
+    if justification.is_some() && sandbox_permissions.is_none() {
+        return Err(FunctionCallError::RespondToModel(
+            "`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: \"require_escalated\"` for unsandboxed execution, or omit `justification`.".to_string(),
+        ));
+    }
+
+    Ok(sandbox_permissions.unwrap_or_default())
 }
 
 pub(crate) fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
@@ -458,12 +470,14 @@ mod tests {
                             value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::GlobPattern {
                             pattern: "**/*.env".to_string(),
                         },
                         access: FileSystemAccessMode::Deny,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,

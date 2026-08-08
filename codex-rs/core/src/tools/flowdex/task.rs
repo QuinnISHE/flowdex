@@ -569,6 +569,7 @@ pub(crate) async fn handle_run_with_review(
     let mut config = build_agent_spawn_config(
         &invocation.session.get_base_instructions().await,
         invocation.turn.as_ref(),
+        invocation.step_context.environments.primary(),
     )?;
     apply_spawn_agent_role(
         &invocation.session,
@@ -592,7 +593,11 @@ pub(crate) async fn handle_run_with_review(
     .await?;
     // Profile loading rebuilds Config from persisted layers. Restore the live turn's
     // approval and sandbox selection before rebasing it onto the task worktree.
-    apply_spawn_agent_runtime_overrides(&mut config, invocation.turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(
+        &mut config,
+        invocation.turn.as_ref(),
+        invocation.step_context.environments.primary(),
+    )?;
     apply_explicit_spawn_agent_model_overrides(
         &invocation.session,
         invocation.turn.as_ref(),
@@ -615,7 +620,7 @@ pub(crate) async fn handle_run_with_review(
         .map_err(|err| {
             FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
         })?;
-    let mut environments = invocation.turn.environments.to_selections();
+    let mut environments = invocation.step_context.environments.to_selections();
     for environment in &mut environments {
         environment.cwd = PathUri::from_abs_path(&task_cwd);
         environment.workspace_roots = vec![PathUri::from_abs_path(&task_cwd)];
@@ -933,13 +938,17 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             "verification cancelled".to_string(),
         ));
     }
-    let turn = std::sync::Arc::make_mut(&mut task_invocation.turn);
-    let config = std::sync::Arc::make_mut(&mut turn.config);
+    let mut config = (*task_invocation.turn.config).clone();
     config.cwd = task_cwd.clone();
     config.workspace_roots = vec![task_cwd.clone()];
     config
         .permissions
         .set_workspace_roots(vec![task_cwd.clone()]);
+    task_invocation.turn = std::sync::Arc::new(
+        task_invocation
+            .turn
+            .clone_with_config(std::sync::Arc::new(config)),
+    );
     let verifier = FlowdexVerifyHandler::new(shell_command_backend_for_features(
         invocation.turn.config.features.get(),
     ));

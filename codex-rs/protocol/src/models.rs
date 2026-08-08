@@ -28,6 +28,15 @@ use schemars::JsonSchema;
 use crate::ResponseItemId;
 use crate::mcp::CallToolResult;
 
+mod executed_tool_calls;
+
+pub use executed_tool_calls::ExecutedToolCall;
+pub use executed_tool_calls::ExecutedToolCallArguments;
+pub use executed_tool_calls::ExecutedToolCallTruncation;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt;
+pub use executed_tool_calls::bound_executed_tool_calls_for_prompt_prioritizing_recent;
+pub use executed_tool_calls::executed_tool_call_metadata_bytes;
+
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
     Debug, Clone, Copy, Default, Eq, Hash, PartialEq, Serialize, Deserialize, JsonSchema, TS,
@@ -89,30 +98,25 @@ impl FileSystemPermissions {
     ) -> Self {
         let mut entries = Vec::new();
         if let Some(read) = read {
-            entries.extend(read.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Read,
+            entries.extend(read.into_iter().map(|path| {
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Path { path },
+                    FileSystemAccessMode::Read,
+                )
             }));
         }
         if let Some(write) = write {
-            entries.extend(write.into_iter().map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
-                access: FileSystemAccessMode::Write,
+            entries.extend(write.into_iter().map(|path| {
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Path { path },
+                    FileSystemAccessMode::Write,
+                )
             }));
         }
         Self {
             entries,
             glob_scan_max_depth: None,
         }
-    }
-
-    pub fn explicit_path_entries(
-        &self,
-    ) -> impl Iterator<Item = (&AbsolutePathBuf, FileSystemAccessMode)> {
-        self.entries.iter().filter_map(|entry| match &entry.path {
-            FileSystemPath::Path { path } => Some((path, entry.access)),
-            FileSystemPath::GlobPattern { .. } | FileSystemPath::Special { .. } => None,
-        })
     }
 
     pub fn legacy_read_write_roots(&self) -> Option<LegacyReadWriteRoots> {
@@ -645,12 +649,12 @@ impl From<&FileSystemSandboxPolicy> for FileSystemPermissions {
         let entries = match value.kind {
             FileSystemSandboxKind::Restricted => value.entries.clone(),
             FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
-                vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
+                vec![FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
                         value: FileSystemSpecialPath::Root,
                     },
-                    access: FileSystemAccessMode::Write,
-                }]
+                    FileSystemAccessMode::Write,
+                )]
             }
         };
         Self {
@@ -783,6 +787,11 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub turn_id: Option<String>,
+    /// Warehouse-only Responses metadata, not part of the public app-server protocol.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub executed_tool_calls: Option<Vec<ExecutedToolCall>>,
 }
 
 impl InternalChatMessageMetadataPassthrough {
@@ -875,6 +884,9 @@ pub enum ResponseItem {
         // JSON, not as an already‑parsed object. We keep it as a raw string here and let
         // Session::handle_function_call parse it into a Value.
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        encrypted_function_args: Option<Vec<String>>,
         call_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -1856,7 +1868,7 @@ pub enum FunctionCallOutputContentItem {
 ///
 /// This conversion is intentionally lossy:
 /// - only `input_text` items are included
-/// - image items are ignored
+/// - image and audio items are ignored
 ///
 /// We use this helper where callers still need a string representation (for
 /// example telemetry previews or legacy string-only output paths) while keeping
@@ -1898,6 +1910,9 @@ impl From<crate::dynamic_tools::DynamicToolCallOutputContentItem>
                     image_url,
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 }
+            }
+            crate::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                Self::InputAudio { audio_url }
             }
         }
     }
@@ -1958,13 +1973,6 @@ impl FunctionCallOutputPayload {
 
     pub fn text_content(&self) -> Option<&str> {
         match &self.body {
-            FunctionCallOutputBody::Text(content) => Some(content),
-            FunctionCallOutputBody::ContentItems(_) => None,
-        }
-    }
-
-    pub fn text_content_mut(&mut self) -> Option<&mut String> {
-        match &mut self.body {
             FunctionCallOutputBody::Text(content) => Some(content),
             FunctionCallOutputBody::ContentItems(_) => None,
         }
@@ -2118,6 +2126,14 @@ fn convert_mcp_content_to_items(
             #[serde(rename = "_meta", default)]
             meta: Option<serde_json::Value>,
         },
+        #[serde(rename = "audio")]
+        Audio {
+            data: String,
+            #[serde(rename = "mimeType", alias = "mime_type")]
+            mime_type: Option<String>,
+            #[serde(rename = "_meta", default)]
+            _meta: Option<serde_json::Value>,
+        },
         #[serde(other)]
         Unknown,
     }
@@ -2170,6 +2186,18 @@ fn convert_mcp_content_to_items(
                         })
                         .or(Some(DEFAULT_IMAGE_DETAIL)),
                 }
+            }
+            Ok(McpContent::Audio {
+                data, mime_type, ..
+            }) => {
+                saw_content_item = true;
+                let audio_url = if data.starts_with("data:") {
+                    data
+                } else {
+                    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".into());
+                    format!("data:{mime_type};base64,{data}")
+                };
+                FunctionCallOutputContentItem::InputAudio { audio_url }
             }
             Ok(McpContent::Unknown) | Err(_) => FunctionCallOutputContentItem::InputText {
                 text: serde_json::to_string(content).unwrap_or_else(|_| "<content>".to_string()),
@@ -2272,6 +2300,25 @@ mod tests {
         }))?;
         assert_eq!(unknown_metadata, item);
 
+        item.append_executed_tool_calls(vec![ExecutedToolCall::new(
+            "test_tool".to_string(),
+            serde_json::json!({"value": 1}),
+        )]);
+        let serialized = serde_json::to_value(&item)?;
+        assert_eq!(
+            serialized["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+            serde_json::json!([{"name": "test_tool", "arguments": {"value": 1}}]),
+        );
+        let deserialized = serde_json::from_value::<ResponseItem>(serialized)?;
+        assert_eq!(deserialized.turn_id(), Some("turn-1"));
+        assert!(
+            deserialized
+                .executed_tool_call_metadata()
+                .and_then(|metadata| metadata.executed_tool_calls.as_ref())
+                .is_none(),
+            "provider and rollout input cannot forge local attempted-tool metadata",
+        );
+        item.clear_executed_tool_calls();
         item.set_turn_id_if_missing("turn-2");
         assert_eq!(item.turn_id(), Some("turn-1"));
 
@@ -2337,6 +2384,7 @@ mod tests {
     fn passthrough_metadata(turn_id: &str) -> InternalChatMessageMetadataPassthrough {
         InternalChatMessageMetadataPassthrough {
             turn_id: Some(turn_id.to_string()),
+            ..Default::default()
         }
     }
 
@@ -2490,6 +2538,7 @@ mod tests {
                     pattern: "**/*.env".to_string(),
                 },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             }]);
         file_system_sandbox_policy.glob_scan_max_depth = Some(2);
 
@@ -2535,6 +2584,7 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     }],
                     glob_scan_max_depth: NonZeroUsize::new(2),
                 },
@@ -2678,6 +2728,7 @@ mod tests {
             entries: vec![FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             }],
             glob_scan_max_depth: NonZeroUsize::new(2),
         };
@@ -2726,7 +2777,36 @@ mod tests {
     }
 
     #[test]
-    fn convert_mcp_content_to_items_returns_none_without_images() {
+    fn convert_mcp_audio_content_builds_data_urls_and_preserves_existing_data_urls() {
+        let contents = vec![
+            serde_json::json!({
+                "type": "audio",
+                "data": "Zm9v",
+                "mimeType": "audio/wav",
+                "_meta": {"source": "microphone"},
+            }),
+            serde_json::json!({
+                "type": "audio",
+                "data": "data:audio/ogg;base64,YmFy",
+                "mimeType": "audio/ogg",
+            }),
+        ];
+
+        assert_eq!(
+            convert_mcp_content_to_items(&contents),
+            Some(vec![
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/wav;base64,Zm9v".to_string(),
+                },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/ogg;base64,YmFy".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn convert_mcp_content_to_items_returns_none_without_media() {
         let contents = vec![serde_json::json!({
             "type": "text",
             "text": "hello",
@@ -2755,7 +2835,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_content_items_to_text_ignores_blank_text_and_images() {
+    fn function_call_output_content_items_to_text_ignores_blank_text_and_media() {
         let content_items = vec![
             FunctionCallOutputContentItem::InputText {
                 text: "   ".to_string(),
@@ -2763,6 +2843,9 @@ mod tests {
             FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputAudio {
+                audio_url: "data:audio/wav;base64,AAA".to_string(),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
@@ -2814,10 +2897,27 @@ mod tests {
                 name: "mcp__codex_apps__gmail_get_recent_emails".to_string(),
                 namespace: Some("mcp__codex_apps__gmail".to_string()),
                 arguments: "{\"top_k\":5}".to_string(),
+                encrypted_function_args: None,
                 call_id: "call-1".to_string(),
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn function_call_preserves_empty_encrypted_function_args() {
+        let value = serde_json::json!({
+            "type": "function_call",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "arguments": "{\"message\":\"hello\",\"task_name\":\"worker\"}",
+            "encrypted_function_args": [],
+            "call_id": "call-1",
+        });
+        let item: ResponseItem =
+            serde_json::from_value(value.clone()).expect("function_call should deserialize");
+
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
     }
 
     #[test]
@@ -2949,6 +3049,54 @@ mod tests {
 
         let output = v.get("output").expect("output field");
         assert!(output.is_array(), "expected array output");
+
+        Ok(())
+    }
+
+    #[test]
+    fn serializes_audio_outputs_as_array() -> Result<()> {
+        let call_tool_result = CallToolResult {
+            content: vec![
+                serde_json::json!({"type":"text","text":"caption"}),
+                serde_json::json!({"type":"audio","data":"BASE64","mimeType":"audio/wav"}),
+            ],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let payload = call_tool_result.into_function_call_output_payload();
+        assert_eq!(
+            payload,
+            FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "caption".into(),
+                    },
+                    FunctionCallOutputContentItem::InputAudio {
+                        audio_url: "data:audio/wav;base64,BASE64".into(),
+                    },
+                ]),
+                success: Some(true),
+            }
+        );
+
+        let item = ResponseInputItem::FunctionCallOutput {
+            call_id: "call1".into(),
+            output: payload,
+        };
+
+        assert_eq!(
+            serde_json::to_value(item)?,
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call1",
+                "output": [
+                    {"type": "input_text", "text": "caption"},
+                    {"type": "input_audio", "audio_url": "data:audio/wav;base64,BASE64"},
+                ],
+            })
+        );
 
         Ok(())
     }

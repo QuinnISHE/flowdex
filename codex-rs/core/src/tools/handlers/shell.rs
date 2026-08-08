@@ -32,7 +32,7 @@ use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
@@ -155,7 +155,7 @@ pub(crate) async fn run_exec_like_result(
         || {
             normalize_and_validate_additional_permissions(
                 additional_permissions_allowed,
-                turn.approval_policy.value(),
+                turn.approval_policy(),
                 effective_additional_permissions.sandbox_permissions,
                 effective_additional_permissions.additional_permissions,
                 effective_additional_permissions.permissions_preapproved,
@@ -174,11 +174,11 @@ pub(crate) async fn run_exec_like_result(
         .requests_sandbox_override()
         && !effective_additional_permissions.permissions_preapproved
         && !matches!(
-            turn.approval_policy.value(),
+            turn.approval_policy(),
             codex_protocol::protocol::AskForApproval::OnRequest
         )
     {
-        let approval_policy = turn.approval_policy.value();
+        let approval_policy = turn.approval_policy();
         return Err(FunctionCallError::RespondToModel(format!(
             "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
         )));
@@ -203,7 +203,14 @@ pub(crate) async fn run_exec_like_result(
     }
 
     let source = ExecCommandSource::Agent;
-    let emitter = ToolEmitter::shell(exec_params.command.clone(), exec_params.cwd.clone(), source);
+    let plugin_attribution =
+        turn.plugin_attribution_for_command(&exec_params.command, &exec_params.cwd);
+    let emitter = ToolEmitter::shell(
+        exec_params.command.clone(),
+        exec_params.cwd.clone(),
+        source,
+        plugin_attribution,
+    );
     let event_ctx = ToolEventCtx::new(
         session.as_ref(),
         turn.as_ref(),
@@ -217,8 +224,8 @@ pub(crate) async fn run_exec_like_result(
         .exec_policy
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &exec_params.command,
-            approval_policy: turn.approval_policy.value(),
-            permission_profile: turn.permission_profile(),
+            approval_policy: turn.approval_policy(),
+            permission_profile: turn_environment.permission_profile().clone(),
             windows_sandbox_level: turn.windows_sandbox_level,
             sandbox_permissions: if effective_additional_permissions.permissions_preapproved {
                 codex_protocol::models::SandboxPermissions::UseDefault
@@ -257,13 +264,7 @@ pub(crate) async fn run_exec_like_result(
         tool_name,
     };
     let out = orchestrator
-        .run(
-            &mut runtime,
-            &req,
-            &tool_ctx,
-            &turn,
-            turn.approval_policy.value(),
-        )
+        .run(&mut runtime, &req, &tool_ctx, &turn, turn.approval_policy())
         .await
         .map(|result| result.output);
     let event_ctx = ToolEventCtx::new(
@@ -274,9 +275,10 @@ pub(crate) async fn run_exec_like_result(
     );
     let structured_output = match &out {
         Ok(output) => Some(output.clone()),
-        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output }))) => {
-            Some((**output).clone())
-        }
+        Err(ToolError::Codex(error)) => match error.details() {
+            CodexErrorDetails::Sandbox(SandboxErr::Timeout { output }) => Some((**output).clone()),
+            _ => None,
+        },
         _ => None,
     };
     let post_tool_use_response = structured_output
