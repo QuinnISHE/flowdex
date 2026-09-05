@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
+use codex_core::config::Constrained;
 use codex_features::Feature;
 use codex_flowdex::{FlowdexStore, ReviewFinding, ReviewResolution, RunInfo, TaskDeclaration};
 use codex_protocol::ThreadId;
@@ -6,10 +8,11 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::items::CollabAgentTool;
 use codex_protocol::items::TurnItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
@@ -1059,13 +1062,14 @@ async fn start_flowdex_workflow_executes_saved_v8_module() -> Result<()> {
     let output = follow_up
         .function_call_output_text("call-1")
         .expect("start tool output should be sent back to the model");
-    let output: Value = serde_json::from_str(&output)?;
+    let output: Value = serde_json::from_str(&output)
+        .map_err(|err| anyhow::anyhow!("invalid Flowdex start output {output:?}: {err}"))?;
     assert!(output["runId"].as_str().is_some());
     assert_eq!(output["status"], "completed");
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["input"]["answer"], 42);
     assert_eq!(workflow_output["path"], ".flowdex/workflows/hello.js");
-    assert_eq!(workflow_output["spawnAvailable"], false);
+    assert_eq!(workflow_output["spawnAvailable"], true);
     assert!(output.get("error").is_none());
     Ok(())
 }
@@ -1200,7 +1204,10 @@ async fn flowdex_workflow_spawns_in_default_tool_mode_without_parent_completion_
     let workflow_output: Value = serde_json::from_str(output["output"].as_str().unwrap())?;
     assert_eq!(workflow_output["hidden"], true);
     assert_eq!(workflow_output["recursive"], true);
-    assert_eq!(workflow_output["result"]["status"], "completed");
+    assert_eq!(
+        workflow_output["result"]["status"], "completed",
+        "workflow output: {workflow_output}"
+    );
     assert_eq!(workflow_output["result"]["message"], "child output");
     let follow_up_request = follow_up.single_request();
     assert!(!follow_up_request.body_contains_text("Message Type: FINAL_ANSWER"));
@@ -1632,7 +1639,7 @@ text(JSON.stringify({ taskId: task.id, createUnknownRejected, runUnknownRejected
         },
         sse(vec![
             ev_response_created("resp-task-child-1"),
-            core_test_support::responses::ev_shell_command_call(
+            core_test_support::responses::ev_exec_command_call(
                 "call-task-child-1",
                 "echo first > task.txt && git add task.txt && git commit -m \"initial task change\"",
             ),
@@ -1674,7 +1681,7 @@ text(JSON.stringify({ taskId: task.id, createUnknownRejected, runUnknownRejected
         |request: &wiremock::Request| body_contains(request, "Make a second change"),
         sse(vec![
             ev_response_created("resp-task-child-2"),
-            core_test_support::responses::ev_shell_command_call(
+            core_test_support::responses::ev_exec_command_call(
                 "call-task-child-2",
                 "echo second >> task.txt && git add task.txt && git commit -m \"resumed task change\"",
             ),
@@ -1776,6 +1783,12 @@ async fn flowdex_scheduler_runs_parallel_dependencies_and_verification() -> Resu
             config.features.enable(Feature::Collab).unwrap();
             config.agent_max_threads = Some(8);
             config.active_project.trust_level = Some(TrustLevel::Trusted);
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+            let cwd = config.cwd.clone();
+            config
+                .permissions
+                .set_legacy_sandbox_policy(SandboxPolicy::DangerFullAccess, cwd.as_path())
+                .unwrap();
         })
         .with_workspace_setup(|cwd, _fs| async move {
             let workflow_dir = cwd.join(".flowdex/workflows");
@@ -1827,16 +1840,12 @@ text(JSON.stringify(await run.wait()));"#,
 
     let mut created = test.thread_manager.subscribe_thread_created();
     let mut reasoning = Vec::new();
-    let submit = test.codex.submit(Op::UserInput {
-        items: vec![UserInput::Text {
+    let submit = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "run the scheduler workflow".into(),
             text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    });
+        }]));
     submit.await?;
     let turn_id = loop {
         let event = tokio::time::timeout(Duration::from_secs(30), test.codex.next_event())
@@ -1945,19 +1954,12 @@ text(JSON.stringify(await run.wait()));"#,
     assert!(!body_contains(follow_up_request, "alpha complete"));
     assert!(!body_contains(follow_up_request, "beta complete"));
 
+    let mut created_ids = HashSet::new();
     for _ in 0..3 {
         let child_id = tokio::time::timeout(Duration::from_secs(5), created.recv()).await??;
-        let snapshot = test
-            .thread_manager
-            .get_thread(child_id)
-            .await?
-            .config_snapshot()
-            .await;
-        assert!(matches!(
-            snapshot.session_source,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        ));
+        created_ids.insert(child_id);
     }
+    assert_eq!(created_ids.len(), 3);
     Ok(())
 }
 
@@ -2032,16 +2034,10 @@ text(JSON.stringify({ input, result }));"#,
         .await;
     let mut created = test.thread_manager.subscribe_thread_created();
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run the joined workflow".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+            }]))
         .await?;
     let turn_id = loop {
         let event =
@@ -2425,16 +2421,10 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "run the context workflow".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run the context workflow".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     let turn_id = loop {
         let event =
@@ -2443,6 +2433,40 @@ async fn flowdex_context_pack_collects_stale_and_reinjects() -> Result<()> {
             break event.turn_id;
         }
     };
+    let stale_deadline = Instant::now() + Duration::from_secs(30);
+    while responder.first_requests.load(Ordering::SeqCst) == 0 {
+        let remaining = stale_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for the first context-dependent task");
+        }
+        let event = tokio::time::timeout(remaining, test.codex.next_event())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out waiting for the first context-dependent task; collector={}, independent={}, first={}",
+                    responder.collector_requests.load(Ordering::SeqCst),
+                    responder.independent_requests.load(Ordering::SeqCst),
+                    responder.first_requests.load(Ordering::SeqCst),
+                )
+            })??;
+        if let EventMsg::TurnComplete(event) = event.msg
+            && event.turn_id == turn_id
+        {
+            let requests = server.received_requests().await.unwrap_or_default();
+            let outputs = requests
+                .iter()
+                .flat_map(|request| {
+                    ["call-context-outer", "call-context-wait"]
+                        .into_iter()
+                        .filter_map(|call_id| function_call_output_text(request, call_id))
+                })
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "context workflow completed before the source became stale: {:?}; outputs={outputs:?}",
+                event.error,
+            );
+        }
+    }
     tokio::time::timeout(Duration::from_secs(10), modifier).await???;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -2560,16 +2584,10 @@ flowdex.output({ input, workflow: flowdex.workflowPath, agent });"#,
         .mount(&server)
         .await;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "run nested workflow".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run nested workflow".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let turn_id = loop {

@@ -129,7 +129,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexReviewReportHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { self.handle_call(invocation).await })
     }
 }

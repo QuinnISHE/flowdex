@@ -7,8 +7,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+use codex_diagnostics::GaugeGuard;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
-use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -20,7 +20,9 @@ use tokio::sync::oneshot;
 use crate::agent::control::AgentExecutionGuard;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::McpInvocation;
@@ -78,6 +80,7 @@ pub(crate) struct RunningTask {
     pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
+    pub(crate) _diagnostics_guard: GaugeGuard,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
 }
@@ -98,12 +101,15 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    /// The last step captured for execution or selected from a speculative fallback.
+    /// Remains absent until a step is captured; standalone local compaction has no step.
+    pub(crate) last_known_step_context: Option<Arc<StepContext>>,
 }
 
 pub(crate) struct PendingRequestPermissions {
     pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
     pub(crate) requested_permissions: RequestPermissionProfile,
-    pub(crate) environment: TurnEnvironmentSelection,
+    pub(crate) environment: TurnEnvironment,
 }
 
 impl TurnState {

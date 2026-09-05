@@ -34,7 +34,6 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
-use codex_tools::shell_command_backend_for_features;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
@@ -153,7 +152,13 @@ macro_rules! executor {
             fn spec(&self) -> ToolSpec {
                 $spec()
             }
-            fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            fn handle<'a>(
+                &'a self,
+                invocation: ToolInvocation,
+            ) -> codex_tools::ToolExecutorFuture<'a>
+            where
+                ToolInvocation: 'a,
+            {
                 Box::pin(async move { $handler(invocation).await.map(boxed_tool_output) })
             }
         }
@@ -169,15 +174,14 @@ impl ToolExecutor<ToolInvocation> for FlowdexTaskVerifyHandler {
     fn spec(&self) -> ToolSpec {
         task_verify_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_verify(invocation).await.map(boxed_tool_output) })
     }
 }
-impl CoreToolRuntime for FlowdexTaskVerifyHandler {
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for FlowdexTaskVerifyHandler {}
 executor!(
     FlowdexTaskIntegrateHandler,
     INTEGRATE,
@@ -569,7 +573,6 @@ pub(crate) async fn handle_run_with_review(
     let mut config = build_agent_spawn_config(
         &invocation.session.get_base_instructions().await,
         invocation.turn.as_ref(),
-        invocation.step_context.environments.primary(),
     )?;
     apply_spawn_agent_role(
         &invocation.session,
@@ -593,11 +596,7 @@ pub(crate) async fn handle_run_with_review(
     .await?;
     // Profile loading rebuilds Config from persisted layers. Restore the live turn's
     // approval and sandbox selection before rebasing it onto the task worktree.
-    apply_spawn_agent_runtime_overrides(
-        &mut config,
-        invocation.turn.as_ref(),
-        invocation.step_context.environments.primary(),
-    )?;
+    apply_spawn_agent_runtime_overrides(&mut config, invocation.turn.as_ref())?;
     apply_explicit_spawn_agent_model_overrides(
         &invocation.session,
         invocation.turn.as_ref(),
@@ -668,7 +667,7 @@ pub(crate) async fn handle_run_with_review(
     let model = config
         .model
         .clone()
-        .unwrap_or_else(|| invocation.turn.model_info.slug.clone());
+        .unwrap_or_else(|| invocation.turn.model_info().slug.clone());
     let reservation_id = if review.is_none() {
         Some(reserve_task_operation(&invocation.session, &invocation.turn, &task.id, &model).await?)
     } else {
@@ -700,6 +699,9 @@ pub(crate) async fn handle_run_with_review(
             Some(source),
             SpawnAgentOptions {
                 parent_thread_id: Some(invocation.session.thread_id),
+                parent_turn_id: Some(invocation.turn.sub_id.clone()),
+                root_turn_id: invocation.turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: invocation.turn.cyber_access_program,
                 environments: Some(environments),
                 completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
                 ..Default::default()
@@ -947,9 +949,7 @@ async fn handle_verify(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             .turn
             .clone_with_config(std::sync::Arc::new(config)),
     );
-    let verifier = FlowdexVerifyHandler::new(shell_command_backend_for_features(
-        invocation.turn.config.features.get(),
-    ));
+    let verifier = FlowdexVerifyHandler::new();
     let output = verifier
         .handle_for_workdir(
             task_invocation.clone(),
@@ -1045,7 +1045,7 @@ pub(crate) fn associate_task_agent(id: ThreadId, task: &str) {
 
 pub(crate) struct JsonOutput(pub(crate) Value);
 impl ToolOutput for JsonOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.0.to_string()
     }
     fn success_for_logging(&self) -> bool {

@@ -1,5 +1,6 @@
 use crate::function_tool::FunctionCallError;
 use crate::session::InputQueueActivity;
+use crate::tools::code_mode::CodeModeNestedTool;
 use crate::tools::code_mode::ExecContext;
 use crate::tools::code_mode::execute_source_with_cell_hook;
 use crate::tools::code_mode::into_function_call_output_content_items;
@@ -61,6 +62,7 @@ pub(crate) use task::FlowdexCreateTaskHandler;
 pub(crate) use task::FlowdexTaskIntegrateHandler;
 pub(crate) use task::FlowdexTaskRunAgentHandler;
 pub(crate) use task::FlowdexTaskVerifyHandler;
+pub(crate) use verification::FlowdexExecCommandHandler;
 pub(crate) use verification::FlowdexVerifyHandler;
 
 const TOOL_NAME: &str = "start_flowdex_workflow";
@@ -323,7 +325,7 @@ struct StartArgs {
 }
 
 pub(crate) struct StartFlowdexWorkflowHandler {
-    nested_tool_specs: Vec<ToolSpec>,
+    nested_tool_specs: Vec<CodeModeNestedTool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,7 +344,7 @@ struct SaveWorkflowArgs {
 }
 
 pub(crate) struct FlowdexRunWorkflowHandler {
-    nested_tool_specs: Vec<ToolSpec>,
+    nested_tool_specs: Vec<CodeModeNestedTool>,
 }
 
 pub(crate) struct SaveFlowdexWorkflowHandler;
@@ -375,7 +377,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexSignalHandler {
             output_schema: Some(serde_json::json!({"type":"null"})),
         })
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolInvocation {
                 payload: ToolPayload::Function { arguments },
@@ -436,7 +441,10 @@ impl ToolExecutor<ToolInvocation> for ContinueFlowdexWorkflowHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { self.handle_call(invocation).await })
     }
 }
@@ -534,7 +542,10 @@ impl ToolExecutor<ToolInvocation> for WaitFlowdexWorkflowHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -619,11 +630,11 @@ impl WaitFlowdexWorkflowHandler {
                             .services
                             .rollout_thread_trace
                             .code_cell_trace_context(&turn.sub_id, runtime_cell_id.as_str())
-                            .record_ended(response);
+                            .record_ended(&response);
                         session
                             .services
                             .code_mode_service
-                            .finish_cell_dispatch(runtime_cell_id);
+                            .finish_cell_dispatch(&runtime_cell_id);
                         workflow_chains()
                             .lock()
                             .expect("workflow chain mutex poisoned")
@@ -815,13 +826,13 @@ struct WaitArgs {
 }
 
 impl StartFlowdexWorkflowHandler {
-    pub(crate) fn new(nested_tool_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(nested_tool_specs: Vec<CodeModeNestedTool>) -> Self {
         Self { nested_tool_specs }
     }
 }
 
 impl FlowdexRunWorkflowHandler {
-    pub(crate) fn new(nested_tool_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(nested_tool_specs: Vec<CodeModeNestedTool>) -> Self {
         Self { nested_tool_specs }
     }
 }
@@ -849,22 +860,22 @@ impl ToolExecutor<ToolInvocation> for FlowdexRunWorkflowHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
 
-impl CoreToolRuntime for FlowdexRunWorkflowHandler {
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for FlowdexRunWorkflowHandler {}
 
 impl FlowdexRunWorkflowHandler {
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let originating_item_id = invocation.originating_item_id().await;
         let ToolInvocation {
             session,
             turn,
@@ -949,7 +960,7 @@ impl FlowdexRunWorkflowHandler {
                 &self.nested_tool_specs,
                 None,
                 None,
-                Some(codex_code_mode::CellId::new(parent_cell.clone())),
+                originating_item_id,
                 Some(Box::new(move |child_cell| {
                     let child_run_id = register_workflow_run(child_cell);
                     *started_child_for_registration
@@ -1138,7 +1149,10 @@ impl ToolExecutor<ToolInvocation> for SaveFlowdexWorkflowHandler {
             output_schema: None,
         })
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -1216,7 +1230,10 @@ impl ToolExecutor<ToolInvocation> for StartFlowdexWorkflowHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -1226,6 +1243,7 @@ impl StartFlowdexWorkflowHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        let originating_item_id = invocation.originating_item_id().await;
         let ToolInvocation {
             session,
             turn,
@@ -1312,7 +1330,7 @@ impl StartFlowdexWorkflowHandler {
             &self.nested_tool_specs,
             None,
             None,
-            None,
+            originating_item_id,
             Some(Box::new(move |cell_id: &codex_code_mode::CellId| {
                 let public_run_id = register_workflow_run(cell_id);
                 *run_id_for_registration

@@ -62,16 +62,15 @@ impl ToolExecutor<ToolInvocation> for FlowdexCheckRulesHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_check_rules(invocation).await.map(boxed_tool_output) })
     }
 }
 
-impl CoreToolRuntime for FlowdexCheckRulesHandler {
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for FlowdexCheckRulesHandler {}
 
 impl ToolExecutor<ToolInvocation> for FlowdexScanRuleCandidatesHandler {
     fn tool_name(&self) -> ToolName {
@@ -89,7 +88,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexScanRuleCandidatesHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             handle_scan_rule_candidates(invocation)
                 .await
@@ -245,7 +247,7 @@ pub(crate) fn validate_rule_ids(rule_ids: &[String]) -> Result<(), FunctionCallE
 pub(crate) struct RulesOutput(Value);
 
 impl ToolOutput for RulesOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.0.to_string()
     }
 

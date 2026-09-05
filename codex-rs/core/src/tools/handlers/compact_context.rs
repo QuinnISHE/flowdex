@@ -23,7 +23,10 @@ impl ToolExecutor<ToolInvocation> for CompactContextHandler {
         create_compact_context_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(

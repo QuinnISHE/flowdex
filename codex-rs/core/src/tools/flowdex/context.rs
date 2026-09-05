@@ -40,7 +40,10 @@ impl ToolExecutor<ToolInvocation> for PublishFlowdexContextHandler {
     fn spec(&self) -> ToolSpec {
         publish_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { publish_call(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -53,7 +56,10 @@ impl ToolExecutor<ToolInvocation> for ReadFlowdexContextHandler {
     fn spec(&self) -> ToolSpec {
         read_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { read_call(invocation).await.map(boxed_tool_output) })
     }
 }

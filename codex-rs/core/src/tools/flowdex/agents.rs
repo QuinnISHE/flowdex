@@ -9,6 +9,7 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::function_tool::FunctionCallError;
 use crate::session::SessionSettingsUpdate;
+use crate::session::step_settings::StepSettingsUpdate;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -148,7 +149,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexSpawnAgentHandler {
     fn spec(&self) -> ToolSpec {
         spawn_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_spawn(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -161,7 +165,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexSendMessageHandler {
     fn spec(&self) -> ToolSpec {
         send_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_send(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -174,7 +181,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexWaitAgentHandler {
     fn spec(&self) -> ToolSpec {
         wait_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_wait(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -187,7 +197,10 @@ impl ToolExecutor<ToolInvocation> for FlowdexResumeAgentHandler {
     fn spec(&self) -> ToolSpec {
         resume_spec()
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_resume(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -287,7 +300,7 @@ pub(crate) async fn apply_flowdex_tool_profile(
     let cfg =
         deserialize_config_toml_with_base(stack.effective_config(), config.codex_home.as_path())
             .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-    let mut next = Config::load_config_with_layer_stack(
+    let next = Config::load_config_with_layer_stack(
         LOCAL_FS.as_ref(),
         cfg,
         ConfigOverrides {
@@ -302,8 +315,14 @@ pub(crate) async fn apply_flowdex_tool_profile(
     )
     .await
     .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-    next.flowdex_config.active_agent_excluded_tools = excluded_tools;
-    *config = next;
+    config.config_layer_stack = next.config_layer_stack;
+    config.mcp_servers = next.mcp_servers;
+    config.web_search_mode = next.web_search_mode;
+    config.experimental_request_user_input_enabled = next.experimental_request_user_input_enabled;
+    config.update_plan_enabled = next.update_plan_enabled;
+    config.include_skill_instructions = next.include_skill_instructions;
+    config.skill_max_context_tokens = next.skill_max_context_tokens;
+    config.flowdex_config.active_agent_excluded_tools = excluded_tools;
     Ok(())
 }
 
@@ -345,11 +364,8 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    let mut config = build_agent_spawn_config(
-        &session.get_base_instructions().await,
-        turn.as_ref(),
-        step_context.environments.primary(),
-    )?;
+    let mut config =
+        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     apply_spawn_agent_role(&session, &mut config, profile).await?;
     apply_flowdex_tool_profile(
         &session,
@@ -362,11 +378,7 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
     .await?;
     // Profile loading rebuilds Config from persisted layers. Restore the live turn's
     // approval and sandbox selection before dispatching the child.
-    apply_spawn_agent_runtime_overrides(
-        &mut config,
-        turn.as_ref(),
-        step_context.environments.primary(),
-    )?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
     apply_explicit_spawn_agent_model_overrides(
         &session,
         turn.as_ref(),
@@ -410,6 +422,8 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
             SpawnAgentOptions {
                 parent_thread_id: Some(session.thread_id),
                 parent_turn_id: Some(turn.sub_id.clone()),
+                root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: turn.cyber_access_program,
                 environments: Some(step_context.environments.to_selections()),
                 completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
                 ..Default::default()
@@ -514,7 +528,17 @@ async fn handle_send(invocation: ToolInvocation) -> Result<JsonOutput, FunctionC
     let submission_id = session
         .services
         .agent_control
-        .send_inter_agent_communication(target, communication, context, Some(turn.sub_id.clone()))
+        .send_inter_agent_communication(
+            target,
+            communication,
+            context,
+            crate::TurnStartOptions {
+                parent_turn_id: Some(turn.sub_id.clone()),
+                root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: turn.cyber_access_program,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|err| collab_agent_error(target, err))?;
     Ok(JsonOutput::new(
@@ -718,6 +742,9 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
                 Some(source),
                 SpawnAgentOptions {
                     parent_thread_id: Some(parent_id),
+                    parent_turn_id: Some(turn.sub_id.clone()),
+                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                    cyber_access_program: turn.cyber_access_program,
                     environments: Some(environments),
                     completion_delivery: SpawnAgentCompletionDelivery::StatusOnly,
                     ..Default::default()
@@ -837,8 +864,11 @@ async fn refresh_agent_runtime_settings(
         .update_agent_settings(
             agent_id,
             SessionSettingsUpdate {
-                approval_policy: Some(turn.approval_policy()),
-                approvals_reviewer: Some(turn.config.approvals_reviewer),
+                step_settings: StepSettingsUpdate {
+                    approval_policy: Some(turn.approval_policy()),
+                    approvals_reviewer: Some(turn.initial_settings.approvals_reviewer()),
+                    ..Default::default()
+                },
                 sandbox_policy: Some(turn.sandbox_policy()),
                 windows_sandbox_level: Some(turn.windows_sandbox_level),
                 ..Default::default()
@@ -877,7 +907,12 @@ async fn submit_trigger_turn(
             id,
             communication,
             context,
-            Some(turn.sub_id.clone()),
+            crate::TurnStartOptions {
+                parent_turn_id: Some(turn.sub_id.clone()),
+                root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                cyber_access_program: turn.cyber_access_program,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|err| collab_agent_error(id, err))?;
@@ -1031,7 +1066,7 @@ impl JsonOutput {
     }
 }
 impl ToolOutput for JsonOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.value.to_string()
     }
     fn success_for_logging(&self) -> bool {

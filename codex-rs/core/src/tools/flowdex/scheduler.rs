@@ -1,12 +1,12 @@
 use super::FlowdexResumeAgentHandler;
 use super::task::{self, AgentSpec};
+use super::task::{
+    FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
+};
 use super::verification::FlowdexVerifyHandler;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::{ToolInvocation, ToolOutput, ToolPayload, boxed_tool_output};
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::{
-    FlowdexTaskIntegrateHandler, FlowdexTaskRunAgentHandler, FlowdexTaskVerifyHandler,
-};
 use crate::tools::registry::{CoreToolRuntime, ToolExecutor};
 use codex_flowdex::context::{
     ContextPackDeclaration, ContextPackStatus, ContextStaleSource, ResolvedContextPack,
@@ -24,7 +24,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::{ReasoningItem, TurnItem};
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_tools::shell_command_backend_for_features;
 use codex_tools::{JsonSchema, ResponsesApiTool, ToolName, ToolSpec};
 use futures::future::join_all;
 use serde::Deserialize;
@@ -309,7 +308,13 @@ macro_rules! handler {
             fn spec(&self) -> ToolSpec {
                 $spec()
             }
-            fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            fn handle<'a>(
+                &'a self,
+                invocation: ToolInvocation,
+            ) -> codex_tools::ToolExecutorFuture<'a>
+            where
+                ToolInvocation: 'a,
+            {
                 Box::pin(async move { $call(invocation).await.map(boxed_tool_output) })
             }
         }
@@ -328,7 +333,10 @@ impl ToolExecutor<ToolInvocation> for QueueFlowdexTaskHandler {
     fn spec(&self) -> ToolSpec {
         queue_spec_named(DIRECT_QUEUE)
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { queue_call(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -341,7 +349,10 @@ impl ToolExecutor<ToolInvocation> for SealFlowdexPhaseHandler {
     fn spec(&self) -> ToolSpec {
         seal_spec_named(DIRECT_SEAL)
     }
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { seal_call(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -2847,9 +2858,7 @@ async fn verify_commands(
         };
         invocation
     };
-    let verifier = FlowdexVerifyHandler::new(shell_command_backend_for_features(
-        controller.invocation.turn.config.features.get(),
-    ));
+    let verifier = FlowdexVerifyHandler::new();
     let output = verifier
         .handle(invocation.clone())
         .await

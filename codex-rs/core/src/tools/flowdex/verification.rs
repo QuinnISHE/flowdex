@@ -1,25 +1,25 @@
 use super::rules::run_rules;
+use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
-use crate::skills::maybe_emit_implicit_skill_invocation;
+use crate::session::step_context::StepContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::ShellCommandHandler;
+use crate::tools::handlers::ExecCommandHandler;
+use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::resolve_workdir_base_path;
-use crate::tools::handlers::shell::RunExecLikeArgs;
-use crate::tools::handlers::shell::RunExecLikeResult;
-use crate::tools::handlers::shell::run_exec_like_result;
-use crate::tools::handlers::shell::run_shell_command_post_hooks;
-use crate::tools::handlers::shell::run_shell_command_pre_hooks;
+use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::PostToolUsePayload;
+use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::router::ToolCall;
+use crate::tools::router::ToolCallSource;
 use codex_protocol::models::ResponseInputItem;
-use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
-use codex_tools::ShellCommandBackendConfig;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -27,16 +27,80 @@ use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const TOOL_NAME: &str = "flowdex_verify";
+const EXEC_TOOL_NAME: &str = "flowdex_exec_command";
 
-pub(crate) struct FlowdexVerifyHandler {
-    backend: ShellCommandBackendConfig,
+pub(crate) struct FlowdexVerifyHandler;
+
+pub(crate) struct FlowdexExecCommandHandler {
+    inner: ExecCommandHandler,
+}
+
+impl FlowdexExecCommandHandler {
+    pub(crate) fn new(options: ExecCommandHandlerOptions) -> Self {
+        Self {
+            inner: ExecCommandHandler::one_shot(options),
+        }
+    }
+}
+
+impl ToolExecutor<ToolInvocation> for FlowdexExecCommandHandler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(EXEC_TOOL_NAME)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        let ToolSpec::Function(mut spec) = self.inner.spec() else {
+            unreachable!("exec_command uses a function spec")
+        };
+        spec.name = EXEC_TOOL_NAME.to_string();
+        ToolSpec::Function(spec)
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        self.inner.supports_parallel_tool_calls()
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
+        self.inner.handle(invocation)
+    }
+}
+
+impl CoreToolRuntime for FlowdexExecCommandHandler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        self.inner.matches_kind(payload)
+    }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        self.inner.pre_tool_use_payload(invocation)
+    }
+
+    fn with_updated_hook_input(
+        &self,
+        invocation: ToolInvocation,
+        updated_input: Value,
+    ) -> Result<ToolInvocation, FunctionCallError> {
+        self.inner
+            .with_updated_hook_input(invocation, updated_input)
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &dyn ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        self.inner.post_tool_use_payload(invocation, result)
+    }
 }
 
 impl FlowdexVerifyHandler {
-    pub(crate) fn new(backend: ShellCommandBackendConfig) -> Self {
-        Self { backend }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn handle_for_workdir(
@@ -98,16 +162,15 @@ impl ToolExecutor<ToolInvocation> for FlowdexVerifyHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation, None, None))
     }
 }
 
-impl CoreToolRuntime for FlowdexVerifyHandler {
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for FlowdexVerifyHandler {}
 
 impl FlowdexVerifyHandler {
     async fn handle_call(
@@ -158,25 +221,48 @@ impl FlowdexVerifyHandler {
         };
         if let Some(runtime_cwd) = runtime_cwd {
             turn_environment.set_runtime_cwd(PathUri::from_abs_path(runtime_cwd));
+            let EnvironmentConfigState::Ready(environment_config) =
+                &mut turn_environment.selection.config
+            else {
+                unreachable!("ready turn environments always carry resolved configuration")
+            };
+            environment_config.permission_profile = turn
+                .config
+                .permissions
+                .permission_profile_state()
+                .snapshot();
         }
-        let environment_cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
+        let cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
             FunctionCallError::RespondToModel(format!(
                 "verification cwd `{}` is not native to the Codex host: {err}",
                 turn_environment.cwd()
             ))
         })?;
-        let cwd = resolve_workdir_base_path(&arguments, &environment_cwd)?;
-        let shell_handler = ShellCommandHandler::from(self.backend);
-        let shell_runtime_backend = shell_handler.shell_runtime_backend();
-        let shell_type = Some(
-            turn_environment
-                .shell
-                .as_ref()
-                .map_or_else(|| session.user_shell().shell_type, |shell| shell.shell_type),
-        );
+        let mut environments = step_context.environments.clone();
+        let Some(primary) = environments
+            .environments
+            .iter_mut()
+            .find(|environment| matches!(environment, TurnEnvironmentState::Ready(_)))
+        else {
+            return Err(FunctionCallError::RespondToModel(
+                "verification is unavailable in this session".to_string(),
+            ));
+        };
+        *primary = TurnEnvironmentState::Ready(turn_environment);
+        let verification_step = Arc::new(StepContext {
+            turn: Arc::clone(&turn),
+            settings: Arc::clone(&step_context.settings),
+            token_budget: step_context.token_budget.clone(),
+            session_telemetry: step_context.session_telemetry.clone(),
+            environments,
+            selected_capability_roots: step_context.selected_capability_roots.clone(),
+            executor_capability_discovery: step_context.executor_capability_discovery.clone(),
+            mcp: Arc::clone(&step_context.mcp),
+            tool_router: Arc::clone(&step_context.tool_router),
+            loaded_agents_md: step_context.loaded_agents_md.clone(),
+        });
 
         let mut results = Vec::with_capacity(args.commands.len());
-        let mut feedback_messages = Vec::new();
         for (index, original_command) in args.commands.iter().enumerate() {
             if cancellation_token.is_cancelled() {
                 return Err(FunctionCallError::RespondToModel(
@@ -184,68 +270,59 @@ impl FlowdexVerifyHandler {
                 ));
             }
             let command_call_id = format!("{call_id}:verify:{index}");
-            let command = run_shell_command_pre_hooks(
-                &session,
-                &turn,
-                command_call_id.clone(),
-                original_command.clone(),
+            let payload = ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "cmd": original_command,
+                    "workdir": args.workdir.clone(),
+                    "timeout_ms": timeout_ms,
+                    "tty": false,
+                })
+                .to_string(),
+            };
+            let result = ToolCallRuntime::new(
+                Arc::clone(&session),
+                Arc::clone(&verification_step),
+                Arc::clone(&tracker),
+            )
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: ToolName::plain(EXEC_TOOL_NAME),
+                    call_id: command_call_id,
+                    payload,
+                    encrypted_function_args: None,
+                },
+                ToolCallSource::Direct,
+                cancellation_token.clone(),
             )
             .await?;
-            maybe_emit_implicit_skill_invocation(session.as_ref(), turn.as_ref(), &command, &cwd)
-                .await;
-            let params = ShellCommandToolCallParams {
-                command: command.clone(),
-                workdir: args.workdir.clone(),
-                login: None,
-                timeout_ms: Some(timeout_ms),
-                sandbox_permissions: None,
-                prefix_rule: None,
-                additional_permissions: None,
-                justification: None,
-            };
-            let exec_params = ShellCommandHandler::to_exec_params(
-                &params,
-                session.as_ref(),
-                turn.as_ref(),
-                &turn_environment,
-                cwd.clone(),
-            )?;
-            let result = run_exec_like_result(RunExecLikeArgs {
-                tool_name: ToolName::plain(TOOL_NAME),
-                exec_params,
-                cancellation_token: cancellation_token.clone(),
-                hook_command: command.clone(),
-                shell_type,
-                additional_permissions: None,
-                prefix_rule: None,
-                session: session.clone(),
-                turn: turn.clone(),
-                turn_environment: turn_environment.clone(),
-                tracker: tracker.clone(),
-                call_id: command_call_id.clone(),
-                shell_runtime_backend,
-            })
-            .await?;
-            let RunExecLikeResult::Command {
-                output: Some(output),
-                ..
-            } = result
-            else {
-                return Err(FunctionCallError::RespondToModel(
-                    "verification command execution failed".to_string(),
-                ));
-            };
-            let failed = output.exit_code != 0 || output.timed_out;
+            let command_result = result.code_mode_result();
+            let exit_code = command_result
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "verification command execution did not return an exit code".to_string(),
+                    )
+                })?;
+            let timed_out = exit_code == 124;
+            let failed = exit_code != 0;
             let mut entry = serde_json::json!({
                 "command": original_command,
-                "exitCode": output.exit_code,
-                "durationMs": output.duration.as_millis() as u64,
+                "exitCode": exit_code,
+                "durationMs": command_result
+                    .get("wall_time_seconds")
+                    .and_then(Value::as_f64)
+                    .map(|seconds| (seconds * 1000.0).round() as u64)
+                    .unwrap_or_default(),
             });
-            if output.timed_out {
+            if timed_out {
                 entry["timedOut"] = Value::Bool(true);
             }
-            if failed && !output.aggregated_output.text.is_empty() {
-                entry["output"] = Value::String(output.aggregated_output.text.clone());
+            if failed
+                && let Some(output) = command_result.get("output").and_then(Value::as_str)
+                && !output.is_empty()
+            {
+                entry["output"] = Value::String(output.to_string());
             }
             results.push(entry);
             if failed {
@@ -253,12 +330,6 @@ impl FlowdexVerifyHandler {
                     value: serde_json::json!({"passed": false, "commands": results}),
                     model_output: None,
                 }));
-            }
-            if let Some(feedback) =
-                run_shell_command_post_hooks(&session, &turn, command_call_id, command, &output)
-                    .await?
-            {
-                feedback_messages.push(feedback);
             }
         }
         let mut value = serde_json::json!({"passed": true, "commands": results});
@@ -284,7 +355,7 @@ impl FlowdexVerifyHandler {
         }
         Ok(boxed_tool_output(VerificationOutput {
             value,
-            model_output: (!feedback_messages.is_empty()).then(|| feedback_messages.join("\n")),
+            model_output: None,
         }))
     }
 }
@@ -295,7 +366,7 @@ struct VerificationOutput {
 }
 
 impl ToolOutput for VerificationOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.value.to_string()
     }
 
@@ -329,15 +400,6 @@ fn verification_timeout_ms(explicit: Option<u64>, configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_tools::ShellCommandBackendConfig;
-
-    #[test]
-    fn verifier_waits_for_runtime_cancellation() {
-        assert!(
-            FlowdexVerifyHandler::new(ShellCommandBackendConfig::Classic)
-                .waits_for_runtime_cancellation()
-        );
-    }
 
     #[test]
     fn verification_timeout_uses_config_unless_explicitly_overridden() {
