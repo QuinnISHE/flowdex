@@ -2,7 +2,7 @@
 
 ## Judge demo quick start
 
-1. Extract the complete archive and keep the three `.exe` files together.
+1. Extract the complete archive and keep the four `.exe` files together.
 2. In PowerShell, run `./flowdex.exe install`.
 3. Fully quit and reopen the Codex app.
 4. Open the included `Flowdex-Demo` folder in Codex and trust the repository.
@@ -19,6 +19,7 @@ the committed result. The finished page is a centered animated FLOWDEX logo.
 ## Package contents
 
 - `flowdex.exe`
+- `codex-code-mode-host.exe`
 - `codex-windows-sandbox-setup.exe`
 - `codex-command-runner.exe`
 - `Flowdex-Demo/`
@@ -26,9 +27,11 @@ the committed result. The finished page is a centered animated FLOWDEX logo.
 For a package assembled from source, place the release files in this directory:
 
 - Windows: copy `codex-rs/target/release/codex.exe` here as `flowdex.exe`, plus
-  `codex-windows-sandbox-setup.exe` and `codex-command-runner.exe` from the same
-  release directory. Flowdex installs all three together so sandboxed agents work.
-- macOS: copy `codex-rs/target/release/codex` here as `flowdex` and keep it executable.
+  `codex-code-mode-host.exe`, `codex-windows-sandbox-setup.exe`, and
+  `codex-command-runner.exe` from the same release directory. Flowdex installs
+  all four together so code mode and sandboxed agents work.
+- macOS: copy `codex-rs/target/release/codex` here as `flowdex` and
+  `codex-rs/target/release/codex-code-mode-host` beside it; keep both executable.
 
 Install or uninstall from this directory:
 

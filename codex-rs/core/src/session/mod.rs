@@ -637,7 +637,7 @@ impl Session {
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
-        // 3. rendered instructions_template for current model
+        // 3. Flowdex prompt mode or rendered instructions_template for current model
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
@@ -657,7 +657,31 @@ impl Session {
             .base_instructions
             .clone()
             .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+            .unwrap_or_else(|| match config.flowdex_config.system_prompt_mode {
+                codex_flowdex::FlowdexSystemPromptMode::Claude => {
+                    let role = if session_source.is_non_root_agent() {
+                        codex_flowdex::ClaudeSystemPromptRole::Worker
+                    } else {
+                        codex_flowdex::ClaudeSystemPromptRole::Coordinator
+                    };
+                    codex_flowdex::claude_system_prompt(role).to_string()
+                }
+                codex_flowdex::FlowdexSystemPromptMode::Codex => {
+                    let prompt = model_info.get_model_instructions(config.personality);
+                    if session_source.is_non_root_agent() {
+                        prompt
+                    } else {
+                        codex_flowdex::with_flowdex_coordinator_prompt(&prompt)
+                    }
+                }
+                codex_flowdex::FlowdexSystemPromptMode::Pi => {
+                    if session_source.is_non_root_agent() {
+                        codex_flowdex::PI_SYSTEM_PROMPT.to_string()
+                    } else {
+                        codex_flowdex::PI_COORDINATOR_SYSTEM_PROMPT.to_string()
+                    }
+                }
+            });
 
         // Dynamic tools are defined at thread start and persisted in rollout session metadata.
         let dynamic_tools = if dynamic_tools.is_empty() {
@@ -3223,6 +3247,13 @@ impl Session {
         turn_context: &TurnContext,
         mut communication: InterAgentCommunication,
     ) {
+        let visible_input = communication
+            .encrypted_content
+            .is_none()
+            .then(|| UserInput::Text {
+                text: communication.content.clone(),
+                text_elements: Vec::new(),
+            });
         communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
         let (items, _) = self.prepare_conversation_items_for_history(
@@ -3247,6 +3278,11 @@ impl Session {
         ])
         .await;
         self.send_raw_response_items(turn_context, items).await;
+        if let Some(visible_input) = visible_input {
+            let turn_item = TurnItem::UserMessage(UserMessageItem::new(&[visible_input]));
+            self.emit_turn_item_started(turn_context, &turn_item).await;
+            self.emit_turn_item_completed(turn_context, turn_item).await;
+        }
     }
 
     async fn maybe_warn_on_server_model_mismatch(

@@ -4505,6 +4505,43 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
 }
 
 #[tokio::test]
+async fn build_agent_spawn_config_uses_claude_worker_prompt_for_children() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.flowdex_config.system_prompt_mode = codex_flowdex::FlowdexSystemPromptMode::Claude;
+    turn.config = Arc::new(config);
+    let base_instructions = BaseInstructions {
+        text: codex_flowdex::claude_system_prompt(
+            codex_flowdex::ClaudeSystemPromptRole::Coordinator,
+        )
+        .to_string(),
+    };
+
+    let config = build_agent_spawn_config(&base_instructions, &turn, turn.environments.primary())
+        .expect("spawn config");
+
+    assert_eq!(
+        config.base_instructions.as_deref(),
+        Some(codex_flowdex::claude_system_prompt(
+            codex_flowdex::ClaudeSystemPromptRole::Worker
+        ))
+    );
+}
+
+#[tokio::test]
+async fn build_agent_spawn_config_removes_flowdex_coordinator_prompt_from_children() {
+    let (_session, turn) = make_session_and_context().await;
+    let base_instructions = BaseInstructions {
+        text: codex_flowdex::with_flowdex_coordinator_prompt("codex base"),
+    };
+
+    let config = build_agent_spawn_config(&base_instructions, &turn, turn.environments.primary())
+        .expect("spawn config");
+
+    assert_eq!(config.base_instructions.as_deref(), Some("codex base"));
+}
+
+#[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();

@@ -678,8 +678,6 @@ pub(crate) async fn handle_run_with_review(
         &invocation.session,
         &invocation.turn,
         instructions.clone(),
-        model,
-        config.model_reasoning_effort.clone().unwrap_or_default(),
     )
     .await;
     let child = match invocation

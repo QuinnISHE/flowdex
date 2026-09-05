@@ -175,10 +175,13 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cargo build --release --target "${{ matrix.target }}" \
               -p codex-cli --bin codex \
+              -p codex-code-mode-host --bin codex-code-mode-host \
               -p codex-windows-sandbox --bin codex-windows-sandbox-setup \
               -p codex-windows-sandbox --bin codex-command-runner
           else
-            cargo build --release --target "${{ matrix.target }}" -p codex-cli --bin codex
+            cargo build --release --target "${{ matrix.target }}" \
+              -p codex-cli --bin codex \
+              -p codex-code-mode-host --bin codex-code-mode-host
           fi
 
       - name: Package Windows binaries
@@ -187,6 +190,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex.exe
+          Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-code-mode-host.exe" dist/
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-windows-sandbox-setup.exe" dist/
           Copy-Item "codex-rs/target/${{ matrix.target }}/release/codex-command-runner.exe" dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.package }}"
@@ -197,8 +201,9 @@ jobs:
         run: |
           mkdir -p dist
           cp "codex-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" dist/flowdex
-          chmod +x dist/flowdex
-          tar -C dist -czf "../${{ matrix.package }}" flowdex
+          cp "codex-rs/target/${{ matrix.target }}/release/codex-code-mode-host" dist/
+          chmod +x dist/flowdex dist/codex-code-mode-host
+          tar -C dist -czf "../${{ matrix.package }}" flowdex codex-code-mode-host
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

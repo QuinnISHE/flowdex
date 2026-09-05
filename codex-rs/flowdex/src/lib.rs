@@ -42,7 +42,122 @@ pub use config::DEFAULT_COMPACTION_REMINDER_THRESHOLD_TOKENS;
 pub use config::FlowdexConfig;
 pub use config::FlowdexConfigError;
 pub use config::FlowdexMultiAgentVersion;
+pub use config::FlowdexSystemPromptMode;
 pub use config::load_config;
+
+/// Source-faithful Claude Code client prompt variants adapted to Codex. Both
+/// share the same base prefix so root and worker requests retain cache reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaudeSystemPromptRole {
+    Coordinator,
+    Worker,
+}
+
+pub const CLAUDE_COORDINATOR_SYSTEM_PROMPT: &str = concat!(
+    include_str!("claude_system_prompt.md"),
+    "\n",
+    include_str!("claude_coordinator_prompt.md"),
+    "\n",
+    include_str!("flowdex_coordinator_prompt.md")
+);
+pub const CLAUDE_WORKER_SYSTEM_PROMPT: &str = concat!(
+    include_str!("claude_system_prompt.md"),
+    "\n",
+    include_str!("claude_worker_prompt.md")
+);
+
+pub fn claude_system_prompt(role: ClaudeSystemPromptRole) -> &'static str {
+    match role {
+        ClaudeSystemPromptRole::Coordinator => CLAUDE_COORDINATOR_SYSTEM_PROMPT,
+        ClaudeSystemPromptRole::Worker => CLAUDE_WORKER_SYSTEM_PROMPT,
+    }
+}
+
+pub fn is_claude_system_prompt(prompt: &str) -> bool {
+    prompt == CLAUDE_COORDINATOR_SYSTEM_PROMPT || prompt == CLAUDE_WORKER_SYSTEM_PROMPT
+}
+
+/// Stable Flowdex planning guidance appended only to coordinator prompts.
+pub const FLOWDEX_COORDINATOR_SYSTEM_PROMPT: &str = include_str!("flowdex_coordinator_prompt.md");
+
+pub fn with_flowdex_coordinator_prompt(prompt: &str) -> String {
+    if prompt.ends_with(FLOWDEX_COORDINATOR_SYSTEM_PROMPT) {
+        prompt.to_string()
+    } else {
+        format!("{prompt}\n{FLOWDEX_COORDINATOR_SYSTEM_PROMPT}")
+    }
+}
+
+pub fn without_flowdex_coordinator_prompt(prompt: &str) -> &str {
+    prompt
+        .strip_suffix(FLOWDEX_COORDINATOR_SYSTEM_PROMPT)
+        .and_then(|prompt| prompt.strip_suffix('\n'))
+        .unwrap_or(prompt)
+}
+
+/// Stable Pi-style prompt. Codex supplies tools, project instructions, skills,
+/// and the working directory through its existing dynamic context layers.
+pub const PI_SYSTEM_PROMPT: &str = include_str!("pi_system_prompt.md");
+pub const PI_COORDINATOR_SYSTEM_PROMPT: &str = concat!(
+    include_str!("pi_system_prompt.md"),
+    "\n",
+    include_str!("flowdex_coordinator_prompt.md")
+);
+
+#[cfg(test)]
+mod claude_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_roles_share_a_stable_prefix_and_have_distinct_suffixes() {
+        let base = include_str!("claude_system_prompt.md");
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.starts_with(base));
+        assert!(CLAUDE_WORKER_SYSTEM_PROMPT.starts_with(base));
+        assert_ne!(
+            CLAUDE_COORDINATOR_SYSTEM_PROMPT,
+            CLAUDE_WORKER_SYSTEM_PROMPT
+        );
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("You are Codex"));
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("## 1. Your Role"));
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("# Delivering work"));
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("# Corrections"));
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("## Delegating to subagents"));
+        assert!(CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("# Flowdex workflow planning"));
+        assert!(CLAUDE_WORKER_SYSTEM_PROMPT.contains("You are a worker agent"));
+        assert!(!CLAUDE_WORKER_SYSTEM_PROMPT.contains("# Flowdex workflow planning"));
+        assert!(!CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("You are Flowdex"));
+        assert!(!CLAUDE_WORKER_SYSTEM_PROMPT.contains("You are Flowdex"));
+        assert!(!CLAUDE_COORDINATOR_SYSTEM_PROMPT.contains("${"));
+        assert!(!CLAUDE_WORKER_SYSTEM_PROMPT.contains("${"));
+    }
+}
+
+#[cfg(test)]
+mod pi_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_keeps_dynamic_context_out_of_the_stable_system_text() {
+        assert!(PI_SYSTEM_PROMPT.contains("expert coding assistant"));
+        assert!(PI_SYSTEM_PROMPT.contains("operating inside Codex, a coding agent harness"));
+        assert!(PI_SYSTEM_PROMPT.contains("Available tools:"));
+        assert!(PI_SYSTEM_PROMPT.contains("(provided separately by Codex)"));
+        assert!(PI_SYSTEM_PROMPT.contains("- Be concise in your responses"));
+        assert!(PI_SYSTEM_PROMPT.contains("- Show file paths clearly when working with files"));
+        assert!(!PI_SYSTEM_PROMPT.contains("inside pi"));
+        assert!(!PI_SYSTEM_PROMPT.contains("enhanced by Flowdex"));
+        assert!(!PI_SYSTEM_PROMPT.contains("Current working directory:"));
+        assert!(!PI_SYSTEM_PROMPT.contains("<project_context>"));
+        assert!(PI_COORDINATOR_SYSTEM_PROMPT.starts_with(PI_SYSTEM_PROMPT));
+        assert!(PI_COORDINATOR_SYSTEM_PROMPT.contains("# Flowdex workflow planning"));
+        assert!(!PI_SYSTEM_PROMPT.contains("# Flowdex workflow planning"));
+        let codex_prompt = with_flowdex_coordinator_prompt("codex base");
+        assert_eq!(
+            without_flowdex_coordinator_prompt(&codex_prompt),
+            "codex base"
+        );
+    }
+}
 pub use context::ContextError;
 pub use context::ContextFragment;
 pub use context::ContextPackDeclaration;

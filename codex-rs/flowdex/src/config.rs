@@ -21,6 +21,16 @@ pub enum FlowdexMultiAgentVersion {
     V2,
 }
 
+/// Base coding prompt selected by Flowdex configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowdexSystemPromptMode {
+    Claude,
+    #[default]
+    Codex,
+    Pi,
+}
+
 /// Resolved Flowdex settings used by a session.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlowdexConfig {
@@ -30,6 +40,7 @@ pub struct FlowdexConfig {
     pub ast_grep_always_run: Vec<String>,
     pub tool_profiles: BTreeMap<String, ToolProfileConfig>,
     pub multi_agent_version: Option<FlowdexMultiAgentVersion>,
+    pub system_prompt_mode: FlowdexSystemPromptMode,
     pub subagent_excluded_tools: Vec<String>,
     pub subagent_excluded_skills: Vec<String>,
     /// Resolved only on a Flowdex child config after applying its tool profile.
@@ -67,6 +78,7 @@ pub fn load_config(
     let mut ast_grep_always_run = Vec::new();
     let mut tool_profiles = BTreeMap::new();
     let mut multi_agent_version = Some(FlowdexMultiAgentVersion::V1);
+    let mut system_prompt_mode = FlowdexSystemPromptMode::Codex;
     let mut subagent_excluded_tools = Vec::new();
     let mut subagent_excluded_skills = vec![DEFAULT_SUBAGENT_EXCLUDED_SKILL.to_string()];
 
@@ -91,6 +103,9 @@ pub fn load_config(
         tool_profiles.extend(config.tool_profiles);
         if let Some(value) = config.multi_agent_version {
             multi_agent_version = Some(value);
+        }
+        if let Some(value) = config.system_prompt_mode {
+            system_prompt_mode = value;
         }
         if let Some(value) = config.subagent_excluded_tools {
             validate_names(&value, &global_path, "subagent_excluded_tools")?;
@@ -126,6 +141,9 @@ pub fn load_config(
             if let Some(value) = config.multi_agent_version {
                 multi_agent_version = Some(value);
             }
+            if let Some(value) = config.system_prompt_mode {
+                system_prompt_mode = value;
+            }
             if let Some(value) = config.subagent_excluded_tools {
                 validate_names(&value, &repository_path, "subagent_excluded_tools")?;
                 subagent_excluded_tools = value;
@@ -144,6 +162,7 @@ pub fn load_config(
         ast_grep_always_run,
         tool_profiles,
         multi_agent_version,
+        system_prompt_mode,
         subagent_excluded_tools,
         subagent_excluded_skills,
         active_agent_excluded_tools: Vec::new(),
@@ -158,6 +177,7 @@ struct PartialFlowdexConfig {
     ast_grep_candidate_threshold: Option<i64>,
     ast_grep_always_run: Option<Vec<String>>,
     multi_agent_version: Option<FlowdexMultiAgentVersion>,
+    system_prompt_mode: Option<FlowdexSystemPromptMode>,
     subagent_excluded_tools: Option<Vec<String>>,
     subagent_excluded_skills: Option<Vec<String>>,
     #[serde(default)]
@@ -344,6 +364,10 @@ mod tests {
             DEFAULT_VERIFICATION_TIMEOUT_MS
         );
         assert_eq!(
+            config(temp.path(), Some(&repository_root)).system_prompt_mode,
+            FlowdexSystemPromptMode::Codex
+        );
+        assert_eq!(
             config(temp.path(), Some(&repository_root)).subagent_excluded_skills,
             [DEFAULT_SUBAGENT_EXCLUDED_SKILL]
         );
@@ -444,6 +468,56 @@ mod tests {
         assert!(message.contains("invalid Flowdex config"), "{message}");
         assert!(message.contains("multi_agent_version"), "{message}");
         assert!(message.contains("v3"), "{message}");
+        assert!(
+            message.contains(path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn resolves_system_prompt_mode_with_repository_precedence() {
+        let temp = tempdir().expect("temp dir");
+        let repository_root = temp.path().join("repo");
+        fs::create_dir_all(repository_root.join(".flowdex")).expect("repository config dir");
+
+        fs::write(
+            temp.path().join("flowdex.toml"),
+            "system_prompt_mode = \"pi\"\n",
+        )
+        .expect("global config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).system_prompt_mode,
+            FlowdexSystemPromptMode::Pi
+        );
+
+        fs::write(repository_root.join(".flowdex/config.toml"), "# omitted\n")
+            .expect("repository omission");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).system_prompt_mode,
+            FlowdexSystemPromptMode::Pi
+        );
+
+        fs::write(
+            repository_root.join(".flowdex/config.toml"),
+            "system_prompt_mode = \"codex\"\n",
+        )
+        .expect("repository config");
+        assert_eq!(
+            config(temp.path(), Some(&repository_root)).system_prompt_mode,
+            FlowdexSystemPromptMode::Codex
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_system_prompt_mode_with_path() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("flowdex.toml");
+        fs::write(&path, "system_prompt_mode = \"other\"\n").expect("global config");
+
+        let error = load_config(temp.path(), None).expect_err("invalid prompt mode");
+        let message = error.to_string();
+        assert!(message.contains("system_prompt_mode"), "{message}");
+        assert!(message.contains("other"), "{message}");
         assert!(
             message.contains(path.to_string_lossy().as_ref()),
             "{message}"

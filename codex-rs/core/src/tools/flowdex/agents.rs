@@ -61,22 +61,16 @@ const HANDOFF_PROMPT: &str = "Produce only a concise structured handoff with com
 pub(super) struct FlowdexSpawnUiEvent {
     id: String,
     prompt: String,
-    model: String,
-    reasoning_effort: ReasoningEffort,
 }
 
 pub(super) async fn begin_spawn_ui_event(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
     prompt: String,
-    model: String,
-    reasoning_effort: ReasoningEffort,
 ) -> FlowdexSpawnUiEvent {
     let event = FlowdexSpawnUiEvent {
         id: Uuid::new_v4().to_string(),
         prompt,
-        model,
-        reasoning_effort,
     };
     session
         .emit_flowdex_item_started(
@@ -89,8 +83,8 @@ pub(super) async fn begin_spawn_ui_event(
                 receiver_thread_ids: Vec::new(),
                 receiver_agents: Vec::new(),
                 prompt: Some(event.prompt.clone()),
-                model: Some(event.model.clone()),
-                reasoning_effort: Some(event.reasoning_effort.clone()),
+                model: None,
+                reasoning_effort: None,
                 agents_states: Default::default(),
             }),
         )
@@ -134,8 +128,8 @@ pub(super) async fn finish_spawn_ui_event(
                 receiver_thread_ids,
                 receiver_agents,
                 prompt: Some(event.prompt),
-                model: Some(event.model),
-                reasoning_effort: Some(event.reasoning_effort),
+                model: None,
+                reasoning_effort: None,
                 agents_states,
             }),
         )
@@ -404,19 +398,7 @@ async fn handle_spawn(invocation: ToolInvocation) -> Result<JsonOutput, Function
         true,
     );
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-    let model = config
-        .model
-        .clone()
-        .unwrap_or_else(|| turn.model_info.slug.clone());
-    let reasoning_effort = config.model_reasoning_effort.clone().unwrap_or_default();
-    let ui_event = begin_spawn_ui_event(
-        &session,
-        &turn,
-        instructions.to_string(),
-        model,
-        reasoning_effort,
-    )
-    .await;
+    let ui_event = begin_spawn_ui_event(&session, &turn, instructions.to_string()).await;
     let child = match session
         .services
         .agent_control
@@ -723,17 +705,7 @@ async fn handle_resume(invocation: ToolInvocation) -> Result<JsonOutput, Functio
             ),
             None => None,
         };
-        let ui_event = begin_spawn_ui_event(
-            &session,
-            &turn,
-            prompt.clone(),
-            config
-                .model
-                .clone()
-                .unwrap_or_else(|| turn.model_info.slug.clone()),
-            config.model_reasoning_effort.clone().unwrap_or_default(),
-        )
-        .await;
+        let ui_event = begin_spawn_ui_event(&session, &turn, prompt.clone()).await;
         let child = match session
             .services
             .agent_control

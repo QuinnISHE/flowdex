@@ -17,6 +17,8 @@ const FLOWDEX_CONFIG_CONTENTS: &str = "# Flowdex global defaults. Repository-loc
 compaction_reminder_threshold_tokens = 185000\n\
 verification_timeout_ms = 300000\n\
 multi_agent_version = \"v1\"\n\
+# Options: codex, claude, pi.\n\
+system_prompt_mode = \"codex\"\n\
 ast_grep_candidate_threshold = 3\n\
 ast_grep_always_run = []\n\
 subagent_excluded_tools = []\n\
@@ -27,10 +29,14 @@ subagent_excluded_skills = [\"run-flowdex-workflows\"]\n\
 # excluded_tools and excluded_skills for focused Flowdex child roles.\n";
 
 #[cfg(windows)]
-const WINDOWS_HELPERS: &[&str] = &[
+const PACKAGE_HELPERS: &[&str] = &[
+    "codex-code-mode-host.exe",
     "codex-windows-sandbox-setup.exe",
     "codex-command-runner.exe",
 ];
+
+#[cfg(target_os = "macos")]
+const PACKAGE_HELPERS: &[&str] = &["codex-code-mode-host"];
 
 const RETIRED_BUNDLED_ASSETS: &[&str] = &[
     "skills/collect-flowdex-context/SKILL.md",
@@ -178,7 +184,9 @@ fn installed_binary_path() -> Result<PathBuf> {
 async fn run_install() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        let helpers = package_helpers()?;
         let target = install_current_binary(BinaryValidation::Macos)?;
+        install_package_helpers(&helpers, &target)?;
         install_bundled_assets(find_codex_home()?.as_path())?;
         macos::install(&target)?;
         println!(
@@ -190,9 +198,9 @@ async fn run_install() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let helpers = windows_package_helpers()?;
+        let helpers = package_helpers()?;
         let target = install_current_binary(BinaryValidation::Windows)?;
-        install_windows_helpers(&helpers, &target)?;
+        install_package_helpers(&helpers, &target)?;
         install_bundled_assets(find_codex_home()?.as_path())?;
         let mut writer = RegistryEnvironmentWriter;
         writer.set_codex_cli_path(&target)?;
@@ -213,6 +221,7 @@ async fn run_uninstall(purge: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         macos::uninstall()?;
+        remove_installed_package_helpers()?;
         remove_flowdex_files(purge)?;
         print_uninstall_result(purge);
         return Ok(());
@@ -222,7 +231,7 @@ async fn run_uninstall(purge: bool) -> Result<()> {
     {
         let mut writer = RegistryEnvironmentWriter;
         writer.remove_codex_cli_path()?;
-        remove_installed_windows_helpers()?;
+        remove_installed_package_helpers()?;
         remove_flowdex_files(purge)?;
         print_uninstall_result(purge);
         Ok(())
@@ -275,13 +284,13 @@ fn install_current_binary(validation: BinaryValidation) -> Result<PathBuf> {
     install_binary(&source, &target, run_version_check, validation)
 }
 
-#[cfg(windows)]
-fn windows_package_helpers() -> Result<Vec<PathBuf>> {
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn package_helpers() -> Result<Vec<PathBuf>> {
     let package = std::env::current_exe().context("cannot locate the running Flowdex package")?;
     let directory = package
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Flowdex package path has no parent"))?;
-    WINDOWS_HELPERS
+    PACKAGE_HELPERS
         .iter()
         .map(|name| {
             let path = directory.join(name);
@@ -299,30 +308,30 @@ fn windows_package_helpers() -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-#[cfg(windows)]
-fn install_windows_helpers(helpers: &[PathBuf], binary: &Path) -> Result<()> {
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn install_package_helpers(helpers: &[PathBuf], binary: &Path) -> Result<()> {
     let directory = binary
         .parent()
         .ok_or_else(|| anyhow::anyhow!("installed Flowdex path has no parent"))?;
-    for (name, source) in WINDOWS_HELPERS.iter().zip(helpers) {
+    for (name, source) in PACKAGE_HELPERS.iter().zip(helpers) {
         install_package_file(source, &directory.join(name))?;
     }
     Ok(())
 }
 
-#[cfg(windows)]
-fn remove_installed_windows_helpers() -> Result<()> {
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn remove_installed_package_helpers() -> Result<()> {
     let binary = installed_binary_path()?;
     let directory = binary
         .parent()
         .ok_or_else(|| anyhow::anyhow!("installed Flowdex path has no parent"))?;
-    for name in WINDOWS_HELPERS {
+    for name in PACKAGE_HELPERS {
         remove_file_if_exists(&directory.join(name))?;
     }
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn install_package_file(source: &Path, target: &Path) -> Result<()> {
     if source == target {
         return Ok(());
@@ -545,6 +554,7 @@ fn complete_existing_flowdex_config(path: &Path) -> Result<()> {
             "verification_timeout_ms = 300000\n",
         ),
         ("multi_agent_version", "multi_agent_version = \"v1\"\n"),
+        ("system_prompt_mode", "system_prompt_mode = \"codex\"\n"),
         (
             "ast_grep_candidate_threshold",
             "ast_grep_candidate_threshold = 3\n",
@@ -1115,6 +1125,31 @@ mod tests {
         assert_eq!(std::fs::read(installed).unwrap(), b"binary");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn installs_every_required_windows_package_helper() {
+        let package = tempdir().expect("package dir");
+        let install = tempdir().expect("install dir");
+        let binary = install.path().join("bin").join("codex.exe");
+        let mut helpers = Vec::new();
+        for (index, name) in PACKAGE_HELPERS.iter().enumerate() {
+            let source = package.path().join(name);
+            std::fs::write(&source, format!("helper-{index}")).expect("package helper");
+            helpers.push(source);
+        }
+
+        install_package_helpers(&helpers, &binary).expect("install helpers");
+
+        for (index, name) in PACKAGE_HELPERS.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(install.path().join("bin").join(name))
+                    .expect("installed helper"),
+                format!("helper-{index}")
+            );
+        }
+        assert!(PACKAGE_HELPERS.contains(&"codex-code-mode-host.exe"));
+    }
+
     #[test]
     fn standalone_name_and_commands_are_exact() {
         assert!(is_flowdex_executable(Path::new("flowdex.exe")));
@@ -1174,6 +1209,7 @@ mod tests {
         let worker = include_str!("../../../.flowdex/workflows/defaults/worker-reviewer.js");
 
         assert!(config.contains("multi_agent_version = \"v1\""));
+        assert!(config.contains("system_prompt_mode = \"codex\""));
         assert!(config.contains("compaction_reminder_threshold_tokens = 185000"));
         assert!(config.contains("verification_timeout_ms = 300000"));
         assert!(config.contains("subagent_excluded_tools = []"));
@@ -1251,6 +1287,7 @@ mod tests {
         );
         assert_eq!(table["verification_timeout_ms"].as_integer(), Some(300000));
         assert_eq!(table["multi_agent_version"].as_str(), Some("v1"));
+        assert_eq!(table["system_prompt_mode"].as_str(), Some("codex"));
         assert_eq!(table["ast_grep_candidate_threshold"].as_integer(), Some(3));
         assert_eq!(
             table["ast_grep_always_run"].as_array().map(Vec::len),

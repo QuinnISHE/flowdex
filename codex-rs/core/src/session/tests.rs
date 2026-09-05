@@ -2220,6 +2220,62 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
 }
 
 #[tokio::test]
+async fn record_inter_agent_communication_emits_visible_user_message() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("worker path"),
+        Vec::new(),
+        "Inspect the parser and report the exact failure.".to_string(),
+        /*trigger_turn*/ true,
+    );
+
+    session
+        .record_inter_agent_communication(&turn_context, communication)
+        .await;
+
+    assert!(matches!(
+        rx.recv().await.expect("raw response item event").msg,
+        EventMsg::RawResponseItem(_)
+    ));
+    let EventMsg::ItemStarted(started) = rx.recv().await.expect("started user message event").msg
+    else {
+        panic!("expected started user message event");
+    };
+    let TurnItem::UserMessage(started_message) = started.item else {
+        panic!("expected visible user message");
+    };
+    assert_eq!(
+        started_message.message(),
+        "Inspect the parser and report the exact failure."
+    );
+
+    let EventMsg::ItemCompleted(completed) =
+        rx.recv().await.expect("completed user message event").msg
+    else {
+        panic!("expected completed user message event");
+    };
+    let TurnItem::UserMessage(completed_message) = completed.item else {
+        panic!("expected visible user message");
+    };
+    assert_eq!(completed_message.id, started_message.id);
+    assert_eq!(
+        completed_message.message(),
+        "Inspect the parser and report the exact failure."
+    );
+    let EventMsg::UserMessage(legacy_message) =
+        rx.recv().await.expect("legacy user message event").msg
+    else {
+        panic!("expected legacy user message event");
+    };
+    assert_eq!(
+        legacy_message.message,
+        "Inspect the parser and report the exact failure."
+    );
+    assert!(rx.try_recv().is_err(), "no extra events expected");
+}
+
+#[tokio::test]
 async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resume() {
     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),

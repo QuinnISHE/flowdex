@@ -1310,7 +1310,7 @@ async fn run_phase(
                     .cloned()
                     .ok_or_else(|| "agent missing".to_string())?;
                 let agent = AgentSpec {
-                    name: scheduler_agent_name("task", &task_def.name, &scheduled.task_id),
+                    name: scheduler_agent_name("", &task_def.name, &scheduled.task_id),
                     display_name: Some(task_def.name.clone()),
                     instructions: "Implement the task requirements above.".into(),
                     profile: agent_def.profile,
@@ -2725,7 +2725,11 @@ fn scheduler_agent_name(role: &str, display_name: &str, unique_id: &str) -> Stri
         .take(8)
         .map(|ch| ch.to_ascii_lowercase())
         .collect();
-    format!("{role}_{slug}_{suffix}")
+    if role.is_empty() {
+        format!("{slug}_{suffix}")
+    } else {
+        format!("{role}_{slug}_{suffix}")
+    }
 }
 
 fn parse_effort(value: String) -> Option<ReasoningEffort> {
@@ -2780,7 +2784,7 @@ async fn spawn_recovery_task_agent(
         .cloned()
         .ok_or_else(|| format!("task agent {} is missing", task_def.agent))?;
     let agent = AgentSpec {
-        name: scheduler_agent_name("task_recovery", &task_def.name, task_id),
+        name: scheduler_agent_name("", &format!("{} repair", task_def.name), task_id),
         display_name: Some(format!("{} repair", task_def.name)),
         instructions,
         profile: definition.profile,
@@ -2945,11 +2949,11 @@ mod tests {
 
     #[test]
     fn scheduler_agent_names_are_valid_and_distinct() {
-        let first = scheduler_agent_name("task", "Use Context / Parser", "12345678-first");
-        let second = scheduler_agent_name("task", "Use Context / Parser", "87654321-second");
+        let first = scheduler_agent_name("", "Use Context / Parser", "12345678-first");
+        let second = scheduler_agent_name("", "Use Context / Parser", "87654321-second");
 
-        assert_eq!(first, "task_use_context_parser_12345678");
-        assert_eq!(second, "task_use_context_parser_87654321");
+        assert_eq!(first, "use_context_parser_12345678");
+        assert_eq!(second, "use_context_parser_87654321");
         assert!(
             first
                 .chars()

@@ -1,9 +1,10 @@
 # Flowdex desktop app installer
 
 Extract the release archive. The Windows package contains `flowdex.exe`,
-`codex-windows-sandbox-setup.exe`, and `codex-command-runner.exe`; both helpers
-must remain beside `flowdex.exe` during installation. A macOS package contains
-`flowdex`. Then run:
+`codex-code-mode-host.exe`, `codex-windows-sandbox-setup.exe`, and
+`codex-command-runner.exe`; all helpers must remain beside `flowdex.exe` during
+installation. A macOS package contains `flowdex` and `codex-code-mode-host`.
+Then run:
 
 ```text
 flowdex install
@@ -11,7 +12,8 @@ flowdex uninstall
 flowdex uninstall --purge
 ```
 
-Install validates the running package with `--version`, copies it to
+Install validates the running package with `--version`, copies it and its
+platform helpers to
 `$CODEX_HOME/flowdex/bin/codex[.exe]`, and configures the platform automatically.
 It does not overwrite the Codex app or its bundled backend. On Windows the copied
 path becomes the current user's `CODEX_CLI_PATH` environment value. On macOS it

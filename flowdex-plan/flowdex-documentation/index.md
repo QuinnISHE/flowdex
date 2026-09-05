@@ -5,6 +5,7 @@
 
 - [Groundwork](groundwork.md)
 - [Agent workflows](agents.md)
+- [System prompt mode](system-prompt.md)
 - [Executable workflows](workflows.md)
 - [Context packs](context-packs.md)
 - [Reusable and nested workflows](reusable-workflows.md)

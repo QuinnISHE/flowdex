@@ -190,7 +190,17 @@ pub(crate) fn build_agent_spawn_config(
     environment: Option<&TurnEnvironment>,
 ) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn, environment)?;
-    config.base_instructions = Some(base_instructions.text.clone());
+    config.base_instructions = Some(
+        if config.flowdex_config.system_prompt_mode
+            == codex_flowdex::FlowdexSystemPromptMode::Claude
+            && codex_flowdex::is_claude_system_prompt(&base_instructions.text)
+        {
+            codex_flowdex::claude_system_prompt(codex_flowdex::ClaudeSystemPromptRole::Worker)
+                .to_string()
+        } else {
+            codex_flowdex::without_flowdex_coordinator_prompt(&base_instructions.text).to_string()
+        },
+    );
     Ok(config)
 }
 

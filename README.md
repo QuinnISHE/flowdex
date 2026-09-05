@@ -21,12 +21,18 @@ See the release to download the binary, along with a demo that will create an HT
 
 Install the normal Codex build prerequisites, then build the modified CLI from the Rust workspace:
 
+Configure the Codex-published V8 archive and binding as described in
+[`third_party/v8/README.md`](third_party/v8/README.md), then build the backend and
+its process-owned code-mode host:
+
 ```shell
 cd codex-rs
-cargo build --release -p codex-cli --bin codex
+cargo build --release \
+  -p codex-cli --bin codex \
+  -p codex-code-mode-host --bin codex-code-mode-host
 ```
 
-The executable is written to `codex-rs/target/release/codex` on macOS or `codex-rs/target/release/codex.exe` on Windows. Copy it into [`flowdex-package`](flowdex-package/README.md) as `flowdex` or `flowdex.exe`.
+The executable is written to `codex-rs/target/release/codex` on macOS or `codex-rs/target/release/codex.exe` on Windows. Copy it into [`flowdex-package`](flowdex-package/README.md) as `flowdex` or `flowdex.exe` together with the matching `codex-code-mode-host` executable and Windows sandbox helpers described there.
 
 Run the packaged binary and restart the Codex app:
 

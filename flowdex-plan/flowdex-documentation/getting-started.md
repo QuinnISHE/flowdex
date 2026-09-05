@@ -8,19 +8,21 @@ From the repository root, build the modified CLI from the Rust workspace:
 
 ```text
 cd codex-rs
-cargo build --release -p codex-cli --bin codex
+cargo build --release -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host
 ```
 
-On Windows, also build `codex-windows-sandbox-setup` and
-`codex-command-runner`, then place both helper executables beside
-`flowdex-package/flowdex.exe`. On macOS, copy the executable to
-`flowdex-package/flowdex`. Then run:
+Place `codex-code-mode-host[.exe]` beside the Flowdex executable. On Windows,
+also build `codex-windows-sandbox-setup` and `codex-command-runner`, then place
+all four executables in `flowdex-package/`. On macOS, keep both `flowdex` and
+`codex-code-mode-host` executable. Then run:
 
 ```text
 flowdex install
 ```
 
 Flowdex detects the platform, validates and copies itself to `$CODEX_HOME/flowdex/bin`, configures the desktop backend, and installs reusable workflows plus the `run-flowdex-workflows` skill and its standalone JavaScript examples. Context collectors and reviewers receive their required tool protocol directly from Flowdex. A new `$CODEX_HOME/flowdex.toml` contains every global option with its default value, including the five-minute per-command `verification_timeout_ms` and the child exclusion that keeps workflow-authoring guidance on the orchestrator. Reinstalling adds missing options to a valid existing config without replacing user values or pre-existing assets. Fully quit and restart the desktop app after installation. Use `flowdex uninstall` to remove the override and copied backend while preserving data, or `flowdex uninstall --purge` to also remove the global assets created by the installer. Other global files, runtime history, task worktrees, and repository `.flowdex/` directories remain untouched. See [the installer contract](windows-app-installer.md).
+
+Set `system_prompt_mode = "claude"` or `"pi"` to use Flowdex's adapted Claude Code-style or Pi-style base coding prompt for new tasks; `"codex"` remains the default. See [system prompt mode](system-prompt.md).
 
 ## Save a workflow
 
